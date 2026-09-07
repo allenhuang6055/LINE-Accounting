@@ -16,7 +16,108 @@ const client = new line.messagingApi.MessagingApiClient({
 });
 
 const SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const SHEET_NAME = process.env.SHEET_NAME || "02_LINE資料庫";
+
+// ===== 場別 =====
+const FARM_ALIASES = {
+  "東平": "東平場",
+  "東平場": "東平場",
+  "草湖": "草湖場",
+  "草湖場": "草湖場",
+  "潭墘": "潭墘場",
+  "潭墘場": "潭墘場",
+  "後寮": "後寮場",
+  "後寮場": "後寮場",
+  "共用": "共用",
+  "共同": "共用",
+  "全部": "全部",
+};
+
+// ===== 原 Excel「資料」分頁 =====
+const ACCOUNT_ITEMS = [
+  ["購入中雞、二春雞", "511101", "銷貨成本"],
+  ["蛋紙-大浪-小浪", "511101", "銷貨成本"],
+  ["勞務支出-清屎人力派遣", "561199", "勞務成本-其他"],
+  ["勞務支出-防疫隊", "561199", "勞務成本-其他"],
+  ["疫苗", "511101", "銷貨成本"],
+  ["藥品", "511101", "銷貨成本"],
+  ["營養品", "511101", "銷貨成本"],
+  ["飼料費", "511101", "銷貨成本"],
+  ["蚵殼粉", "511101", "銷貨成本"],
+  ["間接人工", "515101", "勞務成本-其他"],
+  ["機器設備", "142101", "機器設備－成本"],
+  ["薪資支出-顧問費", "611101", "營業費用"],
+  ["薪資支出-廠長", "611101", "營業費用"],
+  ["薪資支出-員工1", "611101", "營業費用"],
+  ["薪資支出-員工2", "611101", "營業費用"],
+  ["薪資支出-員工3", "611101", "營業費用"],
+  ["薪資支出-員工4", "611101", "營業費用"],
+  ["薪資支出-加班費", "611101", "營業費用"],
+  ["租金支出-雞場", "611201", "營業費用"],
+  ["水費-雞場", "611901", "營業費用"],
+  ["電費-雞場", "611901", "營業費用"],
+  ["瓦斯費-雞場", "611901", "營業費用"],
+  ["設備修繕費", "611701", "營業費用"],
+  ["建物修繕費", "611702", "營業費用"],
+  ["其他修繕費", "611799", "營業費用"],
+  ["保險費", "612004", "營業費用"],
+  ["雜項費用", "613402", "營業費用"],
+  ["租金支出-宿舍", "611209", "營業費用"],
+  ["宿舍-水費", "611901", "營業費用"],
+  ["宿舍-電費", "611901", "營業費用"],
+  ["宿舍-瓦斯費", "611901", "營業費用"],
+  ["交通費-油資(車號)", "611401", "營業費用"],
+  ["車輛保養維修費", "611799", "營業費用"],
+  ["伙食費", "6128", "營業費用"],
+  ["勞保費", "612001", "營業費用"],
+  ["健保費", "612002", "營業費用"],
+  ["生化-廢棄物清運費", "613403", "營業費用"],
+  ["獸醫師年度合約", "613301", "營業費用"],
+  ["檢驗費", "516904", "營業費用"],
+];
+
+const KEYWORD_RULES = [
+  { keys: ["清屎"], item: "勞務支出-清屎人力派遣" },
+  { keys: ["防疫隊", "防疫"], item: "勞務支出-防疫隊" },
+  { keys: ["中雞", "二春雞", "購入雞"], item: "購入中雞、二春雞" },
+  { keys: ["蛋紙", "大浪", "小浪"], item: "蛋紙-大浪-小浪" },
+  { keys: ["疫苗"], item: "疫苗" },
+  { keys: ["營養品", "營養"], item: "營養品" },
+  { keys: ["飼料"], item: "飼料費" },
+  { keys: ["蚵殼"], item: "蚵殼粉" },
+  { keys: ["藥品", "藥"], item: "藥品" },
+
+  { keys: ["顧問"], item: "薪資支出-顧問費" },
+  { keys: ["廠長薪資", "廠長薪水"], item: "薪資支出-廠長" },
+  { keys: ["加班"], item: "薪資支出-加班費" },
+
+  { keys: ["雞場租金", "雞場房租", "房租"], item: "租金支出-雞場" },
+  { keys: ["宿舍租金", "宿舍房租"], item: "租金支出-宿舍" },
+
+  { keys: ["宿舍水費"], item: "宿舍-水費" },
+  { keys: ["宿舍電費"], item: "宿舍-電費" },
+  { keys: ["宿舍瓦斯"], item: "宿舍-瓦斯費" },
+  { keys: ["水費"], item: "水費-雞場" },
+  { keys: ["電費"], item: "電費-雞場" },
+  { keys: ["瓦斯"], item: "瓦斯費-雞場" },
+
+  { keys: ["水泥", "屋頂", "牆壁", "建物", "鐵皮"], item: "建物修繕費" },
+  { keys: ["電線", "燈座", "葉片", "輪胎", "手推車", "馬達維修", "設備維修", "機器維修", "山貓維修", "修理"], item: "設備修繕費" },
+  { keys: ["新機器", "新設備", "機器設備"], item: "機器設備" },
+
+  { keys: ["員工油資", "汽油", "柴油", "加油", "油資"], item: "交通費-油資(車號)" },
+  { keys: ["車輛保養", "汽車保養", "車輛維修", "汽車維修"], item: "車輛保養維修費" },
+
+  { keys: ["礦泉水", "飲料", "便當", "餐費", "沙拉油", "伙食"], item: "伙食費" },
+  { keys: ["勞保"], item: "勞保費" },
+  { keys: ["健保"], item: "健保費" },
+  { keys: ["清運", "廢棄物"], item: "生化-廢棄物清運費" },
+  { keys: ["獸醫"], item: "獸醫師年度合約" },
+  { keys: ["檢驗"], item: "檢驗費" },
+  { keys: ["保險"], item: "保險費" },
+
+  // 依原支出表常用項目
+  { keys: ["電風扇", "潤滑油", "衛生紙", "抹布", "抺布", "漂白水", "洗碗精", "噴霧器油"], item: "雜項費用" },
+];
 
 function getGoogleAuth() {
   const privateKey = (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
@@ -29,145 +130,291 @@ function getGoogleAuth() {
 }
 
 async function getSheets() {
-  const auth = getGoogleAuth();
-  return google.sheets({ version: "v4", auth });
+  return google.sheets({ version: "v4", auth: getGoogleAuth() });
 }
 
-function nowTaipei() {
-  const now = new Date();
-
-  const date = new Intl.DateTimeFormat("zh-TW", {
+function taipeiNow() {
+  const parts = new Intl.DateTimeFormat("zh-TW", {
     timeZone: "Asia/Taipei",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).format(now).replace(/\//g, "-");
-
-  const time = new Intl.DateTimeFormat("zh-TW", {
-    timeZone: "Asia/Taipei",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
-  }).format(now);
+  }).formatToParts(new Date());
 
-  return { date, time };
+  const get = (type) => parts.find(p => p.type === type)?.value || "";
+
+  return {
+    year: get("year"),
+    month: get("month"),
+    day: get("day"),
+    dateText: `${get("year")}/${get("month")}/${get("day")}`,
+    monthSheet: `${get("year")}${get("month")}月`,
+  };
 }
 
-function parseAmount(text) {
-  if (!text) return null;
-
-  const normalized = text
-    .replace(/,/g, "")
-    .replace(/元/g, "")
-    .trim();
-
-  const n = Number(normalized);
-  return Number.isFinite(n) ? n : null;
+function parseAmount(v) {
+  return Number(String(v || "").replace(/,/g, "").trim());
 }
 
-function classifyExpense(item) {
-  const s = (item || "").toLowerCase();
+function farmFromToken(token) {
+  return FARM_ALIASES[String(token || "").trim()] || null;
+}
 
-  const rules = [
-    { keys: ["維修", "修理", "保養"], category: "維修費" },
-    { keys: ["板手", "扳手", "螺絲", "工具"], category: "工具耗材" },
-    { keys: ["油", "柴油", "汽油"], category: "油料費" },
-    { keys: ["飼料"], category: "飼料" },
-    { keys: ["藥", "疫苗"], category: "藥品" },
-    { keys: ["水費"], category: "水費" },
-    { keys: ["電費"], category: "電費" },
-    { keys: ["電話", "網路"], category: "通訊費" },
-    { keys: ["薪資", "薪水", "工資"], category: "薪資" },
-    { keys: ["運費", "貨運", "清運"], category: "運輸費" },
-  ];
+function accountByItem(item) {
+  const row = ACCOUNT_ITEMS.find(r => r[0] === item);
+  return row ? { item: row[0], code: String(row[1]), className: row[2] } : null;
+}
 
-  for (const rule of rules) {
-    if (rule.keys.some(k => s.includes(k))) {
-      return rule.category;
+function autoChooseItem(description) {
+  const text = String(description || "").trim();
+
+  // 使用者直接輸入完整 Excel 品項時優先
+  const exact = ACCOUNT_ITEMS
+    .map(r => r[0])
+    .sort((a, b) => b.length - a.length)
+    .find(item => text === item || text.startsWith(item + " "));
+
+  if (exact) return accountByItem(exact);
+
+  for (const rule of KEYWORD_RULES) {
+    if (rule.keys.some(k => text.includes(k))) {
+      return accountByItem(rule.item);
     }
   }
 
-  return "其他支出";
+  return accountByItem("雜項費用");
 }
 
-function classifyIncome(item) {
-  const s = (item || "").toLowerCase();
+async function ensureSheet(sheetName, headers) {
+  const sheets = await getSheets();
 
-  if (s.includes("蛋")) return "銷貨收入";
-  if (s.includes("租")) return "租金收入";
-  if (s.includes("補助")) return "補助收入";
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: SHEET_ID,
+    fields: "sheets.properties(sheetId,title)",
+  });
 
-  return "其他收入";
-}
+  const exists = (meta.data.sheets || []).some(s => s.properties.title === sheetName);
 
-async function getDisplayName(event) {
-  try {
-    if (event.source?.userId) {
-      const profile = await client.getProfile(event.source.userId);
-      return profile.displayName || event.source.userId;
-    }
-  } catch (err) {
-    console.error("取得使用者名稱失敗：", err.message);
+  if (!exists) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: {
+        requests: [{
+          addSheet: {
+            properties: { title: sheetName },
+          },
+        }],
+      },
+    });
   }
 
-  return "未知使用者";
+  if (headers?.length) {
+    const current = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: `'${sheetName}'!A1:${columnLetter(headers.length)}1`,
+    });
+
+    const firstRow = current.data.values?.[0] || [];
+
+    if (firstRow.join("|") !== headers.join("|")) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID,
+        range: `'${sheetName}'!A1:${columnLetter(headers.length)}1`,
+        valueInputOption: "RAW",
+        requestBody: { values: [headers] },
+      });
+    }
+  }
 }
 
-async function appendAccountingRow({
-  date,
-  time,
-  userName,
-  type,
-  category,
-  item,
-  amount,
-  paymentMethod = "",
-  note = "",
-  status = "有效",
-  messageId = "",
-}) {
+function columnLetter(n) {
+  let s = "";
+  while (n > 0) {
+    const m = (n - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+async function ensureBaseStructure() {
+  // 資料分頁
+  await ensureSheet("資料", ["品項", "科目代號", "科目分類"]);
+
+  const sheets = await getSheets();
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: "'資料'!A2:C",
+  });
+
+  if (!(result.data.values || []).length) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: `'資料'!A2:C${ACCOUNT_ITEMS.length + 1}`,
+      valueInputOption: "RAW",
+      requestBody: { values: ACCOUNT_ITEMS },
+    });
+  }
+}
+
+async function ensureMonthSheet(monthSheet) {
+  await ensureSheet(monthSheet, [
+    "場別",
+    "科目代號",
+    "科目分類",
+    "日期",
+    "品項",
+    "用途說明",
+    "廠商名稱",
+    "數量",
+    "單價",
+    "金額",
+    "發票或憑證",
+  ]);
+}
+
+function parseExpenseCommand(text) {
+  const clean = String(text || "").trim().replace(/\s+/g, " ");
+  const parts = clean.split(" ");
+
+  // 格式一：東平 支出 500 電風扇
+  let farm = farmFromToken(parts[0]);
+  let rest;
+
+  if (farm && parts[1] === "支出") {
+    rest = parts.slice(2).join(" ");
+  } else if (parts[0] === "支出") {
+    // 格式二：支出 東平 500 電風扇
+    farm = farmFromToken(parts[1]);
+    if (!farm) return { error: "請先輸入場別，例如：東平 支出 500 電風扇" };
+    rest = parts.slice(2).join(" ");
+  } else {
+    return null;
+  }
+
+  if (farm === "全部") {
+    return { error: "記帳時不能使用「全部」，請指定東平、草湖、潭墘或後寮。" };
+  }
+
+  // 支援 2x600
+  let m = rest.match(/^(\d+(?:\.\d+)?)\s*[xX×*]\s*([\d,]+(?:\.\d+)?)\s+(.+)$/);
+
+  let qty = 1;
+  let unitPrice;
+  let amount;
+  let description;
+
+  if (m) {
+    qty = Number(m[1]);
+    unitPrice = parseAmount(m[2]);
+    amount = qty * unitPrice;
+    description = m[3].trim();
+  } else {
+    m = rest.match(/^([\d,]+(?:\.\d+)?)\s+(.+)$/);
+    if (!m) return { error: "格式例如：東平 支出 500 電風扇" };
+
+    amount = parseAmount(m[1]);
+    unitPrice = amount;
+    description = m[2].trim();
+  }
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return { error: "金額格式不正確" };
+  }
+
+  let vendor = "";
+  const vendorMatch = description.match(/\s+廠商[:：]\s*(.+)$/);
+  if (vendorMatch) {
+    vendor = vendorMatch[1].trim();
+    description = description.slice(0, vendorMatch.index).trim();
+  }
+
+  let selected = null;
+  let purpose = description;
+
+  // 可明確指定 Excel 品項：
+  // 東平 支出 500 雜項費用 電風扇
+  const itemNames = ACCOUNT_ITEMS.map(r => r[0]).sort((a, b) => b.length - a.length);
+
+  for (const item of itemNames) {
+    if (description === item || description.startsWith(item + " ")) {
+      selected = accountByItem(item);
+      purpose = description.slice(item.length).trim() || item;
+      break;
+    }
+  }
+
+  if (!selected) selected = autoChooseItem(description);
+
+  return {
+    farm,
+    qty,
+    unitPrice,
+    amount,
+    accountItem: selected.item,
+    code: selected.code,
+    className: selected.className,
+    description: purpose,
+    vendor,
+  };
+}
+
+async function writeExpense(monthSheet, expense, dateText) {
   const sheets = await getSheets();
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A:K`,
+    range: `'${monthSheet}'!A:K`,
     valueInputOption: "USER_ENTERED",
     insertDataOption: "INSERT_ROWS",
     requestBody: {
       values: [[
-        date,
-        time,
-        userName,
-        type,
-        category,
-        item,
-        amount,
-        paymentMethod,
-        note,
-        status,
-        messageId,
+        expense.farm,
+        expense.code,
+        expense.className,
+        dateText,
+        expense.accountItem,
+        expense.description,
+        expense.vendor,
+        expense.qty,
+        expense.unitPrice,
+        expense.amount,
+        "",
       ]],
     },
   });
 }
 
-async function readRows() {
+async function readMonthRows(monthSheet) {
   const sheets = await getSheets();
 
   const result = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A2:K`,
+    range: `'${monthSheet}'!A2:K`,
+    valueRenderOption: "FORMATTED_VALUE",
   });
 
-  return result.data.values || [];
+  return (result.data.values || []).map(r => ({
+    farm: r[0] || "",
+    code: r[1] || "",
+    className: r[2] || "",
+    date: r[3] || "",
+    item: r[4] || "",
+    description: r[5] || "",
+    vendor: r[6] || "",
+    qty: Number(String(r[7] || "0").replace(/,/g, "")) || 0,
+    unitPrice: Number(String(r[8] || "0").replace(/,/g, "")) || 0,
+    amount: Number(String(r[9] || "0").replace(/,/g, "")) || 0,
+    receipt: r[10] || "",
+  })).filter(r => r.date || r.item || r.amount);
 }
 
-function parseTaiwanDateString(s) {
-  if (!s) return null;
-
-  // 預期 YYYY-MM-DD
-  const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+function parseDateText(s) {
+  const m = String(s || "").match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
   if (!m) return null;
 
   return {
@@ -177,212 +424,193 @@ function parseTaiwanDateString(s) {
   };
 }
 
-function getCurrentTaipeiParts() {
-  const { date } = nowTaipei();
-  return parseTaiwanDateString(date);
+function parseQuery(text) {
+  const clean = String(text || "").trim().replace(/\s+/g, " ");
+  const parts = clean.split(" ");
+
+  // 「今天」「本月」「今年」= 全部場
+  if (["今天", "本月", "今年"].includes(clean)) {
+    return { farm: "全部", mode: clean };
+  }
+
+  // 東平 今天 / 草湖 本月 / 全部 今年
+  if (parts.length === 2) {
+    const farm = farmFromToken(parts[0]);
+    if (farm && ["今天", "本月", "今年"].includes(parts[1])) {
+      return { farm, mode: parts[1] };
+    }
+  }
+
+  return null;
 }
 
-function rowToObj(row) {
-  return {
-    date: row[0] || "",
-    time: row[1] || "",
-    userName: row[2] || "",
-    type: row[3] || "",
-    category: row[4] || "",
-    item: row[5] || "",
-    amount: Number(String(row[6] || "0").replace(/,/g, "")) || 0,
-    paymentMethod: row[7] || "",
-    note: row[8] || "",
-    status: row[9] || "",
-    messageId: row[10] || "",
-  };
-}
+function summaryText(rows, farm, title) {
+  const filtered = farm === "全部" ? rows : rows.filter(r => r.farm === farm);
+  const total = filtered.reduce((sum, r) => sum + r.amount, 0);
 
-function inRangeByMode(dateStr, mode) {
-  const d = parseTaiwanDateString(dateStr);
-  if (!d) return false;
-
-  const current = getCurrentTaipeiParts();
-  if (!current) return false;
-
-  if (mode === "today") {
-    return d.year === current.year &&
-           d.month === current.month &&
-           d.day === current.day;
+  const byItem = {};
+  for (const r of filtered) {
+    if (!r.item) continue;
+    byItem[r.item] = (byItem[r.item] || 0) + r.amount;
   }
 
-  if (mode === "month") {
-    return d.year === current.year &&
-           d.month === current.month;
-  }
+  const top = Object.entries(byItem)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8);
 
-  if (mode === "year") {
-    return d.year === current.year;
-  }
-
-  return false;
-}
-
-async function makeSummary(mode) {
-  const rows = (await readRows())
-    .map(rowToObj)
-    .filter(r => r.status !== "刪除" && r.status !== "作廢")
-    .filter(r => inRangeByMode(r.date, mode));
-
-  let income = 0;
-  let expense = 0;
-
-  for (const row of rows) {
-    if (row.type === "收入") income += row.amount;
-    if (row.type === "支出") expense += row.amount;
-  }
-
-  const profit = income - expense;
-
-  const title =
-    mode === "today" ? "今日統計" :
-    mode === "month" ? "本月統計" :
-    "今年統計";
-
-  return [
-    title,
+  const lines = [
+    `📒 ${farm === "全部" ? "全部場" : farm}｜${title}`,
     "",
-    `💰 收入：${income.toLocaleString("zh-TW")} 元`,
-    `💸 支出：${expense.toLocaleString("zh-TW")} 元`,
-    `${profit >= 0 ? "📈" : "📉"} 盈餘：${profit.toLocaleString("zh-TW")} 元`,
-    "",
-    `🧾 筆數：${rows.length} 筆`,
-  ].join("\n");
+    `💸 支出合計：${total.toLocaleString("zh-TW")} 元`,
+    `🧾 筆數：${filtered.length} 筆`,
+  ];
+
+  if (top.length) {
+    lines.push("", "分類：");
+    for (const [name, value] of top) {
+      lines.push(`・${name}：${value.toLocaleString("zh-TW")} 元`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+async function querySummary(query) {
+  const now = taipeiNow();
+
+  if (query.mode === "今天") {
+    await ensureMonthSheet(now.monthSheet);
+    const rows = await readMonthRows(now.monthSheet);
+
+    const todayRows = rows.filter(r => {
+      const d = parseDateText(r.date);
+      return d &&
+        d.year === Number(now.year) &&
+        d.month === Number(now.month) &&
+        d.day === Number(now.day);
+    });
+
+    return summaryText(todayRows, query.farm, "今日支出");
+  }
+
+  if (query.mode === "本月") {
+    await ensureMonthSheet(now.monthSheet);
+    const rows = await readMonthRows(now.monthSheet);
+    return summaryText(rows, query.farm, `${Number(now.month)}月支出`);
+  }
+
+  // 今年
+  const sheets = await getSheets();
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: SHEET_ID,
+    fields: "sheets.properties.title",
+  });
+
+  const monthSheets = (meta.data.sheets || [])
+    .map(s => s.properties.title)
+    .filter(title => new RegExp(`^${now.year}\\d{2}月$`).test(title))
+    .sort();
+
+  let rows = [];
+
+  for (const monthSheet of monthSheets) {
+    rows = rows.concat(await readMonthRows(monthSheet));
+  }
+
+  return summaryText(rows, query.farm, `${now.year}年支出`);
+}
+
+async function getProfileName(event) {
+  try {
+    if (!event.source?.userId) return "未知使用者";
+    const profile = await client.getProfile(event.source.userId);
+    return profile.displayName || "未知使用者";
+  } catch (_) {
+    return "未知使用者";
+  }
 }
 
 function helpText() {
   return [
-    "📒 LINE 記帳",
+    "📒 雞場支出記帳",
     "",
-    "記帳方式：",
-    "收入 5000 賣蛋",
-    "支出 1200 山貓維修",
+    "【記帳】",
+    "東平 支出 500 電風扇",
+    "草湖 支出 2313 電費",
+    "潭墘 支出 2x600 手推車輪胎",
+    "後寮 支出 1200 山貓維修 廠商:XX五金",
     "",
-    "查詢：",
+    "也可指定 Excel 品項：",
+    "東平 支出 500 雜項費用 電風扇",
+    "",
+    "【查詢】",
     "今天",
     "本月",
     "今年",
-    "",
-    "也可以輸入：",
-    "說明",
-    "幫助",
+    "東平 今天",
+    "草湖 本月",
+    "潭墘 今年",
+    "全部 本月",
   ].join("\n");
 }
 
-function parseBookkeepingCommand(text) {
-  const clean = (text || "").trim().replace(/\s+/g, " ");
-  if (!clean) return null;
-
-  // 格式：收入 5000 賣蛋
-  // 格式：支出 1200 山貓維修
-  const m = clean.match(/^(收入|支出)\s+([\d,]+(?:\.\d+)?)\s*(.*)$/);
-
-  if (!m) return null;
-
-  const type = m[1];
-  const amount = parseAmount(m[2]);
-  const item = (m[3] || "").trim() || "未填品項";
-
-  if (amount === null || amount <= 0) {
-    return { error: "金額格式錯誤" };
-  }
-
-  const category =
-    type === "支出"
-      ? classifyExpense(item)
-      : classifyIncome(item);
-
-  return {
-    type,
-    amount,
-    item,
-    category,
-  };
-}
-
 async function handleTextMessage(event) {
-  const text = event.message.text.trim();
+  const text = String(event.message.text || "").trim();
 
   if (["說明", "幫助", "help", "HELP", "?"].includes(text)) {
     return helpText();
   }
 
-  if (["今天", "今日", "今日統計"].includes(text)) {
-    return await makeSummary("today");
+  await ensureBaseStructure();
+
+  const query = parseQuery(text);
+  if (query) {
+    return await querySummary(query);
   }
 
-  if (["本月", "本月統計"].includes(text)) {
-    return await makeSummary("month");
+  const expense = parseExpenseCommand(text);
+
+  if (expense?.error) {
+    return `❌ ${expense.error}`;
   }
 
-  if (["今年", "年度", "今年統計"].includes(text)) {
-    return await makeSummary("year");
-  }
+  if (expense) {
+    const now = taipeiNow();
+    await ensureMonthSheet(now.monthSheet);
+    await writeExpense(now.monthSheet, expense, now.dateText);
 
-  const cmd = parseBookkeepingCommand(text);
-
-  if (cmd?.error) {
-    return `❌ ${cmd.error}\n\n例如：\n支出 1200 山貓維修`;
-  }
-
-  if (cmd) {
-    const userName = await getDisplayName(event);
-    const { date, time } = nowTaipei();
-
-    await appendAccountingRow({
-      date,
-      time,
-      userName,
-      type: cmd.type,
-      category: cmd.category,
-      item: cmd.item,
-      amount: cmd.amount,
-      messageId: event.message.id || "",
-    });
+    const userName = await getProfileName(event);
 
     return [
-      `✅ ${cmd.type}記錄完成`,
+      "✅ 支出記錄完成",
       "",
-      `品項：${cmd.item}`,
-      `類別：${cmd.category}`,
-      `金額：${cmd.amount.toLocaleString("zh-TW")} 元`,
+      `場別：${expense.farm}`,
+      `日期：${now.dateText}`,
+      `品項：${expense.accountItem}`,
+      `用途：${expense.description}`,
+      expense.vendor ? `廠商：${expense.vendor}` : null,
+      `數量：${expense.qty}`,
+      `單價：${expense.unitPrice.toLocaleString("zh-TW")} 元`,
+      `金額：${expense.amount.toLocaleString("zh-TW")} 元`,
+      `科目代號：${expense.code}`,
+      `科目分類：${expense.className}`,
       `填表人：${userName}`,
-      `日期：${date}`,
-    ].join("\n");
+      `寫入：${now.monthSheet}`,
+    ].filter(Boolean).join("\n");
   }
 
-  return [
-    "我目前支援：",
-    "",
-    "收入 5000 賣蛋",
-    "支出 1200 山貓維修",
-    "",
-    "查詢：今天／本月／今年",
-    "",
-    "輸入「說明」可看完整格式。",
-  ].join("\n");
+  return helpText();
 }
 
 async function handleEvent(event) {
-  if (event.type !== "message") return null;
-  if (event.message.type !== "text") return null;
+  if (event.type !== "message" || event.message.type !== "text") return null;
 
   try {
     const replyText = await handleTextMessage(event);
 
-    if (!replyText) return null;
-
     await client.replyMessage({
       replyToken: event.replyToken,
-      messages: [{
-        type: "text",
-        text: replyText,
-      }],
+      messages: [{ type: "text", text: replyText }],
     });
 
     return "OK";
@@ -404,7 +632,7 @@ async function handleEvent(event) {
 }
 
 app.get("/", (req, res) => {
-  res.send("LINE Accounting Bot V1 is running.");
+  res.send("Chicken Farm Expense Bot - Farm Version is running.");
 });
 
 app.post("/webhook", line.middleware(config), async (req, res) => {
@@ -420,5 +648,5 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`LINE Accounting Bot V1 running on port ${PORT}`);
+  console.log(`Chicken Farm Expense Bot - Farm Version running on port ${PORT}`);
 });

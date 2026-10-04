@@ -375,32 +375,21 @@ function parseExpenseCommand(text) {
 
   let vendor = "";
 
-  // 方式 1：原本格式仍支援
-  // 草湖 支出 500 電風扇 廠商:振豐五金
-  const vendorMatch = description.match(/\s+廠商[:：]\s*(.+)$/);
+  // 建議使用明確分隔符號，避免「電風扇 三豐」被當成同一個用途。
+  // 支援：
+  // 草湖 支出 500 電風扇 / 三豐
+  // 草湖 支出 500 電風扇｜三豐
+  // 草湖 支出 500 電風扇 廠商:三豐
+  const splitMatch = description.match(/^(.+?)\s*[\/｜|]\s*(.+)$/);
 
-  if (vendorMatch) {
-    vendor = vendorMatch[1].trim();
-    description = description.slice(0, vendorMatch.index).trim();
+  if (splitMatch) {
+    description = splitMatch[1].trim();
+    vendor = splitMatch[2].trim();
   } else {
-    // 方式 2：簡易格式
-    // 草湖 支出 500 電風扇 振豐五金
-    // 9/28 草湖 支出 4528 電費 台電
-    //
-    // 為避免把「山貓 維修」之類用途誤認成廠商，
-    // 只有最後一段看起來像廠商名稱時才自動帶入。
-    const words = description.split(/\s+/).filter(Boolean);
-
-    if (words.length >= 2) {
-      const last = words[words.length - 1];
-
-      const looksLikeVendor =
-        /(公司|企業|商行|五金|水電|工程|電機|材料|行|店|廠|中心|台電|中油|農會|合作社|藥局|診所|醫院|牧場|蛋行|農產|實業|股份|有限公司|工作室|加油站)$/.test(last);
-
-      if (looksLikeVendor) {
-        vendor = last;
-        description = words.slice(0, -1).join(" ").trim();
-      }
+    const vendorMatch = description.match(/\s+廠商[:：]\s*(.+)$/);
+    if (vendorMatch) {
+      vendor = vendorMatch[1].trim();
+      description = description.slice(0, vendorMatch.index).trim();
     }
   }
 
@@ -615,13 +604,6 @@ function helpText() {
     "",
     "【數量 × 單價】",
     "9/20 草湖 支出 2x600 手推車輪胎",
-    "",
-    "【直接輸入廠商】",
-    "草湖 支出 500 電風扇 振豐五金",
-    "9/28 草湖 支出 4528 電費 台電",
-    "",
-    "原本格式也能用：",
-    "草湖 支出 500 電風扇 廠商:振豐五金",
     "",
     "也可指定 Excel 品項：",
     "東平 支出 500 雜項費用 電風扇",

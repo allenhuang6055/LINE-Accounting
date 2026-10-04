@@ -156,6 +156,53 @@ function taipeiNow() {
   };
 }
 
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function makeDateInfo(year, month, day) {
+  const d = new Date(year, month - 1, day);
+  if (d.getFullYear() !== year || d.getMonth() + 1 !== month || d.getDate() !== day) {
+    return null;
+  }
+  return {
+    year, month, day,
+    dateText: `${year}/${pad2(month)}/${pad2(day)}`,
+    monthSheet: `${year}${pad2(month)}月`,
+  };
+}
+
+function parseOptionalDatePrefix(text) {
+  const clean = String(text || "").trim().replace(/\s+/g, " ");
+  const now = taipeiNow();
+
+  let m = clean.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})\s+(.+)$/);
+  if (m) {
+    const dateInfo = makeDateInfo(Number(m[1]), Number(m[2]), Number(m[3]));
+    if (!dateInfo) return { error: "日期格式不正確，例如：2026/9/28 東平 支出 500 電風扇" };
+    return { dateInfo, body: m[4].trim(), isCustomDate: true };
+  }
+
+  m = clean.match(/^(\d{1,2})[\/\-](\d{1,2})\s+(.+)$/);
+  if (m) {
+    const dateInfo = makeDateInfo(Number(now.year), Number(m[1]), Number(m[2]));
+    if (!dateInfo) return { error: "日期格式不正確，例如：9/28 東平 支出 500 電風扇" };
+    return { dateInfo, body: m[3].trim(), isCustomDate: true };
+  }
+
+  return {
+    dateInfo: {
+      year: Number(now.year),
+      month: Number(now.month),
+      day: Number(now.day),
+      dateText: now.dateText,
+      monthSheet: now.monthSheet,
+    },
+    body: clean,
+    isCustomDate: false,
+  };
+}
+
 function parseAmount(v) {
   return Number(String(v || "").replace(/,/g, "").trim());
 }
@@ -534,11 +581,16 @@ function helpText() {
   return [
     "📒 雞場支出記帳",
     "",
-    "【記帳】",
+    "【今天的帳】",
     "東平 支出 500 電風扇",
     "草湖 支出 2313 電費",
-    "潭墘 支出 2x600 手推車輪胎",
-    "後寮 支出 1200 山貓維修 廠商:XX五金",
+    "",
+    "【補登以前日期】",
+    "9/28 東平 支出 4528 電費",
+    "2026/9/28 草湖 支出 500 電風扇",
+    "",
+    "【數量 × 單價】",
+    "9/20 草湖 支出 2x600 手推車輪胎",
     "",
     "也可指定 Excel 品項：",
     "東平 支出 500 雜項費用 電風扇",
@@ -568,24 +620,29 @@ async function handleTextMessage(event) {
     return await querySummary(query);
   }
 
-  const expense = parseExpenseCommand(text);
+  const dated = parseOptionalDatePrefix(text);
+  if (dated.error) {
+    return `❌ ${dated.error}`;
+  }
+
+  const expense = parseExpenseCommand(dated.body);
 
   if (expense?.error) {
     return `❌ ${expense.error}`;
   }
 
   if (expense) {
-    const now = taipeiNow();
-    await ensureMonthSheet(now.monthSheet);
-    await writeExpense(now.monthSheet, expense, now.dateText);
+    await ensureMonthSheet(dated.dateInfo.monthSheet);
+    await writeExpense(dated.dateInfo.monthSheet, expense, dated.dateInfo.dateText);
 
     const userName = await getProfileName(event);
 
     return [
       "✅ 支出記錄完成",
       "",
+      dated.isCustomDate ? "🗓️ 補登日期" : null,
       `場別：${expense.farm}`,
-      `日期：${now.dateText}`,
+      `日期：${dated.dateInfo.dateText}`,
       `品項：${expense.accountItem}`,
       `用途：${expense.description}`,
       expense.vendor ? `廠商：${expense.vendor}` : null,
@@ -595,7 +652,7 @@ async function handleTextMessage(event) {
       `科目代號：${expense.code}`,
       `科目分類：${expense.className}`,
       `填表人：${userName}`,
-      `寫入：${now.monthSheet}`,
+      `寫入：${dated.dateInfo.monthSheet}`,
     ].filter(Boolean).join("\n");
   }
 
@@ -632,7 +689,7 @@ async function handleEvent(event) {
 }
 
 app.get("/", (req, res) => {
-  res.send("Chicken Farm Expense Bot - Farm Version is running.");
+  res.send("Chicken Farm Expense Bot - Backdate Version is running.");
 });
 
 app.post("/webhook", line.middleware(config), async (req, res) => {
@@ -648,5 +705,5 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`Chicken Farm Expense Bot - Farm Version running on port ${PORT}`);
+  console.log(`Chicken Farm Expense Bot - Backdate Version running on port ${PORT}`);
 });

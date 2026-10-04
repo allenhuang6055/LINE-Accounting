@@ -487,17 +487,55 @@ function parseDateText(s) {
 function parseQuery(text) {
   const clean = String(text || "").trim().replace(/\s+/g, " ");
   const parts = clean.split(" ");
+  const now = taipeiNow();
 
-  // 「今天」「本月」「今年」= 全部場
   if (["今天", "本月", "今年"].includes(clean)) {
     return { farm: "全部", mode: clean };
   }
 
-  // 東平 今天 / 草湖 本月 / 全部 今年
+  // 9月
+  let m = clean.match(/^(\d{1,2})月$/);
+  if (m) {
+    const month = Number(m[1]);
+    if (month >= 1 && month <= 12) {
+      return { farm: "全部", mode: "指定月份", year: now.year, month };
+    }
+  }
+
+  // 2026/9 或 2026-9
+  m = clean.match(/^(\d{4})[\/\-](\d{1,2})$/);
+  if (m) {
+    const year = Number(m[1]);
+    const month = Number(m[2]);
+    if (month >= 1 && month <= 12) {
+      return { farm: "全部", mode: "指定月份", year, month };
+    }
+  }
+
   if (parts.length === 2) {
     const farm = farmFromToken(parts[0]);
+
     if (farm && ["今天", "本月", "今年"].includes(parts[1])) {
       return { farm, mode: parts[1] };
+    }
+
+    // 草湖 9月
+    m = parts[1].match(/^(\d{1,2})月$/);
+    if (farm && m) {
+      const month = Number(m[1]);
+      if (month >= 1 && month <= 12) {
+        return { farm, mode: "指定月份", year: now.year, month };
+      }
+    }
+
+    // 東平 2026/9
+    m = parts[1].match(/^(\d{4})[\/\-](\d{1,2})$/);
+    if (farm && m) {
+      const year = Number(m[1]);
+      const month = Number(m[2]);
+      if (month >= 1 && month <= 12) {
+        return { farm, mode: "指定月份", year, month };
+      }
     }
   }
 
@@ -537,6 +575,35 @@ function summaryText(rows, farm, title) {
 
 async function querySummary(query) {
   const now = taipeiNow();
+
+  if (query.mode === "指定月份") {
+    const monthSheet = `${query.year}${pad2(query.month)}月`;
+
+    const sheets = await getSheets();
+    const meta = await sheets.spreadsheets.get({
+      spreadsheetId: SHEET_ID,
+      fields: "sheets.properties.title",
+    });
+
+    const exists = (meta.data.sheets || []).some(
+      s => s.properties.title === monthSheet
+    );
+
+    if (!exists) {
+      return [
+        `📒 ${query.farm === "全部" ? "全部場" : query.farm}｜${query.year}年${query.month}月支出`,
+        "",
+        "目前沒有這個月份的資料。",
+      ].join("\n");
+    }
+
+    const rows = await readMonthRows(monthSheet);
+    return summaryText(
+      rows,
+      query.farm,
+      `${query.year}年${query.month}月支出`
+    );
+  }
 
   if (query.mode === "今天") {
     await ensureMonthSheet(now.monthSheet);
@@ -595,28 +662,28 @@ function helpText() {
     "📒 雞場支出記帳",
     "",
     "【今天的帳】",
-    "東平 支出 500 電風扇",
-    "草湖 支出 2313 電費",
+    "東平 支出 500 電風扇 / 三豐",
+    "草湖 支出 2313 電費 / 台電",
     "",
     "【補登以前日期】",
-    "9/28 東平 支出 4528 電費",
-    "2026/9/28 草湖 支出 500 電風扇",
+    "9/28 東平 支出 4528 電費 / 台電",
+    "2026/9/28 草湖 支出 500 電風扇 / 三豐",
     "",
-    "【數量 × 單價】",
-    "9/20 草湖 支出 2x600 手推車輪胎",
+    "【指定月份查詢】",
+    "9月",
+    "草湖 9月",
+    "全部 9月",
+    "2026/9",
+    "東平 2026/9",
     "",
-    "也可指定 Excel 品項：",
-    "東平 支出 500 雜項費用 電風扇",
-    "",
-    "【查詢】",
+    "【其他查詢】",
     "今天",
     "本月",
     "今年",
     "東平 今天",
     "草湖 本月",
-    "潭墘 今年",
     "全部 本月",
-  ].join("\n");
+  ].join("\\n");
 }
 
 async function handleTextMessage(event) {

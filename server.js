@@ -689,6 +689,23 @@ function helpText() {
 async function handleTextMessage(event) {
   const text = String(event.message.text || "").trim();
 
+  // ===== 查詢自己的 LINE User ID =====
+  if (text === "我的ID") {
+    const userId = event.source?.userId || "";
+    const userName = await getProfileName(event);
+
+    if (!userId) {
+      return "❌ 目前無法取得你的 LINE User ID。";
+    }
+
+    return [
+      "🪪 LINE 使用者資料",
+      "",
+      `名稱：${userName}`,
+      `LINE User ID：${userId}`,
+    ].join("\n");
+  }
+
   if (["說明", "幫助", "help", "HELP", "?"].includes(text)) {
     return helpText();
   }

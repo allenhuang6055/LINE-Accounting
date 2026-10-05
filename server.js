@@ -430,6 +430,8 @@ async function ensureMonthSheet(sheetId, monthSheet) {
     "單價",
     "金額",
     "發票或憑證",
+    "付款來源",
+    "收支類型",
   ]);
 }
 
@@ -437,26 +439,42 @@ function parseExpenseCommand(text) {
   const clean = String(text || "").trim().replace(/\s+/g, " ");
   const parts = clean.split(" ");
 
-  // 格式一：東平 支出 500 電風扇
   let farm = farmFromToken(parts[0]);
+  let txType = "";
+  let paymentSource = "雞場帳戶";
   let rest;
 
-  if (farm && parts[1] === "支出") {
-    rest = parts.slice(2).join(" ");
-  } else if (parts[0] === "支出") {
-    // 格式二：支出 東平 500 電風扇
+  // 支援：
+  // 草湖 支出 500 電風扇 / 三豐
+  // 草湖 收入 5000 雞蛋銷售 / 客戶
+  // 草湖 零 支出 500 電風扇 / 三豐
+  // 草湖 零 收入 5000 其他收入 / 客戶
+  if (farm) {
+    if (parts[1] === "零") {
+      paymentSource = "零用金";
+      txType = parts[2];
+      rest = parts.slice(3).join(" ");
+    } else {
+      txType = parts[1];
+      rest = parts.slice(2).join(" ");
+    }
+  } else if (["支出", "收入"].includes(parts[0])) {
     farm = farmFromToken(parts[1]);
     if (!farm) return { error: "請先輸入場別，例如：東平 支出 500 電風扇" };
+    txType = parts[0];
     rest = parts.slice(2).join(" ");
   } else {
     return null;
   }
 
-  if (farm === "全部") {
-    return { error: "記帳時不能使用「全部」，請指定東平、草湖、仁愛、東勢、埤北、賜福、永興、秉夆、後寮、鎮平、二崙、東陽、潭墘、龍潭或泰順。" };
+  if (!["支出", "收入"].includes(txType)) {
+    return null;
   }
 
-  // 支援 2x600
+  if (farm === "全部") {
+    return { error: "記帳時不能使用「全部」，請指定實際場別。" };
+  }
+
   let m = rest.match(/^(\d+(?:\.\d+)?)\s*[xX×*]\s*([\d,]+(?:\.\d+)?)\s+(.+)$/);
 
   let qty = 1;
@@ -471,7 +489,7 @@ function parseExpenseCommand(text) {
     description = m[3].trim();
   } else {
     m = rest.match(/^([\d,]+(?:\.\d+)?)\s+(.+)$/);
-    if (!m) return { error: "格式例如：東平 支出 500 電風扇" };
+    if (!m) return { error: `格式例如：東平 ${txType} 500 電風扇` };
 
     amount = parseAmount(m[1]);
     unitPrice = amount;
@@ -484,11 +502,6 @@ function parseExpenseCommand(text) {
 
   let vendor = "";
 
-  // 建議使用明確分隔符號，避免「電風扇 三豐」被當成同一個用途。
-  // 支援：
-  // 草湖 支出 500 電風扇 / 三豐
-  // 草湖 支出 500 電風扇｜三豐
-  // 草湖 支出 500 電風扇 廠商:三豐
   const splitMatch = description.match(/^(.+?)\s*[\/｜|]\s*(.+)$/);
 
   if (splitMatch) {
@@ -505,8 +518,6 @@ function parseExpenseCommand(text) {
   let selected = null;
   let purpose = description;
 
-  // 可明確指定 Excel 品項：
-  // 東平 支出 500 雜項費用 電風扇
   const itemNames = ACCOUNT_ITEMS.map(r => r[0]).sort((a, b) => b.length - a.length);
 
   for (const item of itemNames) {
@@ -529,6 +540,8 @@ function parseExpenseCommand(text) {
     className: selected.className,
     description: purpose,
     vendor,
+    paymentSource,
+    txType,
   };
 }
 
@@ -537,7 +550,7 @@ async function writeExpense(sheetId, monthSheet, expense, dateText) {
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
-    range: `'${monthSheet}'!A:K`,
+    range: `'${monthSheet}'!A:M`,
     valueInputOption: "USER_ENTERED",
     insertDataOption: "INSERT_ROWS",
     requestBody: {
@@ -553,6 +566,8 @@ async function writeExpense(sheetId, monthSheet, expense, dateText) {
         expense.unitPrice,
         expense.amount,
         "",
+        expense.paymentSource || "雞場帳戶",
+        expense.txType || "支出",
       ]],
     },
   });
@@ -563,7 +578,7 @@ async function readMonthRows(sheetId, monthSheet) {
 
   const result = await sheets.spreadsheets.values.get({
     spreadsheetId: sheetId,
-    range: `'${monthSheet}'!A2:K`,
+    range: `'${monthSheet}'!A2:M`,
     valueRenderOption: "FORMATTED_VALUE",
   });
 
@@ -579,6 +594,8 @@ async function readMonthRows(sheetId, monthSheet) {
     unitPrice: Number(String(r[8] || "0").replace(/,/g, "")) || 0,
     amount: Number(String(r[9] || "0").replace(/,/g, "")) || 0,
     receipt: r[10] || "",
+    paymentSource: r[11] || "",
+    txType: r[12] || "支出",
   })).filter(r => r.date || r.item || r.amount);
 }
 
@@ -653,10 +670,16 @@ function parseQuery(text) {
 
 function summaryText(rows, farm, title) {
   const filtered = farm === "全部" ? rows : rows.filter(r => r.farm === farm);
-  const total = filtered.reduce((sum, r) => sum + r.amount, 0);
+
+  const expenseRows = filtered.filter(r => (r.txType || "支出") === "支出");
+  const incomeRows = filtered.filter(r => r.txType === "收入");
+
+  const expenseTotal = expenseRows.reduce((sum, r) => sum + r.amount, 0);
+  const incomeTotal = incomeRows.reduce((sum, r) => sum + r.amount, 0);
+  const net = incomeTotal - expenseTotal;
 
   const byItem = {};
-  for (const r of filtered) {
+  for (const r of expenseRows) {
     if (!r.item) continue;
     byItem[r.item] = (byItem[r.item] || 0) + r.amount;
   }
@@ -668,12 +691,14 @@ function summaryText(rows, farm, title) {
   const lines = [
     `📒 ${farm === "全部" ? "全部場" : farm}｜${title}`,
     "",
-    `💸 支出合計：${total.toLocaleString("zh-TW")} 元`,
+    `💸 支出合計：${expenseTotal.toLocaleString("zh-TW")} 元`,
+    `💰 收入合計：${incomeTotal.toLocaleString("zh-TW")} 元`,
+    `📊 收支差額：${net.toLocaleString("zh-TW")} 元`,
     `🧾 筆數：${filtered.length} 筆`,
   ];
 
   if (top.length) {
-    lines.push("", "分類：");
+    lines.push("", "支出分類：");
     for (const [name, value] of top) {
       lines.push(`・${name}：${value.toLocaleString("zh-TW")} 元`);
     }
@@ -710,7 +735,7 @@ async function querySummary(sheetId, query) {
     return summaryText(
       rows,
       query.farm,
-      `${query.year}年${query.month}月支出`
+      `${query.year}年${query.month}月收支`
     );
   }
 
@@ -726,13 +751,13 @@ async function querySummary(sheetId, query) {
         d.day === Number(now.day);
     });
 
-    return summaryText(todayRows, query.farm, "今日支出");
+    return summaryText(todayRows, query.farm, "今日收支");
   }
 
   if (query.mode === "本月") {
     await ensureMonthSheet(sheetId, now.monthSheet);
     const rows = await readMonthRows(sheetId, now.monthSheet);
-    return summaryText(rows, query.farm, `${Number(now.month)}月支出`);
+    return summaryText(rows, query.farm, `${Number(now.month)}月收支`);
   }
 
   // 今年
@@ -753,7 +778,7 @@ async function querySummary(sheetId, query) {
     rows = rows.concat(await readMonthRows(sheetId, monthSheet));
   }
 
-  return summaryText(rows, query.farm, `${now.year}年支出`);
+  return summaryText(rows, query.farm, `${now.year}年收支`);
 }
 
 async function getProfileName(event) {
@@ -772,7 +797,10 @@ function helpText() {
     "",
     "【今天的帳】",
     "東平 支出 500 電風扇 / 三豐",
-    "草湖 支出 2313 電費 / 台電",
+    "草湖 零 支出 2313 電費 / 台電",
+    "仁愛 收入 5000 雞蛋銷售 / 客戶",
+    "",
+    "付款來源：未寫＝雞場帳戶；「零」＝零用金",
     "",
     "【補登以前日期】",
     "9/28 東平 支出 4528 電費 / 台電",
@@ -851,7 +879,7 @@ async function handleTextMessage(event) {
     const userName = await getProfileName(event);
 
     return [
-      "✅ 支出記錄完成",
+      `✅ ${expense.txType}記錄完成`,
       "",
       dated.isCustomDate ? "🗓️ 補登日期" : null,
       `場別：${expense.farm}`,
@@ -862,6 +890,8 @@ async function handleTextMessage(event) {
       `數量：${expense.qty}`,
       `單價：${expense.unitPrice.toLocaleString("zh-TW")} 元`,
       `金額：${expense.amount.toLocaleString("zh-TW")} 元`,
+      `付款來源：${expense.paymentSource}`,
+      `收支類型：${expense.txType}`,
       `科目代號：${expense.code}`,
       `科目分類：${expense.className}`,
       `填表人：${userName}`,

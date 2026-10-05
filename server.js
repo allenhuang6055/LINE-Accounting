@@ -15,7 +15,8 @@ const client = new line.messagingApi.MessagingApiClient({
   channelAccessToken: config.channelAccessToken,
 });
 
-const SHEET_ID = process.env.GOOGLE_SHEET_ID;
+const DEFAULT_SHEET_ID = process.env.GOOGLE_SHEET_ID;
+const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
 
 // ===== 場別 =====
 const FARM_ALIASES = {
@@ -27,6 +28,10 @@ const FARM_ALIASES = {
   "潭墘場": "潭墘場",
   "後寮": "後寮場",
   "後寮場": "後寮場",
+  "仁愛": "仁愛場",
+  "仁愛場": "仁愛場",
+  "埤北": "埤北場",
+  "埤北場": "埤北場",
   "共用": "共用",
   "共同": "共用",
   "全部": "全部",
@@ -236,11 +241,95 @@ function autoChooseItem(description) {
   return accountByItem("雜項費用");
 }
 
-async function ensureSheet(sheetName, headers) {
+
+async function getMasterSheetTitle() {
+  if (!MASTER_SHEET_ID) return null;
+
+  const sheets = await getSheets();
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: MASTER_SHEET_ID,
+    fields: "sheets.properties(title,index)",
+  });
+
+  const tabs = (meta.data.sheets || [])
+    .map(s => s.properties)
+    .sort((a, b) => (a.index || 0) - (b.index || 0));
+
+  return tabs[0]?.title || null;
+}
+
+async function resolveUserSheet(event) {
+  const userId = event.source?.userId || "";
+
+  // 如果尚未設定主檔，暫時沿用原本單人版 Sheet。
+  if (!MASTER_SHEET_ID) {
+    if (!DEFAULT_SHEET_ID) {
+      throw new Error("缺少 MASTER_SHEET_ID 與 GOOGLE_SHEET_ID");
+    }
+
+    return {
+      sheetId: DEFAULT_SHEET_ID,
+      name: await getProfileName(event),
+      source: "default",
+    };
+  }
+
+  if (!userId) {
+    throw new Error("無法取得 LINE User ID");
+  }
+
+  const masterTitle = await getMasterSheetTitle();
+  if (!masterTitle) {
+    throw new Error("使用者主檔沒有可讀取的分頁");
+  }
+
+  const sheets = await getSheets();
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: MASTER_SHEET_ID,
+    range: `'${masterTitle}'!A2:F`,
+    valueRenderOption: "FORMATTED_VALUE",
+  });
+
+  const rows = result.data.values || [];
+
+  const matched = rows.find(r =>
+    String(r[2] || "").trim() === userId
+  );
+
+  if (!matched) {
+    return {
+      error: "❌ 你的帳號尚未登記在使用者主檔。\n請先聯絡管理者完成綁定。",
+    };
+  }
+
+  const name = String(matched[0] || "").trim() || "未命名";
+  const sheetId = String(matched[3] || "").trim();
+  const enabled = String(matched[4] || "").trim().toUpperCase();
+
+  if (!["Y", "YES", "TRUE", "1", "啟用"].includes(enabled)) {
+    return {
+      error: `❌ ${name} 的帳號目前尚未啟用。`,
+    };
+  }
+
+  if (!sheetId) {
+    return {
+      error: `❌ ${name} 尚未設定 Google Sheet ID。`,
+    };
+  }
+
+  return {
+    sheetId,
+    name,
+    source: "master",
+  };
+}
+
+async function ensureSheet(sheetId, sheetName, headers) {
   const sheets = await getSheets();
 
   const meta = await sheets.spreadsheets.get({
-    spreadsheetId: SHEET_ID,
+    spreadsheetId: sheetId,
     fields: "sheets.properties(sheetId,title)",
   });
 
@@ -248,7 +337,7 @@ async function ensureSheet(sheetName, headers) {
 
   if (!exists) {
     await sheets.spreadsheets.batchUpdate({
-      spreadsheetId: SHEET_ID,
+      spreadsheetId: sheetId,
       requestBody: {
         requests: [{
           addSheet: {
@@ -261,7 +350,7 @@ async function ensureSheet(sheetName, headers) {
 
   if (headers?.length) {
     const current = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID,
+      spreadsheetId: sheetId,
       range: `'${sheetName}'!A1:${columnLetter(headers.length)}1`,
     });
 
@@ -269,7 +358,7 @@ async function ensureSheet(sheetName, headers) {
 
     if (firstRow.join("|") !== headers.join("|")) {
       await sheets.spreadsheets.values.update({
-        spreadsheetId: SHEET_ID,
+        spreadsheetId: sheetId,
         range: `'${sheetName}'!A1:${columnLetter(headers.length)}1`,
         valueInputOption: "RAW",
         requestBody: { values: [headers] },
@@ -288,19 +377,19 @@ function columnLetter(n) {
   return s;
 }
 
-async function ensureBaseStructure() {
+async function ensureBaseStructure(sheetId) {
   // 資料分頁
-  await ensureSheet("資料", ["品項", "科目代號", "科目分類"]);
+  await ensureSheet(sheetId, "資料", ["品項", "科目代號", "科目分類"]);
 
   const sheets = await getSheets();
   const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
+    spreadsheetId: sheetId,
     range: "'資料'!A2:C",
   });
 
   if (!(result.data.values || []).length) {
     await sheets.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID,
+      spreadsheetId: sheetId,
       range: `'資料'!A2:C${ACCOUNT_ITEMS.length + 1}`,
       valueInputOption: "RAW",
       requestBody: { values: ACCOUNT_ITEMS },
@@ -308,8 +397,8 @@ async function ensureBaseStructure() {
   }
 }
 
-async function ensureMonthSheet(monthSheet) {
-  await ensureSheet(monthSheet, [
+async function ensureMonthSheet(sheetId, monthSheet) {
+  await ensureSheet(sheetId, monthSheet, [
     "場別",
     "科目代號",
     "科目分類",
@@ -344,7 +433,7 @@ function parseExpenseCommand(text) {
   }
 
   if (farm === "全部") {
-    return { error: "記帳時不能使用「全部」，請指定東平、草湖、潭墘或後寮。" };
+    return { error: "記帳時不能使用「全部」，請指定東平、草湖、潭墘、後寮、仁愛或埤北。" };
   }
 
   // 支援 2x600
@@ -423,11 +512,11 @@ function parseExpenseCommand(text) {
   };
 }
 
-async function writeExpense(monthSheet, expense, dateText) {
+async function writeExpense(sheetId, monthSheet, expense, dateText) {
   const sheets = await getSheets();
 
   await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID,
+    spreadsheetId: sheetId,
     range: `'${monthSheet}'!A:K`,
     valueInputOption: "USER_ENTERED",
     insertDataOption: "INSERT_ROWS",
@@ -449,11 +538,11 @@ async function writeExpense(monthSheet, expense, dateText) {
   });
 }
 
-async function readMonthRows(monthSheet) {
+async function readMonthRows(sheetId, monthSheet) {
   const sheets = await getSheets();
 
   const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
+    spreadsheetId: sheetId,
     range: `'${monthSheet}'!A2:K`,
     valueRenderOption: "FORMATTED_VALUE",
   });
@@ -573,7 +662,7 @@ function summaryText(rows, farm, title) {
   return lines.join("\n");
 }
 
-async function querySummary(query) {
+async function querySummary(sheetId, query) {
   const now = taipeiNow();
 
   if (query.mode === "指定月份") {
@@ -581,7 +670,7 @@ async function querySummary(query) {
 
     const sheets = await getSheets();
     const meta = await sheets.spreadsheets.get({
-      spreadsheetId: SHEET_ID,
+      spreadsheetId: sheetId,
       fields: "sheets.properties.title",
     });
 
@@ -597,7 +686,7 @@ async function querySummary(query) {
       ].join("\n");
     }
 
-    const rows = await readMonthRows(monthSheet);
+    const rows = await readMonthRows(sheetId, monthSheet);
     return summaryText(
       rows,
       query.farm,
@@ -606,8 +695,8 @@ async function querySummary(query) {
   }
 
   if (query.mode === "今天") {
-    await ensureMonthSheet(now.monthSheet);
-    const rows = await readMonthRows(now.monthSheet);
+    await ensureMonthSheet(sheetId, now.monthSheet);
+    const rows = await readMonthRows(sheetId, now.monthSheet);
 
     const todayRows = rows.filter(r => {
       const d = parseDateText(r.date);
@@ -621,15 +710,15 @@ async function querySummary(query) {
   }
 
   if (query.mode === "本月") {
-    await ensureMonthSheet(now.monthSheet);
-    const rows = await readMonthRows(now.monthSheet);
+    await ensureMonthSheet(sheetId, now.monthSheet);
+    const rows = await readMonthRows(sheetId, now.monthSheet);
     return summaryText(rows, query.farm, `${Number(now.month)}月支出`);
   }
 
   // 今年
   const sheets = await getSheets();
   const meta = await sheets.spreadsheets.get({
-    spreadsheetId: SHEET_ID,
+    spreadsheetId: sheetId,
     fields: "sheets.properties.title",
   });
 
@@ -641,7 +730,7 @@ async function querySummary(query) {
   let rows = [];
 
   for (const monthSheet of monthSheets) {
-    rows = rows.concat(await readMonthRows(monthSheet));
+    rows = rows.concat(await readMonthRows(sheetId, monthSheet));
   }
 
   return summaryText(rows, query.farm, `${now.year}年支出`);
@@ -710,11 +799,18 @@ async function handleTextMessage(event) {
     return helpText();
   }
 
-  await ensureBaseStructure();
+  const userSheet = await resolveUserSheet(event);
+  if (userSheet.error) {
+    return userSheet.error;
+  }
+
+  const targetSheetId = userSheet.sheetId;
+
+  await ensureBaseStructure(targetSheetId);
 
   const query = parseQuery(text);
   if (query) {
-    return await querySummary(query);
+    return await querySummary(targetSheetId, query);
   }
 
   const dated = parseOptionalDatePrefix(text);
@@ -729,8 +825,8 @@ async function handleTextMessage(event) {
   }
 
   if (expense) {
-    await ensureMonthSheet(dated.dateInfo.monthSheet);
-    await writeExpense(dated.dateInfo.monthSheet, expense, dated.dateInfo.dateText);
+    await ensureMonthSheet(targetSheetId, dated.dateInfo.monthSheet);
+    await writeExpense(targetSheetId, dated.dateInfo.monthSheet, expense, dated.dateInfo.dateText);
 
     const userName = await getProfileName(event);
 
@@ -749,6 +845,7 @@ async function handleTextMessage(event) {
       `科目代號：${expense.code}`,
       `科目分類：${expense.className}`,
       `填表人：${userName}`,
+      `帳本：${userSheet.name}`,
       `寫入：${dated.dateInfo.monthSheet}`,
     ].filter(Boolean).join("\n");
   }
@@ -786,7 +883,7 @@ async function handleEvent(event) {
 }
 
 app.get("/", (req, res) => {
-  res.send("Chicken Farm Expense Bot - Backdate Version is running.");
+  res.send("Chicken Farm Expense Bot - Multi User Test Version is running.");
 });
 
 app.post("/webhook", line.middleware(config), async (req, res) => {
@@ -802,5 +899,5 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`Chicken Farm Expense Bot - Backdate Version running on port ${PORT}`);
+  console.log(`Chicken Farm Expense Bot - Multi User Test Version running on port ${PORT}`);
 });

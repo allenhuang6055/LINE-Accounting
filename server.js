@@ -647,87 +647,30 @@ async function parseExpenseCommand(text) {
   const clean = String(text || "").trim().replace(/\s+/g, " ");
   const parts = clean.split(" ");
 
-  let farm = farmFromToken(parts[0]);
-  let txType = "";
+  const farm = farmFromToken(parts[0]);
   let paymentSource = "雞場帳戶";
-  let advanceTarget = "";
-  let rest = "";
+  let actionIndex = 1;
 
-  if (!farm) {
-    return null;
-  }
+  if (!farm) return null;
 
   if (farm === "全部") {
     return { error: "記帳時不能使用「全部」，請指定實際場別。" };
   }
 
-  // 支援「零」：草湖 零 支出 500 ...
-  // 也支援：草湖 零 代仁愛 1500 ...
-  //         草湖 零 代分配 20000 ...
-  let actionIndex = 1;
+  // 零用金：草湖 零 支出 500 ...
   if (parts[1] === "零") {
     paymentSource = "零用金";
     actionIndex = 2;
   }
 
-  const action = String(parts[actionIndex] || "").trim();
+  const txType = String(parts[actionIndex] || "").trim();
 
-  // ===== 一般支出 / 收入 =====
-  if (["支出", "收入"].includes(action)) {
-    txType = action;
-    rest = parts.slice(actionIndex + 1).join(" ");
-  }
-  // ===== 代分配 =====
-  else if (action === "代分配" || action === "待分配採購") {
-    txType = "代分配";
-    rest = parts.slice(actionIndex + 1).join(" ");
-  }
-  // ===== 代某場：代仁愛、代東勢... =====
-  else if (action.startsWith("代") && action.length > 1) {
-    const targetToken = action.slice(1);
-    const targetFarm = farmFromToken(targetToken);
-
-    if (!targetFarm || targetFarm === "全部" || targetFarm === "共用") {
-      return {
-        error: "代墊格式例如：草湖 代仁愛 1500 油資 / 中油",
-      };
-    }
-
-    txType = "代墊";
-    advanceTarget = targetFarm;
-    rest = parts.slice(actionIndex + 1).join(" ");
-  }
-  // ===== 收某場：收仁愛、收東勢... =====
-  else if (action.startsWith("收") && action.length > 1) {
-    const targetToken = action.slice(1);
-    const targetFarm = farmFromToken(targetToken);
-
-    if (!targetFarm || targetFarm === "全部" || targetFarm === "共用") {
-      return {
-        error: "代墊收回格式例如：草湖 收仁愛 1500 油資 / 中油",
-      };
-    }
-
-    txType = "代墊收回";
-    advanceTarget = targetFarm;
-    paymentSource = "";
-    rest = parts.slice(actionIndex + 1).join(" ");
-  }
-  // ===== 舊語法相容 =====
-  else if (action === "代墊") {
-    txType = "代墊";
-    advanceTarget = farm;
-    rest = parts.slice(actionIndex + 1).join(" ");
-  }
-  else if (action === "代墊收回" || action === "收回代墊") {
-    txType = "代墊收回";
-    advanceTarget = farm;
-    paymentSource = "";
-    rest = parts.slice(actionIndex + 1).join(" ");
-  }
-  else {
+  // 正式簡化版只保留「支出 / 收入」
+  if (!["支出", "收入"].includes(txType)) {
     return null;
   }
+
+  const rest = parts.slice(actionIndex + 1).join(" ");
 
   let qty = 1;
   let unitPrice;
@@ -746,15 +689,6 @@ async function parseExpenseCommand(text) {
     m = rest.match(/^([\d,]+(?:\.\d+)?)(?:\s+(.+))?$/);
 
     if (!m) {
-      if (txType === "代分配") {
-        return { error: "格式例如：草湖 代分配 20000 ADE 10瓶 / XX公司" };
-      }
-      if (txType === "代墊") {
-        return { error: "格式例如：草湖 代仁愛 1500 油資 / 中油" };
-      }
-      if (txType === "代墊收回") {
-        return { error: "格式例如：草湖 收仁愛 1500 油資 / 中油" };
-      }
       return { error: `格式例如：草湖 ${txType} 500 電風扇 / 三豐` };
     }
 
@@ -765,11 +699,6 @@ async function parseExpenseCommand(text) {
 
   if (!Number.isFinite(amount) || amount <= 0) {
     return { error: "金額格式不正確" };
-  }
-
-  // 收回可不填用途
-  if (!description && txType === "代墊收回") {
-    description = "代墊還款";
   }
 
   if (!description) {
@@ -827,7 +756,7 @@ async function parseExpenseCommand(text) {
     vendor,
     paymentSource,
     txType,
-    advanceTarget,
+    advanceTarget: "",
   };
 }
 
@@ -852,7 +781,7 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName) {
         expense.vendor,
         expense.qty,
         expense.unitPrice,
-        expense.amount,
+        expense.txType === "收入" ? -Math.abs(expense.amount) : Math.abs(expense.amount),
         "",
         expense.advanceTarget || "",
         userName || "",
@@ -885,9 +814,6 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName) {
         const colorMap = {
           "支出": { red: 1.0, green: 0.92, blue: 0.92 },
           "收入": { red: 0.90, green: 0.98, blue: 0.90 },
-          "代墊": { red: 1.0, green: 0.95, blue: 0.85 },
-          "代墊收回": { red: 0.90, green: 0.95, blue: 1.0 },
-          "代分配": { red: 1.0, green: 0.98, blue: 0.82 },
         };
 
         const backgroundColor =
@@ -922,32 +848,116 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName) {
   }
 }
 
+function headerIndex(headers, names) {
+  for (const name of names) {
+    const idx = headers.findIndex(h => String(h || "").trim() === name);
+    if (idx >= 0) return idx;
+  }
+  return -1;
+}
+
 async function readMonthRows(sheetId, monthSheet) {
   const sheets = await getSheets();
 
   const result = await sheets.spreadsheets.values.get({
     spreadsheetId: sheetId,
-    range: `'${monthSheet}'!A2:O`,
+    range: `'${monthSheet}'!A1:Z`,
     valueRenderOption: "FORMATTED_VALUE",
   });
 
-  return (result.data.values || []).map(r => ({
-    farm: r[0] || "",
-    txType: r[1] || "支出",
-    paymentSource: r[2] || "",
-    code: r[3] || "",
-    className: r[4] || "",
-    date: r[5] || "",
-    item: r[6] || "",
-    description: r[7] || "",
-    vendor: r[8] || "",
-    qty: Number(String(r[9] || "0").replace(/,/g, "")) || 0,
-    unitPrice: Number(String(r[10] || "0").replace(/,/g, "")) || 0,
-    amount: Number(String(r[11] || "0").replace(/,/g, "")) || 0,
-    receipt: r[12] || "",
-    advanceTarget: r[13] || "",
-    recorder: r[14] || "",
+  const values = result.data.values || [];
+  if (!values.length) return [];
+
+  const headers = values[0] || [];
+
+  // 不再假設固定欄位位置，直接依標題找欄位。
+  const iFarm = headerIndex(headers, ["場別"]);
+  const iType = headerIndex(headers, ["收支類型"]);
+  const iPayment = headerIndex(headers, ["付款來源"]);
+  const iCode = headerIndex(headers, ["科目代號"]);
+  const iClass = headerIndex(headers, ["科目分類"]);
+  const iDate = headerIndex(headers, ["日期"]);
+  const iItem = headerIndex(headers, ["品項"]);
+  const iDesc = headerIndex(headers, ["用途說明"]);
+  const iVendor = headerIndex(headers, ["廠商名稱"]);
+  const iQty = headerIndex(headers, ["數量"]);
+  const iUnit = headerIndex(headers, ["單價"]);
+  const iAmount = headerIndex(headers, ["金額"]);
+  const iReceipt = headerIndex(headers, ["發票或憑證"]);
+  const iRecorder = headerIndex(headers, ["填表人"]);
+
+  const cell = (r, idx) => idx >= 0 ? (r[idx] || "") : "";
+  const num = v => Number(String(v || "0").replace(/,/g, "")) || 0;
+
+  return values.slice(1).map(r => ({
+    farm: cell(r, iFarm),
+    txType: cell(r, iType) || "支出",
+    paymentSource: cell(r, iPayment),
+    code: cell(r, iCode),
+    className: cell(r, iClass),
+    date: cell(r, iDate),
+    item: cell(r, iItem),
+    description: cell(r, iDesc),
+    vendor: cell(r, iVendor),
+    qty: num(cell(r, iQty)),
+    unitPrice: num(cell(r, iUnit)),
+    amount: num(cell(r, iAmount)),
+    receipt: cell(r, iReceipt),
+    recorder: cell(r, iRecorder),
   })).filter(r => r.date || r.item || r.amount);
+}
+
+// 將舊資料的「金額」欄正負號整理成：支出 +、收入 -。
+// 只改金額欄，不刪除任何歷史資料。
+async function normalizeMonthAmountSigns(sheetId, monthSheet) {
+  const sheets = await getSheets();
+
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: `'${monthSheet}'!A1:Z`,
+    valueRenderOption: "FORMATTED_VALUE",
+  });
+
+  const values = result.data.values || [];
+  if (values.length <= 1) return;
+
+  const headers = values[0] || [];
+  const iType = headerIndex(headers, ["收支類型"]);
+  const iAmount = headerIndex(headers, ["金額"]);
+
+  if (iAmount < 0) return;
+
+  let changed = false;
+  const amounts = values.slice(1).map(r => {
+    const raw = String(r[iAmount] || "").replace(/,/g, "").trim();
+    if (!raw) return [""];
+
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return [r[iAmount] || ""];
+
+    const txType = iType >= 0 ? String(r[iType] || "支出").trim() : "支出";
+    let normalized = n;
+
+    if (txType === "收入") normalized = -Math.abs(n);
+    else if (txType === "支出" || !txType) normalized = Math.abs(n);
+    else {
+      // 已停用的舊代墊類型不自動改動，避免破壞歷史資料。
+      return [r[iAmount] || ""];
+    }
+
+    if (normalized !== n) changed = true;
+    return [normalized];
+  });
+
+  if (!changed) return;
+
+  const col = columnLetter(iAmount + 1);
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: sheetId,
+    range: `'${monthSheet}'!${col}2:${col}${amounts.length + 1}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: { values: amounts },
+  });
 }
 
 function parseDateText(s) {
@@ -1020,37 +1030,25 @@ function parseQuery(text) {
 }
 
 function summaryText(rows, farm, title) {
-  const filtered = farm === "全部" ? rows : rows.filter(r => r.farm === farm);
+  const filteredAll = farm === "全部" ? rows : rows.filter(r => r.farm === farm);
+
+  // 目前正式版只統計支出 / 收入。
+  // 舊的代墊、代分配資料保留在 Sheet，但不列入目前收支統計。
+  const filtered = filteredAll.filter(r =>
+    ["支出", "收入"].includes(r.txType || "支出")
+  );
 
   const expenseRows = filtered.filter(r => (r.txType || "支出") === "支出");
   const incomeRows = filtered.filter(r => r.txType === "收入");
-  const advanceRows = filtered.filter(r => r.txType === "代墊");
-  const recoveredRows = filtered.filter(r => r.txType === "代墊收回");
-  const allocationRows = filtered.filter(r =>
-    ["代分配", "待分配採購"].includes(r.txType)
-  );
 
-  const expenseTotal = expenseRows.reduce((sum, r) => sum + r.amount, 0);
-  const incomeTotal = incomeRows.reduce((sum, r) => sum + r.amount, 0);
-  const advanceTotal = advanceRows.reduce((sum, r) => sum + r.amount, 0);
-  const recoveredTotal = recoveredRows.reduce((sum, r) => sum + r.amount, 0);
-  const allocationTotal = allocationRows.reduce((sum, r) => sum + r.amount, 0);
-
-  const outstandingAdvance = advanceTotal - recoveredTotal;
-
-  // 支出表正負邏輯：
-  // 支出 +、代墊 +、代分配 +、收入 -、代墊收回 -
-  const net =
-    expenseTotal +
-    advanceTotal +
-    allocationTotal -
-    incomeTotal -
-    recoveredTotal;
+  const expenseTotal = expenseRows.reduce((sum, r) => sum + Math.abs(r.amount), 0);
+  const incomeTotal = incomeRows.reduce((sum, r) => sum + Math.abs(r.amount), 0);
+  const net = expenseTotal - incomeTotal;
 
   const byItem = {};
   for (const r of expenseRows) {
     if (!r.item) continue;
-    byItem[r.item] = (byItem[r.item] || 0) + r.amount;
+    byItem[r.item] = (byItem[r.item] || 0) + Math.abs(r.amount);
   }
 
   const top = Object.entries(byItem)
@@ -1062,13 +1060,14 @@ function summaryText(rows, farm, title) {
     "",
     `💸 支出：＋${expenseTotal.toLocaleString("zh-TW")} 元`,
     `💰 收入：－${incomeTotal.toLocaleString("zh-TW")} 元`,
-    `🤝 代墊：＋${advanceTotal.toLocaleString("zh-TW")} 元`,
-    `📦 代分配：＋${allocationTotal.toLocaleString("zh-TW")} 元`,
-    `↩️ 代墊收回：－${recoveredTotal.toLocaleString("zh-TW")} 元`,
-    `⏳ 尚未收回代墊：${outstandingAdvance.toLocaleString("zh-TW")} 元`,
     `📊 淨支出：${net.toLocaleString("zh-TW")} 元`,
     `🧾 筆數：${filtered.length} 筆`,
   ];
+
+  const ignoredCount = filteredAll.length - filtered.length;
+  if (ignoredCount > 0) {
+    lines.push(`ℹ️ 舊代墊類資料：${ignoredCount} 筆（目前不計入）`);
+  }
 
   if (top.length) {
     lines.push("", "支出分類：");
@@ -1104,6 +1103,7 @@ async function querySummary(sheetId, query) {
       ].join("\n");
     }
 
+    await normalizeMonthAmountSigns(sheetId, monthSheet);
     const rows = await readMonthRows(sheetId, monthSheet);
     return summaryText(
       rows,
@@ -1114,6 +1114,7 @@ async function querySummary(sheetId, query) {
 
   if (query.mode === "今天") {
     await ensureMonthSheet(sheetId, now.monthSheet);
+    await normalizeMonthAmountSigns(sheetId, now.monthSheet);
     const rows = await readMonthRows(sheetId, now.monthSheet);
 
     const todayRows = rows.filter(r => {
@@ -1129,6 +1130,7 @@ async function querySummary(sheetId, query) {
 
   if (query.mode === "本月") {
     await ensureMonthSheet(sheetId, now.monthSheet);
+    await normalizeMonthAmountSigns(sheetId, now.monthSheet);
     const rows = await readMonthRows(sheetId, now.monthSheet);
     return summaryText(rows, query.farm, `${Number(now.month)}月收支`);
   }
@@ -1148,6 +1150,7 @@ async function querySummary(sheetId, query) {
   let rows = [];
 
   for (const monthSheet of monthSheets) {
+    await normalizeMonthAmountSigns(sheetId, monthSheet);
     rows = rows.concat(await readMonthRows(sheetId, monthSheet));
   }
 
@@ -1166,7 +1169,7 @@ async function getProfileName(event) {
 
 function helpText() {
   return [
-    "📒 雞場記帳正式版",
+    "📒 雞場記帳正式簡化版",
     "",
     "【支出】",
     "草湖 支出 500 電風扇 / 三豐",
@@ -1179,18 +1182,9 @@ function helpText() {
     "未寫＝雞場帳戶",
     "加「零」＝零用金",
     "",
-    "【代墊】",
-    "草湖 代仁愛 1500 油資 / 中油",
-    "",
-    "【代墊收回】",
-    "草湖 收仁愛 1500 油資 / 中油",
-    "",
-    "【代分配】",
-    "草湖 代分配 20000 ADE 10瓶 / XX公司",
-    "",
     "【補登日期】",
     "9/28 草湖 支出 500 電風扇 / 三豐",
-    "2026/9/28 草湖 代仁愛 1500 油資 / 中油",
+    "2026/9/28 仁愛 收入 5000 雞蛋銷售 / 客戶",
     "",
     "【查詢】",
     "今天",
@@ -1280,9 +1274,6 @@ async function handleTextMessage(event) {
       `金額：${expense.amount.toLocaleString("zh-TW")} 元`,
       expense.paymentSource ? `付款來源：${expense.paymentSource}` : null,
       `收支類型：${expense.txType}`,
-      expense.txType === "代分配" ? "狀態：待後續分配" : null,
-      expense.advanceTarget ? `代墊對象：${expense.advanceTarget}` : null,
-      expense.txType === "代墊" ? `代墊人：${userName}` : null,
       `科目代號：${expense.code}`,
       `科目分類：${expense.className}`,
       `填表人：${userName}`,
@@ -1324,7 +1315,7 @@ async function handleEvent(event) {
 }
 
 app.get("/", (req, res) => {
-  res.send("Chicken Farm Accounting Bot - Official Multi User + Keyword Master Version is running.");
+  res.send("Chicken Farm Accounting Bot - Simplified Income Expense + Keyword Master Version is running.");
 });
 
 app.post("/webhook", line.middleware(config), async (req, res) => {
@@ -1340,5 +1331,5 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`Chicken Farm Accounting Bot - Official Multi User + Keyword Master Version running on port ${PORT}`);
+  console.log(`Chicken Farm Accounting Bot - Simplified Income Expense + Keyword Master Version running on port ${PORT}`);
 });

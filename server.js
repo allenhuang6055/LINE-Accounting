@@ -41,8 +41,6 @@ const FARM_ALIASES = {
   "後寮場": "後寮場",
   "鎮平": "鎮平場",
   "鎮平場": "鎮平場",
-  "二崙": "二崙場",
-  "二崙場": "二崙場",
   "東陽": "東陽場",
   "東陽場": "東陽場",
   "潭墘": "潭墘場",
@@ -51,6 +49,14 @@ const FARM_ALIASES = {
   "龍潭場": "龍潭場",
   "泰順": "泰順場",
   "泰順場": "泰順場",
+
+  "清屎": "清屎部門",
+  "清屎部門": "清屎部門",
+
+  "班神": "班神場",
+  "班神場": "班神場",
+  "昊陽": "昊陽場",
+  "昊陽場": "昊陽場",
 
   "共用": "共用",
   "共同": "共用",
@@ -432,6 +438,8 @@ async function ensureMonthSheet(sheetId, monthSheet) {
     "發票或憑證",
     "付款來源",
     "收支類型",
+    "代墊對象",
+    "填表人",
   ]);
 }
 
@@ -446,9 +454,11 @@ function parseExpenseCommand(text) {
 
   // 支援：
   // 草湖 支出 500 電風扇 / 三豐
-  // 草湖 收入 5000 雞蛋銷售 / 客戶
   // 草湖 零 支出 500 電風扇 / 三豐
-  // 草湖 零 收入 5000 其他收入 / 客戶
+  // 仁愛 收入 5000 雞蛋銷售 / 客戶
+  // 仁愛 代墊 1500 油資 / 台塑
+  // 仁愛 代墊收回 1500
+  // 仁愛 收回代墊 1500
   if (farm) {
     if (parts[1] === "零") {
       paymentSource = "零用金";
@@ -458,16 +468,18 @@ function parseExpenseCommand(text) {
       txType = parts[1];
       rest = parts.slice(2).join(" ");
     }
-  } else if (["支出", "收入"].includes(parts[0])) {
+  } else if (["支出", "收入", "代墊", "代墊收回", "收回代墊"].includes(parts[0])) {
     farm = farmFromToken(parts[1]);
-    if (!farm) return { error: "請先輸入場別，例如：東平 支出 500 電風扇" };
+    if (!farm) return { error: "請先輸入場別，例如：仁愛 代墊 1500 油資" };
     txType = parts[0];
     rest = parts.slice(2).join(" ");
   } else {
     return null;
   }
 
-  if (!["支出", "收入"].includes(txType)) {
+  if (txType === "收回代墊") txType = "代墊收回";
+
+  if (!["支出", "收入", "代墊", "代墊收回"].includes(txType)) {
     return null;
   }
 
@@ -475,12 +487,18 @@ function parseExpenseCommand(text) {
     return { error: "記帳時不能使用「全部」，請指定實際場別。" };
   }
 
-  let m = rest.match(/^(\d+(?:\.\d+)?)\s*[xX×*]\s*([\d,]+(?:\.\d+)?)\s+(.+)$/);
+  // 代墊與代墊收回先不歸類到雞場帳戶/零用金
+  if (["代墊", "代墊收回"].includes(txType)) {
+    paymentSource = "";
+  }
 
   let qty = 1;
   let unitPrice;
   let amount;
-  let description;
+  let description = "";
+
+  // 支援 2x600
+  let m = rest.match(/^(\d+(?:\.\d+)?)\s*[xX×*]\s*([\d,]+(?:\.\d+)?)\s+(.+)$/);
 
   if (m) {
     qty = Number(m[1]);
@@ -488,16 +506,27 @@ function parseExpenseCommand(text) {
     amount = qty * unitPrice;
     description = m[3].trim();
   } else {
-    m = rest.match(/^([\d,]+(?:\.\d+)?)\s+(.+)$/);
-    if (!m) return { error: `格式例如：東平 ${txType} 500 電風扇` };
+    // 代墊收回可只打金額；其他類型需有用途
+    m = rest.match(/^([\d,]+(?:\.\d+)?)(?:\s+(.+))?$/);
+    if (!m) {
+      return { error: `格式例如：仁愛 ${txType} 1500${txType === "代墊收回" ? "" : " 油資"}` };
+    }
 
     amount = parseAmount(m[1]);
     unitPrice = amount;
-    description = m[2].trim();
+    description = String(m[2] || "").trim();
   }
 
   if (!Number.isFinite(amount) || amount <= 0) {
     return { error: "金額格式不正確" };
+  }
+
+  if (!description && txType !== "代墊收回") {
+    return { error: `請輸入用途，例如：仁愛 ${txType} 1500 油資` };
+  }
+
+  if (!description && txType === "代墊收回") {
+    description = "代墊還款";
   }
 
   let vendor = "";
@@ -542,15 +571,16 @@ function parseExpenseCommand(text) {
     vendor,
     paymentSource,
     txType,
+    advanceTarget: ["代墊", "代墊收回"].includes(txType) ? farm : "",
   };
 }
 
-async function writeExpense(sheetId, monthSheet, expense, dateText) {
+async function writeExpense(sheetId, monthSheet, expense, dateText, userName) {
   const sheets = await getSheets();
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
-    range: `'${monthSheet}'!A:M`,
+    range: `'${monthSheet}'!A:O`,
     valueInputOption: "USER_ENTERED",
     insertDataOption: "INSERT_ROWS",
     requestBody: {
@@ -566,8 +596,10 @@ async function writeExpense(sheetId, monthSheet, expense, dateText) {
         expense.unitPrice,
         expense.amount,
         "",
-        expense.paymentSource || "雞場帳戶",
+        expense.paymentSource || "",
         expense.txType || "支出",
+        expense.advanceTarget || "",
+        userName || "",
       ]],
     },
   });
@@ -578,7 +610,7 @@ async function readMonthRows(sheetId, monthSheet) {
 
   const result = await sheets.spreadsheets.values.get({
     spreadsheetId: sheetId,
-    range: `'${monthSheet}'!A2:M`,
+    range: `'${monthSheet}'!A2:O`,
     valueRenderOption: "FORMATTED_VALUE",
   });
 
@@ -596,6 +628,8 @@ async function readMonthRows(sheetId, monthSheet) {
     receipt: r[10] || "",
     paymentSource: r[11] || "",
     txType: r[12] || "支出",
+    advanceTarget: r[13] || "",
+    recorder: r[14] || "",
   })).filter(r => r.date || r.item || r.amount);
 }
 
@@ -673,9 +707,14 @@ function summaryText(rows, farm, title) {
 
   const expenseRows = filtered.filter(r => (r.txType || "支出") === "支出");
   const incomeRows = filtered.filter(r => r.txType === "收入");
+  const advanceRows = filtered.filter(r => r.txType === "代墊");
+  const recoveredRows = filtered.filter(r => r.txType === "代墊收回");
 
   const expenseTotal = expenseRows.reduce((sum, r) => sum + r.amount, 0);
   const incomeTotal = incomeRows.reduce((sum, r) => sum + r.amount, 0);
+  const advanceTotal = advanceRows.reduce((sum, r) => sum + r.amount, 0);
+  const recoveredTotal = recoveredRows.reduce((sum, r) => sum + r.amount, 0);
+  const outstandingAdvance = advanceTotal - recoveredTotal;
   const net = incomeTotal - expenseTotal;
 
   const byItem = {};
@@ -694,6 +733,9 @@ function summaryText(rows, farm, title) {
     `💸 支出合計：${expenseTotal.toLocaleString("zh-TW")} 元`,
     `💰 收入合計：${incomeTotal.toLocaleString("zh-TW")} 元`,
     `📊 收支差額：${net.toLocaleString("zh-TW")} 元`,
+    `🤝 代墊合計：${advanceTotal.toLocaleString("zh-TW")} 元`,
+    `↩️ 代墊收回：${recoveredTotal.toLocaleString("zh-TW")} 元`,
+    `⏳ 尚未收回：${outstandingAdvance.toLocaleString("zh-TW")} 元`,
     `🧾 筆數：${filtered.length} 筆`,
   ];
 
@@ -802,6 +844,11 @@ function helpText() {
     "",
     "付款來源：未寫＝雞場帳戶；「零」＝零用金",
     "",
+    "【代墊】",
+    "仁愛 代墊 1500 油資 / 台塑",
+    "仁愛 代墊 800 工具 / 五金行",
+    "仁愛 代墊收回 1500",
+    "",
     "【補登以前日期】",
     "9/28 東平 支出 4528 電費 / 台電",
     "2026/9/28 草湖 支出 500 電風扇 / 三豐",
@@ -873,10 +920,16 @@ async function handleTextMessage(event) {
   }
 
   if (expense) {
-    await ensureMonthSheet(targetSheetId, dated.dateInfo.monthSheet);
-    await writeExpense(targetSheetId, dated.dateInfo.monthSheet, expense, dated.dateInfo.dateText);
-
     const userName = await getProfileName(event);
+
+    await ensureMonthSheet(targetSheetId, dated.dateInfo.monthSheet);
+    await writeExpense(
+      targetSheetId,
+      dated.dateInfo.monthSheet,
+      expense,
+      dated.dateInfo.dateText,
+      userName
+    );
 
     return [
       `✅ ${expense.txType}記錄完成`,
@@ -890,8 +943,10 @@ async function handleTextMessage(event) {
       `數量：${expense.qty}`,
       `單價：${expense.unitPrice.toLocaleString("zh-TW")} 元`,
       `金額：${expense.amount.toLocaleString("zh-TW")} 元`,
-      `付款來源：${expense.paymentSource}`,
+      expense.paymentSource ? `付款來源：${expense.paymentSource}` : null,
       `收支類型：${expense.txType}`,
+      expense.advanceTarget ? `代墊對象：${expense.advanceTarget}` : null,
+      expense.txType === "代墊" ? `代墊人：${userName}` : null,
       `科目代號：${expense.code}`,
       `科目分類：${expense.className}`,
       `填表人：${userName}`,

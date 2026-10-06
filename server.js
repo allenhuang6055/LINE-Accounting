@@ -17,6 +17,7 @@ const client = new line.messagingApi.MessagingApiClient({
 
 const DEFAULT_SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
+const ACCOUNT_MASTER_SHEET_ID = process.env.ACCOUNT_MASTER_SHEET_ID;
 
 // ===== 場別 =====
 const FARM_ALIASES = {
@@ -24,7 +25,6 @@ const FARM_ALIASES = {
   "東平場": "東平場",
   "草湖": "草湖場",
   "草湖場": "草湖場",
-
   "仁愛": "仁愛場",
   "仁愛場": "仁愛場",
   "東勢": "東勢場",
@@ -49,14 +49,16 @@ const FARM_ALIASES = {
   "龍潭場": "龍潭場",
   "泰順": "泰順場",
   "泰順場": "泰順場",
-
   "清屎": "清屎部門",
   "清屎部門": "清屎部門",
 
-  "班神": "班神場",
-  "班神場": "班神場",
-  "昊陽": "昊陽場",
-  "昊陽場": "昊陽場",
+  "班神": "班神公司",
+  "班神公司": "班神公司",
+  "班神場": "班神公司",
+
+  "昊陽": "昊陽公司",
+  "昊陽公司": "昊陽公司",
+  "昊陽場": "昊陽公司",
 
   "共用": "共用",
   "共同": "共用",
@@ -242,31 +244,103 @@ function farmFromToken(token) {
   return FARM_ALIASES[String(token || "").trim()] || null;
 }
 
-function accountByItem(item) {
-  const row = ACCOUNT_ITEMS.find(r => r[0] === item);
-  return row ? { item: row[0], code: String(row[1]), className: row[2] } : null;
+
+let ACCOUNT_MASTER_CACHE = {
+  loadedAt: 0,
+  rows: null,
+};
+
+async function getAccountMasterRows() {
+  const now = Date.now();
+
+  // 5 分鐘快取，避免每筆都讀 Google Sheet
+  if (
+    ACCOUNT_MASTER_CACHE.rows &&
+    now - ACCOUNT_MASTER_CACHE.loadedAt < 5 * 60 * 1000
+  ) {
+    return ACCOUNT_MASTER_CACHE.rows;
+  }
+
+  // 尚未設定中央主檔時，暫時沿用程式內建科目
+  if (!ACCOUNT_MASTER_SHEET_ID) {
+    const fallback = ACCOUNT_ITEMS.map(r => ({
+      item: String(r[0]),
+      code: String(r[1]),
+      className: String(r[2]),
+    }));
+
+    ACCOUNT_MASTER_CACHE = { loadedAt: now, rows: fallback };
+    return fallback;
+  }
+
+  const sheets = await getSheets();
+
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: ACCOUNT_MASTER_SHEET_ID,
+    fields: "sheets.properties(title,index)",
+  });
+
+  const tabs = (meta.data.sheets || [])
+    .map(s => s.properties)
+    .sort((a, b) => (a.index || 0) - (b.index || 0));
+
+  // 優先讀「資料」分頁；沒有就讀第一個分頁
+  const targetTab = tabs.find(t => t.title === "資料") || tabs[0];
+  if (!targetTab?.title) {
+    throw new Error("中央科目主檔沒有可讀取的分頁");
+  }
+
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: ACCOUNT_MASTER_SHEET_ID,
+    range: `'${targetTab.title}'!A2:C`,
+    valueRenderOption: "FORMATTED_VALUE",
+  });
+
+  const rows = (result.data.values || [])
+    .map(r => ({
+      item: String(r[0] || "").trim(),
+      code: String(r[1] || "").trim(),
+      className: String(r[2] || "").trim(),
+    }))
+    .filter(r => r.item);
+
+  if (!rows.length) {
+    throw new Error("中央科目主檔沒有科目資料");
+  }
+
+  ACCOUNT_MASTER_CACHE = { loadedAt: now, rows };
+  return rows;
 }
 
-function autoChooseItem(description) {
-  const text = String(description || "").trim();
+async function accountByItem(item) {
+  const rows = await getAccountMasterRows();
+  return rows.find(r => r.item === item) || null;
+}
 
-  // 使用者直接輸入完整 Excel 品項時優先
-  const exact = ACCOUNT_ITEMS
-    .map(r => r[0])
+async function autoChooseItem(description) {
+  const text = String(description || "").trim();
+  const rows = await getAccountMasterRows();
+
+  // 直接輸入完整品項名稱時優先
+  const exact = rows
+    .map(r => r.item)
     .sort((a, b) => b.length - a.length)
     .find(item => text === item || text.startsWith(item + " "));
 
-  if (exact) return accountByItem(exact);
+  if (exact) {
+    return rows.find(r => r.item === exact) || null;
+  }
 
+  // 關鍵字仍沿用，但代號與分類從中央主檔取得
   for (const rule of KEYWORD_RULES) {
     if (rule.keys.some(k => text.includes(k))) {
-      return accountByItem(rule.item);
+      const row = rows.find(r => r.item === rule.item);
+      if (row) return row;
     }
   }
 
-  return accountByItem("雜項費用");
+  return rows.find(r => r.item === "雜項費用") || rows[0] || null;
 }
-
 
 async function getMasterSheetTitle() {
   if (!MASTER_SHEET_ID) return null;
@@ -404,27 +478,47 @@ function columnLetter(n) {
 }
 
 async function ensureBaseStructure(sheetId) {
-  // 資料分頁
-  await ensureSheet(sheetId, "資料", ["品項", "科目代號", "科目分類"]);
-
-  const sheets = await getSheets();
-  const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: sheetId,
-    range: "'資料'!A2:C",
-  });
-
-  if (!(result.data.values || []).length) {
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: sheetId,
-      range: `'資料'!A2:C${ACCOUNT_ITEMS.length + 1}`,
-      valueInputOption: "RAW",
-      requestBody: { values: ACCOUNT_ITEMS },
-    });
-  }
+  // 科目統一由中央科目主檔提供。
+  // 每位使用者自己的帳本不再需要維護「資料」分頁。
+  await getAccountMasterRows();
 }
 
-async function ensureMonthSheet(sheetId, monthSheet) {
-  await ensureSheet(sheetId, monthSheet, [
+
+async function migrateMonthSheetColumns(sheetId, monthSheet) {
+  const sheets = await getSheets();
+
+  const desiredHeaders = [
+    "場別",
+    "收支類型",
+    "付款來源",
+    "科目代號",
+    "科目分類",
+    "日期",
+    "品項",
+    "用途說明",
+    "廠商名稱",
+    "數量",
+    "單價",
+    "金額",
+    "發票或憑證",
+    "代墊對象",
+    "填表人",
+  ];
+
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: `'${monthSheet}'!A1:O`,
+    valueRenderOption: "FORMATTED_VALUE",
+  });
+
+  const values = result.data.values || [];
+  const currentHeaders = values[0] || [];
+
+  if (currentHeaders.join("|") === desiredHeaders.join("|")) {
+    return;
+  }
+
+  const oldHeaders = [
     "場別",
     "科目代號",
     "科目分類",
@@ -440,46 +534,81 @@ async function ensureMonthSheet(sheetId, monthSheet) {
     "收支類型",
     "代墊對象",
     "填表人",
+  ];
+
+  // 只有辨識到舊版欄位順序時才自動搬移，避免誤改其他格式。
+  const looksLikeOldLayout =
+    currentHeaders.slice(0, oldHeaders.length).join("|") === oldHeaders.join("|");
+
+  if (!looksLikeOldLayout) {
+    return;
+  }
+
+  const rows = values.slice(1).map(r => [
+    r[0] || "",   // 場別
+    r[12] || "支出", // 收支類型
+    r[11] || "",  // 付款來源
+    r[1] || "",   // 科目代號
+    r[2] || "",   // 科目分類
+    r[3] || "",   // 日期
+    r[4] || "",   // 品項
+    r[5] || "",   // 用途說明
+    r[6] || "",   // 廠商名稱
+    r[7] || "",   // 數量
+    r[8] || "",   // 單價
+    r[9] || "",   // 金額
+    r[10] || "",  // 發票或憑證
+    r[13] || "",  // 代墊對象
+    r[14] || "",  // 填表人
+  ]);
+
+  await sheets.spreadsheets.values.clear({
+    spreadsheetId: sheetId,
+    range: `'${monthSheet}'!A:O`,
+  });
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: sheetId,
+    range: `'${monthSheet}'!A1:O${Math.max(1, rows.length + 1)}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: {
+      values: [desiredHeaders, ...rows],
+    },
+  });
+}
+
+async function ensureMonthSheet(sheetId, monthSheet) {
+  await migrateMonthSheetColumns(sheetId, monthSheet);
+  await ensureSheet(sheetId, monthSheet, [
+    "場別",
+    "收支類型",
+    "付款來源",
+    "科目代號",
+    "科目分類",
+    "日期",
+    "品項",
+    "用途說明",
+    "廠商名稱",
+    "數量",
+    "單價",
+    "金額",
+    "發票或憑證",
+    "代墊對象",
+    "填表人",
   ]);
 }
 
-function parseExpenseCommand(text) {
+async function parseExpenseCommand(text) {
   const clean = String(text || "").trim().replace(/\s+/g, " ");
   const parts = clean.split(" ");
 
   let farm = farmFromToken(parts[0]);
   let txType = "";
   let paymentSource = "雞場帳戶";
-  let rest;
+  let advanceTarget = "";
+  let rest = "";
 
-  // 支援：
-  // 草湖 支出 500 電風扇 / 三豐
-  // 草湖 零 支出 500 電風扇 / 三豐
-  // 仁愛 收入 5000 雞蛋銷售 / 客戶
-  // 仁愛 代墊 1500 油資 / 台塑
-  // 仁愛 代墊收回 1500
-  // 仁愛 收回代墊 1500
-  if (farm) {
-    if (parts[1] === "零") {
-      paymentSource = "零用金";
-      txType = parts[2];
-      rest = parts.slice(3).join(" ");
-    } else {
-      txType = parts[1];
-      rest = parts.slice(2).join(" ");
-    }
-  } else if (["支出", "收入", "代墊", "代墊收回", "收回代墊"].includes(parts[0])) {
-    farm = farmFromToken(parts[1]);
-    if (!farm) return { error: "請先輸入場別，例如：仁愛 代墊 1500 油資" };
-    txType = parts[0];
-    rest = parts.slice(2).join(" ");
-  } else {
-    return null;
-  }
-
-  if (txType === "收回代墊") txType = "代墊收回";
-
-  if (!["支出", "收入", "代墊", "代墊收回"].includes(txType)) {
+  if (!farm) {
     return null;
   }
 
@@ -487,9 +616,72 @@ function parseExpenseCommand(text) {
     return { error: "記帳時不能使用「全部」，請指定實際場別。" };
   }
 
-  // 代墊與代墊收回先不歸類到雞場帳戶/零用金
-  if (["代墊", "代墊收回"].includes(txType)) {
+  // 支援「零」：草湖 零 支出 500 ...
+  // 也支援：草湖 零 代仁愛 1500 ...
+  //         草湖 零 代分配 20000 ...
+  let actionIndex = 1;
+  if (parts[1] === "零") {
+    paymentSource = "零用金";
+    actionIndex = 2;
+  }
+
+  const action = String(parts[actionIndex] || "").trim();
+
+  // ===== 一般支出 / 收入 =====
+  if (["支出", "收入"].includes(action)) {
+    txType = action;
+    rest = parts.slice(actionIndex + 1).join(" ");
+  }
+  // ===== 代分配 =====
+  else if (action === "代分配" || action === "待分配採購") {
+    txType = "代分配";
+    rest = parts.slice(actionIndex + 1).join(" ");
+  }
+  // ===== 代某場：代仁愛、代東勢... =====
+  else if (action.startsWith("代") && action.length > 1) {
+    const targetToken = action.slice(1);
+    const targetFarm = farmFromToken(targetToken);
+
+    if (!targetFarm || targetFarm === "全部" || targetFarm === "共用") {
+      return {
+        error: "代墊格式例如：草湖 代仁愛 1500 油資 / 中油",
+      };
+    }
+
+    txType = "代墊";
+    advanceTarget = targetFarm;
+    rest = parts.slice(actionIndex + 1).join(" ");
+  }
+  // ===== 收某場：收仁愛、收東勢... =====
+  else if (action.startsWith("收") && action.length > 1) {
+    const targetToken = action.slice(1);
+    const targetFarm = farmFromToken(targetToken);
+
+    if (!targetFarm || targetFarm === "全部" || targetFarm === "共用") {
+      return {
+        error: "代墊收回格式例如：草湖 收仁愛 1500 油資 / 中油",
+      };
+    }
+
+    txType = "代墊收回";
+    advanceTarget = targetFarm;
     paymentSource = "";
+    rest = parts.slice(actionIndex + 1).join(" ");
+  }
+  // ===== 舊語法相容 =====
+  else if (action === "代墊") {
+    txType = "代墊";
+    advanceTarget = farm;
+    rest = parts.slice(actionIndex + 1).join(" ");
+  }
+  else if (action === "代墊收回" || action === "收回代墊") {
+    txType = "代墊收回";
+    advanceTarget = farm;
+    paymentSource = "";
+    rest = parts.slice(actionIndex + 1).join(" ");
+  }
+  else {
+    return null;
   }
 
   let qty = 1;
@@ -506,10 +698,19 @@ function parseExpenseCommand(text) {
     amount = qty * unitPrice;
     description = m[3].trim();
   } else {
-    // 代墊收回可只打金額；其他類型需有用途
     m = rest.match(/^([\d,]+(?:\.\d+)?)(?:\s+(.+))?$/);
+
     if (!m) {
-      return { error: `格式例如：仁愛 ${txType} 1500${txType === "代墊收回" ? "" : " 油資"}` };
+      if (txType === "代分配") {
+        return { error: "格式例如：草湖 代分配 20000 ADE 10瓶 / XX公司" };
+      }
+      if (txType === "代墊") {
+        return { error: "格式例如：草湖 代仁愛 1500 油資 / 中油" };
+      }
+      if (txType === "代墊收回") {
+        return { error: "格式例如：草湖 收仁愛 1500 油資 / 中油" };
+      }
+      return { error: `格式例如：草湖 ${txType} 500 電風扇 / 三豐` };
     }
 
     amount = parseAmount(m[1]);
@@ -521,16 +722,17 @@ function parseExpenseCommand(text) {
     return { error: "金額格式不正確" };
   }
 
-  if (!description && txType !== "代墊收回") {
-    return { error: `請輸入用途，例如：仁愛 ${txType} 1500 油資` };
-  }
-
+  // 收回可不填用途
   if (!description && txType === "代墊收回") {
     description = "代墊還款";
   }
 
-  let vendor = "";
+  if (!description) {
+    return { error: "請輸入用途或品項。" };
+  }
 
+  // 廠商用 / 分隔
+  let vendor = "";
   const splitMatch = description.match(/^(.+?)\s*[\/｜|]\s*(.+)$/);
 
   if (splitMatch) {
@@ -547,17 +749,26 @@ function parseExpenseCommand(text) {
   let selected = null;
   let purpose = description;
 
-  const itemNames = ACCOUNT_ITEMS.map(r => r[0]).sort((a, b) => b.length - a.length);
+  const accountRows = await getAccountMasterRows();
+  const itemNames = accountRows
+    .map(r => r.item)
+    .sort((a, b) => b.length - a.length);
 
   for (const item of itemNames) {
     if (description === item || description.startsWith(item + " ")) {
-      selected = accountByItem(item);
+      selected = await accountByItem(item);
       purpose = description.slice(item.length).trim() || item;
       break;
     }
   }
 
-  if (!selected) selected = autoChooseItem(description);
+  if (!selected) {
+    selected = await autoChooseItem(description);
+  }
+
+  if (!selected) {
+    return { error: "中央科目主檔找不到可使用的科目，請先檢查科目主檔。" };
+  }
 
   return {
     farm,
@@ -571,14 +782,14 @@ function parseExpenseCommand(text) {
     vendor,
     paymentSource,
     txType,
-    advanceTarget: ["代墊", "代墊收回"].includes(txType) ? farm : "",
+    advanceTarget,
   };
 }
 
 async function writeExpense(sheetId, monthSheet, expense, dateText, userName) {
   const sheets = await getSheets();
 
-  await sheets.spreadsheets.values.append({
+  const appendResult = await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
     range: `'${monthSheet}'!A:O`,
     valueInputOption: "USER_ENTERED",
@@ -586,6 +797,8 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName) {
     requestBody: {
       values: [[
         expense.farm,
+        expense.txType || "支出",
+        expense.paymentSource || "",
         expense.code,
         expense.className,
         dateText,
@@ -596,13 +809,72 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName) {
         expense.unitPrice,
         expense.amount,
         "",
-        expense.paymentSource || "",
-        expense.txType || "支出",
         expense.advanceTarget || "",
         userName || "",
       ]],
     },
   });
+
+  // 顏色只是方便查看，不參與任何加減計算
+  try {
+    const updatedRange =
+      appendResult.data?.updates?.updatedRange ||
+      appendResult.data?.tableRange ||
+      "";
+
+    const rowMatch = String(updatedRange).match(/![A-Z]+(\d+):[A-Z]+(\d+)$/);
+
+    if (rowMatch) {
+      const rowNumber = Number(rowMatch[1]);
+
+      const meta = await sheets.spreadsheets.get({
+        spreadsheetId: sheetId,
+        fields: "sheets.properties(sheetId,title)",
+      });
+
+      const tab = (meta.data.sheets || []).find(
+        s => s.properties.title === monthSheet
+      );
+
+      if (tab?.properties?.sheetId != null) {
+        const colorMap = {
+          "支出": { red: 1.0, green: 0.92, blue: 0.92 },
+          "收入": { red: 0.90, green: 0.98, blue: 0.90 },
+          "代墊": { red: 1.0, green: 0.95, blue: 0.85 },
+          "代墊收回": { red: 0.90, green: 0.95, blue: 1.0 },
+          "代分配": { red: 1.0, green: 0.98, blue: 0.82 },
+        };
+
+        const backgroundColor =
+          colorMap[expense.txType] || { red: 1, green: 1, blue: 1 };
+
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId: sheetId,
+          requestBody: {
+            requests: [{
+              repeatCell: {
+                range: {
+                  sheetId: tab.properties.sheetId,
+                  startRowIndex: rowNumber - 1,
+                  endRowIndex: rowNumber,
+                  startColumnIndex: 0,
+                  endColumnIndex: 15,
+                },
+                cell: {
+                  userEnteredFormat: {
+                    backgroundColor,
+                  },
+                },
+                fields: "userEnteredFormat.backgroundColor",
+              },
+            }],
+          },
+        });
+      }
+    }
+  } catch (formatErr) {
+    console.warn("套用列顏色失敗，不影響記帳：", formatErr.message);
+  }
 }
 
 async function readMonthRows(sheetId, monthSheet) {
@@ -616,18 +888,18 @@ async function readMonthRows(sheetId, monthSheet) {
 
   return (result.data.values || []).map(r => ({
     farm: r[0] || "",
-    code: r[1] || "",
-    className: r[2] || "",
-    date: r[3] || "",
-    item: r[4] || "",
-    description: r[5] || "",
-    vendor: r[6] || "",
-    qty: Number(String(r[7] || "0").replace(/,/g, "")) || 0,
-    unitPrice: Number(String(r[8] || "0").replace(/,/g, "")) || 0,
-    amount: Number(String(r[9] || "0").replace(/,/g, "")) || 0,
-    receipt: r[10] || "",
-    paymentSource: r[11] || "",
-    txType: r[12] || "支出",
+    txType: r[1] || "支出",
+    paymentSource: r[2] || "",
+    code: r[3] || "",
+    className: r[4] || "",
+    date: r[5] || "",
+    item: r[6] || "",
+    description: r[7] || "",
+    vendor: r[8] || "",
+    qty: Number(String(r[9] || "0").replace(/,/g, "")) || 0,
+    unitPrice: Number(String(r[10] || "0").replace(/,/g, "")) || 0,
+    amount: Number(String(r[11] || "0").replace(/,/g, "")) || 0,
+    receipt: r[12] || "",
     advanceTarget: r[13] || "",
     recorder: r[14] || "",
   })).filter(r => r.date || r.item || r.amount);
@@ -709,13 +981,26 @@ function summaryText(rows, farm, title) {
   const incomeRows = filtered.filter(r => r.txType === "收入");
   const advanceRows = filtered.filter(r => r.txType === "代墊");
   const recoveredRows = filtered.filter(r => r.txType === "代墊收回");
+  const allocationRows = filtered.filter(r =>
+    ["代分配", "待分配採購"].includes(r.txType)
+  );
 
   const expenseTotal = expenseRows.reduce((sum, r) => sum + r.amount, 0);
   const incomeTotal = incomeRows.reduce((sum, r) => sum + r.amount, 0);
   const advanceTotal = advanceRows.reduce((sum, r) => sum + r.amount, 0);
   const recoveredTotal = recoveredRows.reduce((sum, r) => sum + r.amount, 0);
+  const allocationTotal = allocationRows.reduce((sum, r) => sum + r.amount, 0);
+
   const outstandingAdvance = advanceTotal - recoveredTotal;
-  const net = incomeTotal - expenseTotal;
+
+  // 支出表正負邏輯：
+  // 支出 +、代墊 +、代分配 +、收入 -、代墊收回 -
+  const net =
+    expenseTotal +
+    advanceTotal +
+    allocationTotal -
+    incomeTotal -
+    recoveredTotal;
 
   const byItem = {};
   for (const r of expenseRows) {
@@ -730,12 +1015,13 @@ function summaryText(rows, farm, title) {
   const lines = [
     `📒 ${farm === "全部" ? "全部場" : farm}｜${title}`,
     "",
-    `💸 支出合計：${expenseTotal.toLocaleString("zh-TW")} 元`,
-    `💰 收入合計：${incomeTotal.toLocaleString("zh-TW")} 元`,
-    `📊 收支差額：${net.toLocaleString("zh-TW")} 元`,
-    `🤝 代墊合計：${advanceTotal.toLocaleString("zh-TW")} 元`,
-    `↩️ 代墊收回：${recoveredTotal.toLocaleString("zh-TW")} 元`,
-    `⏳ 尚未收回：${outstandingAdvance.toLocaleString("zh-TW")} 元`,
+    `💸 支出：＋${expenseTotal.toLocaleString("zh-TW")} 元`,
+    `💰 收入：－${incomeTotal.toLocaleString("zh-TW")} 元`,
+    `🤝 代墊：＋${advanceTotal.toLocaleString("zh-TW")} 元`,
+    `📦 代分配：＋${allocationTotal.toLocaleString("zh-TW")} 元`,
+    `↩️ 代墊收回：－${recoveredTotal.toLocaleString("zh-TW")} 元`,
+    `⏳ 尚未收回代墊：${outstandingAdvance.toLocaleString("zh-TW")} 元`,
+    `📊 淨支出：${net.toLocaleString("zh-TW")} 元`,
     `🧾 筆數：${filtered.length} 筆`,
   ];
 
@@ -835,38 +1121,42 @@ async function getProfileName(event) {
 
 function helpText() {
   return [
-    "📒 雞場支出記帳",
+    "📒 雞場記帳正式版",
     "",
-    "【今天的帳】",
-    "東平 支出 500 電風扇 / 三豐",
-    "草湖 零 支出 2313 電費 / 台電",
+    "【支出】",
+    "草湖 支出 500 電風扇 / 三豐",
+    "草湖 零 支出 500 電風扇 / 三豐",
+    "",
+    "【收入】",
     "仁愛 收入 5000 雞蛋銷售 / 客戶",
     "",
-    "付款來源：未寫＝雞場帳戶；「零」＝零用金",
+    "付款來源：",
+    "未寫＝雞場帳戶",
+    "加「零」＝零用金",
     "",
     "【代墊】",
-    "仁愛 代墊 1500 油資 / 台塑",
-    "仁愛 代墊 800 工具 / 五金行",
-    "仁愛 代墊收回 1500",
+    "草湖 代仁愛 1500 油資 / 中油",
     "",
-    "【補登以前日期】",
-    "9/28 東平 支出 4528 電費 / 台電",
-    "2026/9/28 草湖 支出 500 電風扇 / 三豐",
+    "【代墊收回】",
+    "草湖 收仁愛 1500 油資 / 中油",
     "",
-    "【指定月份查詢】",
-    "9月",
-    "草湖 9月",
-    "全部 9月",
-    "2026/9",
-    "東平 2026/9",
+    "【代分配】",
+    "草湖 代分配 20000 ADE 10瓶 / XX公司",
     "",
-    "【其他查詢】",
+    "【補登日期】",
+    "9/28 草湖 支出 500 電風扇 / 三豐",
+    "2026/9/28 草湖 代仁愛 1500 油資 / 中油",
+    "",
+    "【查詢】",
     "今天",
     "本月",
     "今年",
-    "東平 今天",
     "草湖 本月",
-    "全部 本月",
+    "仁愛 9月",
+    "2026/9",
+    "",
+    "【查自己的 LINE ID】",
+    "我的ID",
   ].join("\\n");
 }
 
@@ -913,7 +1203,7 @@ async function handleTextMessage(event) {
     return `❌ ${dated.error}`;
   }
 
-  const expense = parseExpenseCommand(dated.body);
+  const expense = await parseExpenseCommand(dated.body);
 
   if (expense?.error) {
     return `❌ ${expense.error}`;
@@ -945,6 +1235,7 @@ async function handleTextMessage(event) {
       `金額：${expense.amount.toLocaleString("zh-TW")} 元`,
       expense.paymentSource ? `付款來源：${expense.paymentSource}` : null,
       `收支類型：${expense.txType}`,
+      expense.txType === "代分配" ? "狀態：待後續分配" : null,
       expense.advanceTarget ? `代墊對象：${expense.advanceTarget}` : null,
       expense.txType === "代墊" ? `代墊人：${userName}` : null,
       `科目代號：${expense.code}`,
@@ -988,7 +1279,7 @@ async function handleEvent(event) {
 }
 
 app.get("/", (req, res) => {
-  res.send("Chicken Farm Expense Bot - Multi User Test Version is running.");
+  res.send("Chicken Farm Accounting Bot - Official Multi User Version is running.");
 });
 
 app.post("/webhook", line.middleware(config), async (req, res) => {
@@ -1004,5 +1295,5 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`Chicken Farm Expense Bot - Multi User Test Version running on port ${PORT}`);
+  console.log(`Chicken Farm Accounting Bot - Official Multi User Version running on port ${PORT}`);
 });

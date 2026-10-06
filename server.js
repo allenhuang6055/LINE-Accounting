@@ -253,7 +253,7 @@ let ACCOUNT_MASTER_CACHE = {
 async function getAccountMasterRows() {
   const now = Date.now();
 
-  // 5 分鐘快取，避免每筆都讀 Google Sheet
+  // 5 分鐘快取，避免每一筆都重新讀 Google Sheet
   if (
     ACCOUNT_MASTER_CACHE.rows &&
     now - ACCOUNT_MASTER_CACHE.loadedAt < 5 * 60 * 1000
@@ -261,15 +261,20 @@ async function getAccountMasterRows() {
     return ACCOUNT_MASTER_CACHE.rows;
   }
 
-  // 尚未設定中央主檔時，暫時沿用程式內建科目
+  // 尚未設定中央科目主檔時，暫時沿用程式內建資料
   if (!ACCOUNT_MASTER_SHEET_ID) {
     const fallback = ACCOUNT_ITEMS.map(r => ({
       item: String(r[0]),
       code: String(r[1]),
       className: String(r[2]),
+      keywords: [],
     }));
 
-    ACCOUNT_MASTER_CACHE = { loadedAt: now, rows: fallback };
+    ACCOUNT_MASTER_CACHE = {
+      loadedAt: now,
+      rows: fallback,
+    };
+
     return fallback;
   }
 
@@ -284,15 +289,16 @@ async function getAccountMasterRows() {
     .map(s => s.properties)
     .sort((a, b) => (a.index || 0) - (b.index || 0));
 
-  // 優先讀「資料」分頁；沒有就讀第一個分頁
+  // 優先讀「資料」分頁；沒有就用第一個分頁
   const targetTab = tabs.find(t => t.title === "資料") || tabs[0];
+
   if (!targetTab?.title) {
     throw new Error("中央科目主檔沒有可讀取的分頁");
   }
 
   const result = await sheets.spreadsheets.values.get({
     spreadsheetId: ACCOUNT_MASTER_SHEET_ID,
-    range: `'${targetTab.title}'!A2:C`,
+    range: `'${targetTab.title}'!A2:D`,
     valueRenderOption: "FORMATTED_VALUE",
   });
 
@@ -301,6 +307,10 @@ async function getAccountMasterRows() {
       item: String(r[0] || "").trim(),
       code: String(r[1] || "").trim(),
       className: String(r[2] || "").trim(),
+      keywords: String(r[3] || "")
+        .split(/[,，、]/)
+        .map(x => x.trim())
+        .filter(Boolean),
     }))
     .filter(r => r.item);
 
@@ -308,7 +318,11 @@ async function getAccountMasterRows() {
     throw new Error("中央科目主檔沒有科目資料");
   }
 
-  ACCOUNT_MASTER_CACHE = { loadedAt: now, rows };
+  ACCOUNT_MASTER_CACHE = {
+    loadedAt: now,
+    rows,
+  };
+
   return rows;
 }
 
@@ -317,28 +331,59 @@ async function accountByItem(item) {
   return rows.find(r => r.item === item) || null;
 }
 
+function normalizeMatchText(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, "")
+    .toLowerCase();
+}
+
 async function autoChooseItem(description) {
-  const text = String(description || "").trim();
+  const rawText = String(description || "").trim();
+  const text = normalizeMatchText(rawText);
   const rows = await getAccountMasterRows();
 
-  // 直接輸入完整品項名稱時優先
-  const exact = rows
-    .map(r => r.item)
-    .sort((a, b) => b.length - a.length)
-    .find(item => text === item || text.startsWith(item + " "));
+  // 1) 先看 A 欄「品項」
+  // 完整命中優先
+  let matched = rows.find(r =>
+    normalizeMatchText(r.item) === text
+  );
+  if (matched) return matched;
 
-  if (exact) {
-    return rows.find(r => r.item === exact) || null;
-  }
+  // A 欄品項名稱包含於描述中，較長的品項優先
+  matched = rows
+    .filter(r => {
+      const itemText = normalizeMatchText(r.item);
+      return itemText && text.includes(itemText);
+    })
+    .sort((a, b) =>
+      normalizeMatchText(b.item).length - normalizeMatchText(a.item).length
+    )[0];
 
-  // 關鍵字仍沿用，但代號與分類從中央主檔取得
-  for (const rule of KEYWORD_RULES) {
-    if (rule.keys.some(k => text.includes(k))) {
-      const row = rows.find(r => r.item === rule.item);
-      if (row) return row;
+  if (matched) return matched;
+
+  // 2) 再看 D 欄「辨識關鍵字」
+  // 命中較長的關鍵字優先，避免「租金」蓋過「宿舍租金」
+  const keywordMatches = [];
+
+  for (const row of rows) {
+    for (const keyword of row.keywords || []) {
+      const k = normalizeMatchText(keyword);
+      if (k && text.includes(k)) {
+        keywordMatches.push({
+          row,
+          keywordLength: k.length,
+        });
+      }
     }
   }
 
+  if (keywordMatches.length) {
+    keywordMatches.sort((a, b) => b.keywordLength - a.keywordLength);
+    return keywordMatches[0].row;
+  }
+
+  // 3) A、D 都找不到才歸「雜項費用」
   return rows.find(r => r.item === "雜項費用") || rows[0] || null;
 }
 
@@ -1279,7 +1324,7 @@ async function handleEvent(event) {
 }
 
 app.get("/", (req, res) => {
-  res.send("Chicken Farm Accounting Bot - Official Multi User Version is running.");
+  res.send("Chicken Farm Accounting Bot - Official Multi User + Keyword Master Version is running.");
 });
 
 app.post("/webhook", line.middleware(config), async (req, res) => {
@@ -1295,5 +1340,5 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`Chicken Farm Accounting Bot - Official Multi User Version running on port ${PORT}`);
+  console.log(`Chicken Farm Accounting Bot - Official Multi User + Keyword Master Version running on port ${PORT}`);
 });

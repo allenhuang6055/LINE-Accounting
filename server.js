@@ -1197,6 +1197,7 @@ function helpText() {
     "草湖幫埤北付5000飼料",
     "埤北還草湖3000",
     "查代付",
+    "同步中央測試（只寫入中央主控表的測試分頁）",
     "",
     "【查詢】",
     "今天",
@@ -1209,6 +1210,87 @@ function helpText() {
     "【查自己的 LINE ID】",
     "我的ID",
   ].join("\n");
+}
+
+// ===== 中央主控表測試彙整：僅允許原中央主控表中的「測試_」分頁 =====
+// TEST_CENTRAL_SHEET_ID 必須是預先核准的中央表 ID；不得寫入正式分頁。
+const TEST_CENTRAL_SHEET_ID = process.env.TEST_CENTRAL_SHEET_ID || "";
+const PRODUCTION_CENTRAL_SHEET_ID = "1xy5sqJuR585wyE3Urq5VtSawa8_lY3FkykEitEVmx3c";
+const CENTRAL_TEST_HEADERS = {
+  "測試_全場收支彙整": ["交易編號","日期","帳務歸屬","付款場別","收支類型","付款來源","科目代號","科目分類","品項","用途說明","廠商名稱","數量","單價","金額","填表人","來源試算表ID"],
+  "測試_代付彙整": ["交易編號","日期","付款場別","帳務歸屬","科目分類","品項","代付金額","填表人","來源試算表ID"],
+  "測試_還款彙整": ["交易編號","日期","還款場別","收款場別","還款金額","付款來源","填表人","備註"]
+};
+
+function requireSafeCentralTarget(sourceId) {
+  if (TEST_CENTRAL_SHEET_ID !== PRODUCTION_CENTRAL_SHEET_ID || TEST_CENTRAL_SHEET_ID === sourceId)
+    throw new Error("安全鎖：TEST_CENTRAL_SHEET_ID 必須是指定中央主控表，且不可等於來源帳本");
+}
+
+async function buildCentralTestSnapshot(sourceId) {
+  const sheets = await getSheets();
+  const meta = await sheets.spreadsheets.get({spreadsheetId:sourceId,fields:"sheets.properties.title"});
+  const monthTabs = (meta.data.sheets || []).map(x=>x.properties.title)
+    .filter(x=>/^\d{6}月$/.test(x)).sort();
+  const incomeExpense = [];
+  for (const tab of monthTabs) {
+    const response = await sheets.spreadsheets.values.get({spreadsheetId:sourceId,range:`'${tab}'!A1:O`,valueRenderOption:"FORMATTED_VALUE"});
+    const values = response.data.values || [];
+    const headers = values[0] || [];
+    const idx = name => headers.indexOf(name);
+    const cell = (r,name) => {const i=idx(name);return i<0?"":(r[i]??"");};
+    values.slice(1).forEach((r,i)=>{
+      const kind=cell(r,"收支類型");
+      if (!(["支出","收入"].includes(kind))) return;
+      const raw=Number(String(cell(r,"金額")).replace(/,/g,""));
+      if (!Number.isFinite(raw) || !cell(r,"日期")) return;
+      const sourceMarker=cell(r,"發票或憑證");
+      const txId=sourceMarker.startsWith("TEST-TRANSFER:") ? sourceMarker : `${sourceId}:${tab}:${i+2}`;
+      const payment=String(cell(r,"付款來源"));
+      incomeExpense.push([txId,cell(r,"日期"),cell(r,"場別"),payment.startsWith("代付：")?payment.slice(3):cell(r,"場別"),kind,payment,cell(r,"科目代號"),cell(r,"科目分類"),cell(r,"品項"),cell(r,"用途說明"),cell(r,"廠商名稱"),cell(r,"數量"),cell(r,"單價"),kind==="收入"?-Math.abs(raw):Math.abs(raw),cell(r,"填表人"),sourceId]);
+    });
+  }
+  const transfers = (await transferRows(sourceId)).filter(r=>r.status==="完成");
+  const advances = transfers.filter(r=>r.type==="代付").map(r=>[r.id,r.date,r.payer,r.owner,"",r.description,Math.abs(r.amount),"",sourceId]);
+  const repayments = transfers.filter(r=>r.type==="還款").map(r=>[r.id,r.date,r.owner,r.payer,-Math.abs(r.amount),"","","還款（測試資料）"]);
+  return {"測試_全場收支彙整":incomeExpense,"測試_代付彙整":advances,"測試_還款彙整":repayments};
+}
+
+async function syncCentralTest(sourceId) {
+  requireSafeCentralTarget(sourceId);
+  const snapshot = await buildCentralTestSnapshot(sourceId);
+  const sheets = await getSheets();
+  // 先確認測試副本可存取，避免把不存在的 ID 當作成功。
+  await sheets.spreadsheets.get({spreadsheetId:TEST_CENTRAL_SHEET_ID,fields:"spreadsheetId"});
+  for (const [tab, rows] of Object.entries(snapshot)) {
+    // 白名單：僅允許程式內定義的三個測試分頁。
+    if (!Object.prototype.hasOwnProperty.call(CENTRAL_TEST_HEADERS, tab) || !tab.startsWith("測試_"))
+      throw new Error("拒絕寫入非測試分頁");
+    const expectedHeaders = CENTRAL_TEST_HEADERS[tab];
+    const current = await sheets.spreadsheets.values.get({
+      spreadsheetId: TEST_CENTRAL_SHEET_ID, range: `'${tab}'!A1:P`, valueRenderOption: "FORMATTED_VALUE"
+    });
+    const existing = current.data.values || [];
+    if (existing[0]?.some(x => String(x).trim()) && existing[0].join("|") !== expectedHeaders.join("|"))
+      throw new Error(`${tab} 的欄位與程式不同，已停止同步以免覆蓋資料`);
+    if (!existing[0]?.length) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: TEST_CENTRAL_SHEET_ID, range: `'${tab}'!A1`, valueInputOption: "RAW",
+        requestBody: {values: [expectedHeaders]}
+      });
+    }
+    // 僅新增未出現過的交易編號，不清除、不覆寫任何既有列。
+    const existingIds = new Set(existing.slice(1).map(r => String(r[0] || "")).filter(Boolean));
+    const missing = rows.filter(r => !existingIds.has(String(r[0])));
+    if (missing.length) {
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: TEST_CENTRAL_SHEET_ID, range: `'${tab}'!A:P`,
+        valueInputOption: "RAW", insertDataOption: "INSERT_ROWS",
+        requestBody: {values: missing}
+      });
+    }
+  }
+  return `✅ 中央測試彙整完成\n全場收支：${snapshot["測試_全場收支彙整"].length} 筆\n代付：${snapshot["測試_代付彙整"].length} 筆\n還款：${snapshot["測試_還款彙整"].length} 筆\n只新增中央主控表「測試_」分頁中尚未同步的交易，不覆蓋原資料。`;
 }
 
 // ===== 測試專用跨場往來 =====
@@ -1333,6 +1415,7 @@ async function handleTextMessage(event) {
 
   await ensureBaseStructure(targetSheetId);
   if (text === "查代付") return await transferSummary(targetSheetId);
+  if (text === "同步中央測試") return await syncCentralTest(targetSheetId);
 
   const query = parseQuery(text);
   if (query) {

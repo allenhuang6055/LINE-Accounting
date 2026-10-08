@@ -16,11 +16,25 @@ const client = new line.messagingApi.MessagingApiClient({
 });
 
 const DEFAULT_SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
+// 測試版專用使用者主檔；正式版 MASTER_SHEET_ID 一律禁止。
+const MASTER_SHEET_ID = process.env.TEST_USER_MASTER_SHEET_ID || "";
+const TEST_ALLOWED_SHEET_ID = process.env.TEST_ALLOWED_SHEET_ID || "";
 const ACCOUNT_MASTER_SHEET_ID = process.env.ACCOUNT_MASTER_SHEET_ID;
 // 測試版強制隔離：啟動時必須明確啟用，且不得使用正式多人主檔。
-if (process.env.TEST_MODE !== "1" || MASTER_SHEET_ID || process.env.CENTRAL_SHEET_ID) {
-  throw new Error("測試版安全鎖：需設定 TEST_MODE=1，且不可設定 MASTER_SHEET_ID 或 CENTRAL_SHEET_ID");
+if (process.env.TEST_MODE !== "1" || process.env.MASTER_SHEET_ID || process.env.CENTRAL_SHEET_ID) {
+  throw new Error("測試版安全鎖：需 TEST_MODE=1，不得設定正式 MASTER_SHEET_ID 或 CENTRAL_SHEET_ID");
+}
+if (Boolean(MASTER_SHEET_ID) !== Boolean(TEST_ALLOWED_SHEET_ID)) {
+  throw new Error("多人測試安全鎖：TEST_USER_MASTER_SHEET_ID 與 TEST_ALLOWED_SHEET_ID 必須同時設定");
+}
+if (MASTER_SHEET_ID && (
+  MASTER_SHEET_ID === TEST_ALLOWED_SHEET_ID ||
+  MASTER_SHEET_ID === DEFAULT_SHEET_ID ||
+  TEST_ALLOWED_SHEET_ID === DEFAULT_SHEET_ID ||
+  MASTER_SHEET_ID === process.env.TEST_CENTRAL_SHEET_ID ||
+  TEST_ALLOWED_SHEET_ID === process.env.TEST_CENTRAL_SHEET_ID
+)) {
+  throw new Error("多人測試安全鎖：測試主檔、測試帳本、原測試帳本、中央表不可互相混用");
 }
 if (!DEFAULT_SHEET_ID) throw new Error("測試版缺少 GOOGLE_SHEET_ID");
 
@@ -468,6 +482,11 @@ async function resolveUserSheet(event) {
     return {
       error: `❌ ${name} 尚未設定 Google Sheet ID。`,
     };
+  }
+
+  // 測試版只能寫入事先指定的埤北場測試帳本，禁止其他主檔列指向正式帳本。
+  if (sheetId !== TEST_ALLOWED_SHEET_ID) {
+    return { error: "❌ 安全鎖：這位使用者的帳本不是核准的測試帳本，已停止操作。" };
   }
 
   return {
@@ -1412,6 +1431,11 @@ async function handleTextMessage(event) {
   }
 
   const targetSheetId = userSheet.sheetId;
+
+  // 唯讀核對指令，不新增、不修改任何帳本資料。
+  if (text === "測試帳本") {
+    return `🔎 測試分流檢查\n使用者：${userSheet.name}\n來源：${userSheet.source}\n帳本 ID：${targetSheetId}\n尚未寫入任何資料。`;
+  }
 
   await ensureBaseStructure(targetSheetId);
   if (text === "查代付") return await transferSummary(targetSheetId);

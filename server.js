@@ -1238,9 +1238,15 @@ async function transferRows(sheetId) {
   const result = await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${TRANSFER_TAB}'!A2:I`,valueRenderOption:"FORMATTED_VALUE"});
   return (result.data.values || []).map((r,i)=>({row:i+2,id:r[0]||"",date:r[1]||"",type:r[2]||"",payer:r[3]||"",owner:r[4]||"",amount:parseAmount(r[5])||0,description:r[6]||"",status:r[7]||""}));
 }
+// 相容舊資料：過去還款是正數，新版還款為負數；均以類型決定方向。
+function signedTransferAmount(row) {
+  if (row.type === "代付") return Math.abs(row.amount);
+  if (row.type === "還款") return -Math.abs(row.amount);
+  return 0;
+}
 function transferBalance(rows,payer,owner) {
-  return rows.filter(r=>r.payer===payer && r.owner===owner && ["代付","還款"].includes(r.type))
-    .reduce((n,r)=>n+(r.type==="代付"?r.amount:-r.amount),0);
+  return rows.filter(r=>r.status === "完成" && r.payer===payer && r.owner===owner)
+    .reduce((n,r)=>n+signedTransferAmount(r),0);
 }
 async function hasExpenseMarker(sheetId,monthSheet,marker) {
   const sheets=await getSheets();
@@ -1259,7 +1265,7 @@ async function processTransfer(sheetId,event,dated,cmd,userName) {
   }
   let transferRow=previous?.row;
   if (!previous) {
-    const added=await sheets.spreadsheets.values.append({spreadsheetId:sheetId,range:`'${TRANSFER_TAB}'!A:I`,valueInputOption:"USER_ENTERED",insertDataOption:"INSERT_ROWS",requestBody:{values:[[id,dated.dateInfo.dateText,cmd.type,cmd.payer,cmd.owner,cmd.amount,cmd.description,"處理中",userName]]}});
+    const added=await sheets.spreadsheets.values.append({spreadsheetId:sheetId,range:`'${TRANSFER_TAB}'!A:I`,valueInputOption:"USER_ENTERED",insertDataOption:"INSERT_ROWS",requestBody:{values:[[id,dated.dateInfo.dateText,cmd.type,cmd.payer,cmd.owner,cmd.type==="還款"?-Math.abs(cmd.amount):Math.abs(cmd.amount),cmd.description,"處理中",userName]]}});
     const updated=added.data.updates?.updatedRange||"";
     const match=updated.match(/![A-Z]+(\d+):/);
     if (!match) throw new Error("跨場紀錄已新增但無法確認列號，請先檢查測試表，不要重送。");
@@ -1287,9 +1293,9 @@ async function processTransfer(sheetId,event,dated,cmd,userName) {
 async function transferSummary(sheetId) {
   const rows=(await transferRows(sheetId)).filter(r=>r.status==="完成");
   const pairs=new Map();
-  for(const r of rows){const key=`${r.owner} → ${r.payer}`;pairs.set(key,(pairs.get(key)||0)+(r.type==="代付"?r.amount:-r.amount));}
+  for(const r of rows){const key=`${r.owner} → ${r.payer}`;const item=pairs.get(key)||{paid:0,repaid:0};if(r.type==="代付")item.paid+=Math.abs(r.amount);if(r.type==="還款")item.repaid+=Math.abs(r.amount);pairs.set(key,item);}
   const lines=["📒 測試版跨場代付餘額"];
-  for(const [key,n] of pairs) if(n!==0) lines.push(`${key}：${n.toLocaleString("zh-TW")} 元`);
+  for(const [key,v] of pairs) {const n=v.paid-v.repaid;if(n!==0) lines.push(`${key}\n代付：${v.paid.toLocaleString("zh-TW")} 元\n還款：${v.repaid.toLocaleString("zh-TW")} 元\n尚欠：${n.toLocaleString("zh-TW")} 元`);}
   if(lines.length===1) lines.push("目前沒有未結清代付款。");
   return lines.join("\n");
 }

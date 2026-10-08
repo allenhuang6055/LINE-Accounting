@@ -1312,6 +1312,17 @@ async function syncCentralTest(sourceId) {
   return `✅ 中央測試彙整完成\n全場收支：${snapshot["測試_全場收支彙整"].length} 筆\n代付：${snapshot["測試_代付彙整"].length} 筆\n還款：${snapshot["測試_還款彙整"].length} 筆\n只新增中央主控表「測試_」分頁中尚未同步的交易，不覆蓋原資料。`;
 }
 
+// 記帳已成功後才同步中央；同步失敗不得讓使用者誤以為記帳失敗而重送。
+async function autoSyncCentralAfterSaved(sourceId) {
+  try {
+    await syncCentralTest(sourceId);
+    return "📊 中央測試總表：已自動同步";
+  } catch (err) {
+    console.error("記帳成功，但中央自動同步失敗：", err);
+    return "⚠️ 帳本已記錄，但中央同步未完成。請勿重送記帳訊息；稍後傳「同步中央測試」補同步。";
+  }
+}
+
 // ===== 測試專用跨場往來 =====
 const TRANSFER_TAB = "跨場往來測試";
 const TRANSFER_HEADERS = ["訊息ID", "日期", "類型", "付款場別", "帳務歸屬", "金額", "用途", "狀態", "填表人"];
@@ -1453,7 +1464,12 @@ async function handleTextMessage(event) {
 
   const transfer = parseTransferCommand(dated.body);
   if (transfer?.error) return `❌ ${transfer.error}`;
-  if (transfer) return await processTransfer(targetSheetId,event,dated,transfer,await getProfileName(event));
+  if (transfer) {
+    const result = await processTransfer(targetSheetId,event,dated,transfer,await getProfileName(event));
+    // 拒絕/重複的指令不觸發同步；完成記帳後才同步。
+    if (!result.startsWith("✅") || result.includes("已經記錄過")) return result;
+    return result + "\n\n" + await autoSyncCentralAfterSaved(targetSheetId);
+  }
 
   const expense = await parseExpenseCommand(dated.body);
 
@@ -1472,6 +1488,8 @@ async function handleTextMessage(event) {
       dated.dateInfo.dateText,
       userName
     );
+
+    const centralSyncStatus = await autoSyncCentralAfterSaved(targetSheetId);
 
     return [
       `✅ ${expense.txType}記錄完成`,
@@ -1492,6 +1510,8 @@ async function handleTextMessage(event) {
       `填表人：${userName}`,
       `帳本：${userSheet.name}`,
       `寫入：${dated.dateInfo.monthSheet}`,
+      "",
+      centralSyncStatus,
     ].filter(Boolean).join("\n");
   }
 

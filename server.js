@@ -18,9 +18,16 @@ const client = new line.messagingApi.MessagingApiClient({
 const DEFAULT_SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
 const ACCOUNT_MASTER_SHEET_ID = process.env.ACCOUNT_MASTER_SHEET_ID;
+// 測試版強制隔離：啟動時必須明確啟用，且不得使用正式多人主檔。
+if (process.env.TEST_MODE !== "1" || MASTER_SHEET_ID || process.env.CENTRAL_SHEET_ID) {
+  throw new Error("測試版安全鎖：需設定 TEST_MODE=1，且不可設定 MASTER_SHEET_ID 或 CENTRAL_SHEET_ID");
+}
+if (!DEFAULT_SHEET_ID) throw new Error("測試版缺少 GOOGLE_SHEET_ID");
 
 // ===== 場別 =====
 const FARM_ALIASES = {
+  "測試": "測試場",
+  "測試場": "測試場",
   "東平": "東平場",
   "東平場": "東平場",
   "草湖": "草湖場",
@@ -760,7 +767,7 @@ async function parseExpenseCommand(text) {
   };
 }
 
-async function writeExpense(sheetId, monthSheet, expense, dateText, userName) {
+async function writeExpense(sheetId, monthSheet, expense, dateText, userName, receiptMarker = "") {
   const sheets = await getSheets();
 
   const appendResult = await sheets.spreadsheets.values.append({
@@ -782,7 +789,7 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName) {
         expense.qty,
         expense.unitPrice,
         expense.txType === "收入" ? -Math.abs(expense.amount) : Math.abs(expense.amount),
-        "",
+        receiptMarker,
         expense.advanceTarget || "",
         userName || "",
       ]],
@@ -1186,6 +1193,11 @@ function helpText() {
     "9/28 草湖 支出 500 電風扇 / 三豐",
     "2026/9/28 仁愛 收入 5000 雞蛋銷售 / 客戶",
     "",
+    "【跨場代付測試】",
+    "草湖幫埤北付5000飼料",
+    "埤北還草湖3000",
+    "查代付",
+    "",
     "【查詢】",
     "今天",
     "本月",
@@ -1196,7 +1208,90 @@ function helpText() {
     "",
     "【查自己的 LINE ID】",
     "我的ID",
-  ].join("\\n");
+  ].join("\n");
+}
+
+// ===== 測試專用跨場往來 =====
+const TRANSFER_TAB = "跨場往來測試";
+const TRANSFER_HEADERS = ["訊息ID", "日期", "類型", "付款場別", "帳務歸屬", "金額", "用途", "狀態", "填表人"];
+function parseTransferCommand(body) {
+  const t = String(body || "").replace(/\s+/g, "").replace(/，/g, "");
+  let m = t.match(/^(.+?)幫(.+?)付([\d,]+(?:\.\d+)?)(.+)$/);
+  if (m) {
+    const payer = farmFromToken(m[1]), owner = farmFromToken(m[2]);
+    const amount = parseAmount(m[3]), description = m[4].trim();
+    if (!payer || !owner || payer === "全部" || owner === "全部" || payer === owner) return {error:"代付場別不正確，付款場與歸屬場必須不同。"};
+    if (!(amount > 0) || !description) return {error:"請填入有效金額及用途。"};
+    return {type:"代付",payer,owner,amount,description};
+  }
+  m = t.match(/^(.+?)還(.+?)([\d,]+(?:\.\d+)?)$/);
+  if (m) {
+    const owner = farmFromToken(m[1]), payer = farmFromToken(m[2]), amount = parseAmount(m[3]);
+    if (!payer || !owner || payer === "全部" || owner === "全部" || payer === owner || !(amount > 0)) return {error:"還款格式或金額不正確。"};
+    return {type:"還款",payer,owner,amount,description:"還款"};
+  }
+  return null;
+}
+async function transferRows(sheetId) {
+  const sheets = await getSheets();
+  await ensureSheet(sheetId, TRANSFER_TAB, TRANSFER_HEADERS);
+  const result = await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${TRANSFER_TAB}'!A2:I`,valueRenderOption:"FORMATTED_VALUE"});
+  return (result.data.values || []).map((r,i)=>({row:i+2,id:r[0]||"",date:r[1]||"",type:r[2]||"",payer:r[3]||"",owner:r[4]||"",amount:parseAmount(r[5])||0,description:r[6]||"",status:r[7]||""}));
+}
+function transferBalance(rows,payer,owner) {
+  return rows.filter(r=>r.payer===payer && r.owner===owner && ["代付","還款"].includes(r.type))
+    .reduce((n,r)=>n+(r.type==="代付"?r.amount:-r.amount),0);
+}
+async function hasExpenseMarker(sheetId,monthSheet,marker) {
+  const sheets=await getSheets();
+  const result=await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${monthSheet}'!M2:M`,valueRenderOption:"FORMATTED_VALUE"});
+  return (result.data.values||[]).some(r=>r[0]===marker);
+}
+async function processTransfer(sheetId,event,dated,cmd,userName) {
+  const sheets=await getSheets();
+  const id=String(event.message?.id||"");
+  if (!id) return "❌ 無法取得訊息編號，為避免重複記帳，已取消操作。";
+  const rows=await transferRows(sheetId);
+  const previous=rows.find(r=>r.id===id);
+  if (previous?.status==="完成") return `✅ 這筆${cmd.type}已經記錄過，沒有重複寫入。`;
+  if (cmd.type==="還款" && !previous && cmd.amount>transferBalance(rows,cmd.payer,cmd.owner)) {
+    return `❌ 還款金額超過未結清代付：${transferBalance(rows,cmd.payer,cmd.owner).toLocaleString("zh-TW")} 元`;
+  }
+  let transferRow=previous?.row;
+  if (!previous) {
+    const added=await sheets.spreadsheets.values.append({spreadsheetId:sheetId,range:`'${TRANSFER_TAB}'!A:I`,valueInputOption:"USER_ENTERED",insertDataOption:"INSERT_ROWS",requestBody:{values:[[id,dated.dateInfo.dateText,cmd.type,cmd.payer,cmd.owner,cmd.amount,cmd.description,"處理中",userName]]}});
+    const updated=added.data.updates?.updatedRange||"";
+    const match=updated.match(/![A-Z]+(\d+):/);
+    if (!match) throw new Error("跨場紀錄已新增但無法確認列號，請先檢查測試表，不要重送。");
+    transferRow=Number(match[1]);
+  }
+  if (cmd.type==="代付") {
+    const marker=`TEST-TRANSFER:${id}`;
+    await ensureMonthSheet(sheetId,dated.dateInfo.monthSheet);
+    if (!(await hasExpenseMarker(sheetId,dated.dateInfo.monthSheet,marker))) {
+      const selected=await autoChooseItem(cmd.description);
+      if (!selected) throw new Error("找不到對應科目");
+      await writeExpense(sheetId,dated.dateInfo.monthSheet,{
+        farm:cmd.owner,txType:"支出",paymentSource:"代付："+cmd.payer,
+        code:selected.code,className:selected.className,accountItem:selected.item,
+        description:cmd.description,vendor:"",qty:1,unitPrice:cmd.amount,amount:cmd.amount,
+        advanceTarget:cmd.payer
+      },dated.dateInfo.dateText,userName,marker);
+    }
+  }
+  await sheets.spreadsheets.values.update({spreadsheetId:sheetId,range:`'${TRANSFER_TAB}'!H${transferRow}`,valueInputOption:"RAW",requestBody:{values:[["完成"]]}});
+  const newRows=await transferRows(sheetId);
+  const balance=transferBalance(newRows,cmd.payer,cmd.owner);
+  return [`✅ ${cmd.type}測試記錄完成`,`付款場別：${cmd.payer}`,`帳務歸屬：${cmd.owner}`,`金額：${cmd.amount.toLocaleString("zh-TW")} 元`,cmd.type==="代付"?`用途：${cmd.description}`:null,`目前 ${cmd.owner} 欠 ${cmd.payer}：${balance.toLocaleString("zh-TW")} 元`,`紀錄：${TRANSFER_TAB}`].filter(Boolean).join("\n");
+}
+async function transferSummary(sheetId) {
+  const rows=(await transferRows(sheetId)).filter(r=>r.status==="完成");
+  const pairs=new Map();
+  for(const r of rows){const key=`${r.owner} → ${r.payer}`;pairs.set(key,(pairs.get(key)||0)+(r.type==="代付"?r.amount:-r.amount));}
+  const lines=["📒 測試版跨場代付餘額"];
+  for(const [key,n] of pairs) if(n!==0) lines.push(`${key}：${n.toLocaleString("zh-TW")} 元`);
+  if(lines.length===1) lines.push("目前沒有未結清代付款。");
+  return lines.join("\n");
 }
 
 async function handleTextMessage(event) {
@@ -1231,6 +1326,7 @@ async function handleTextMessage(event) {
   const targetSheetId = userSheet.sheetId;
 
   await ensureBaseStructure(targetSheetId);
+  if (text === "查代付") return await transferSummary(targetSheetId);
 
   const query = parseQuery(text);
   if (query) {
@@ -1241,6 +1337,10 @@ async function handleTextMessage(event) {
   if (dated.error) {
     return `❌ ${dated.error}`;
   }
+
+  const transfer = parseTransferCommand(dated.body);
+  if (transfer?.error) return `❌ ${transfer.error}`;
+  if (transfer) return await processTransfer(targetSheetId,event,dated,transfer,await getProfileName(event));
 
   const expense = await parseExpenseCommand(dated.body);
 

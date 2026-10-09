@@ -801,6 +801,24 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName) {
     },
   });
 
+  // 記錄實際寫入時間，跨月份查詢依此排序；記帳成功後才寫日誌。
+  // 日誌失敗不應讓使用者重複記帳。
+  let auditWarning = false;
+  try {
+    const updatedRange = appendResult.data?.updates?.updatedRange || "";
+    const rowMatch = updatedRange.match(/![A-Z]+(\d+):[A-Z]+(\d+)$/);
+    const rowNumber = rowMatch ? Number(rowMatch[1]) : null;
+    if (!rowNumber) throw new Error("Google Sheets 未回傳寫入列號");
+    await appendAccountingLog(sheetId, {
+      timestamp: new Date().toISOString(), monthSheet, rowNumber,
+      farm: expense.farm, txType: expense.txType || "支出",
+      item: expense.accountItem, amount: expense.amount, recorder: userName || "",
+    });
+  } catch (auditErr) {
+    auditWarning = true;
+    console.warn("記帳已成功，但寫入排序紀錄失敗：", auditErr.message);
+  }
+
   // 顏色只是方便查看，不參與任何加減計算
   try {
     const updatedRange =
@@ -858,6 +876,7 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName) {
   } catch (formatErr) {
     console.warn("套用列顏色失敗，不影響記帳：", formatErr.message);
   }
+  return { auditWarning };
 }
 
 function headerIndex(headers, names) {
@@ -1206,9 +1225,123 @@ function helpText() {
     "仁愛 9月",
     "2026/9",
     "",
+    "最近10筆",
+    "",
     "【查自己的 LINE ID】",
     "我的ID",
   ].join("\\n");
+}
+
+
+// 最近10筆專用：獨立記錄分頁，不改動每月 A～O 15 欄。
+const RECENT_LOG_TAB = "系統記帳順序";
+const RECENT_LOG_HEADERS = ["寫入時間UTC", "月份分頁", "列號", "場別", "收支類型", "品項", "金額", "填表人"];
+
+async function appendAccountingLog(sheetId, record) {
+  await ensureSheet(sheetId, RECENT_LOG_TAB, RECENT_LOG_HEADERS);
+  const sheets = await getSheets();
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: sheetId,
+    range: `'${RECENT_LOG_TAB}'!A:H`,
+    valueInputOption: "RAW",
+    insertDataOption: "INSERT_ROWS",
+    requestBody: { values: [[record.timestamp, record.monthSheet, record.rowNumber,
+      record.farm, record.txType, record.item, record.amount, record.recorder]] },
+  });
+}
+
+async function recentTenText(sheetId) {
+  const sheets = await getSheets();
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: sheetId,
+    fields: "sheets.properties.title",
+  });
+  const titles = (meta.data.sheets || []).map(s => s.properties.title);
+  const months = titles.filter(t => /^\d{6}月$/.test(t)).sort().reverse();
+  const hasLog = titles.includes(RECENT_LOG_TAB);
+  let logRows = [];
+  if (hasLog) {
+    const logResult = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId,
+      range: `'${RECENT_LOG_TAB}'!A2:H`,
+      valueRenderOption: "FORMATTED_VALUE",
+    });
+    logRows = (logResult.data.values || []).map(r => ({
+      timestamp: String(r[0] || ""), month: String(r[1] || ""),
+      row: Number(r[2]),
+    })).filter(r => /^\d{6}月$/.test(r.month) && r.row >= 2 && !Number.isNaN(Date.parse(r.timestamp)));
+  }
+
+  // 先依實際寫入時間排序；舊資料沒有時間紀錄時只能用月份及列號近似。
+  const ordered = logRows.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  const byMonth = new Map();
+  async function monthRows(month) {
+    if (byMonth.has(month)) return byMonth.get(month);
+    const result = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId, range: `'${month}'!A1:O`,
+      valueRenderOption: "FORMATTED_VALUE",
+    });
+    const values = result.data.values || [];
+    const headers = values[0] || [];
+    const idx = names => headerIndex(headers, names);
+    const indices = {
+      farm: idx(["場別", "帳務歸屬"]), date: idx(["日期"]),
+      txType: idx(["收支類型"]), item: idx(["品項"]),
+      amount: idx(["金額"]), recorder: idx(["填表人"]),
+    };
+    const rows = values.slice(1).map((r, i) => {
+      const get = key => indices[key] < 0 ? "" : String(r[indices[key]] || "").trim();
+      return { month, row: i + 2, farm: get("farm"), date: get("date"),
+        txType: get("txType"), item: get("item"), amount: get("amount"),
+        recorder: get("recorder") };
+    }).filter(r => r.date || r.item || r.amount);
+    byMonth.set(month, rows);
+    return rows;
+  }
+
+  const recent = [];
+  const used = new Set();
+  for (const log of ordered) {
+    if (recent.length >= 10) break;
+    if (!months.includes(log.month)) continue;
+    const key = `${log.month}:${log.row}`;
+    if (used.has(key)) continue;
+    const row = (await monthRows(log.month)).find(r => r.row === log.row);
+    if (!row) continue;
+    used.add(key);
+    recent.push({ ...row, approximate: false });
+  }
+
+  // 補齊沒有排序紀錄的舊資料。不能宣稱這些舊資料有精確寫入先後。
+  if (recent.length < 10) {
+    for (const month of months) {
+      const rows = await monthRows(month);
+      for (const row of rows.slice().reverse()) {
+        if (recent.length >= 10) break;
+        const key = `${month}:${row.row}`;
+        if (used.has(key)) continue;
+        used.add(key);
+        recent.push({ ...row, approximate: true });
+      }
+      if (recent.length >= 10) break;
+    }
+  }
+
+  if (!recent.length) return "📒 最近10筆記帳\n\n目前沒有記帳資料。";
+  const lines = ["📒 最近10筆記帳（同帳本所有人）", ""];
+  for (let i = 0; i < recent.length; i++) {
+    const r = recent[i];
+    const amount = Number(r.amount.replace(/,/g, ""));
+    const formatted = Number.isFinite(amount) ? Math.abs(amount).toLocaleString("zh-TW") : r.amount;
+    const date = r.date.replace(/^\d{4}[\/-]/, "");
+    lines.push(`${i + 1}. ${date} ${r.farm}｜${r.txType || "支出"}｜${r.item}｜${formatted}元${r.approximate ? " ※" : ""}`);
+    lines.push(`   填表人：${r.recorder || "未填"}`);
+  }
+  lines.push("", `共顯示 ${recent.length} 筆`);
+  if (recent.some(r => r.approximate)) {
+    lines.push("※ 舊資料沒有寫入時間，只能按月份及列順序推估；補登可能不是實際先後。 ");
+  }
+  return lines.join("\n");
 }
 
 async function handleTextMessage(event) {
@@ -1244,6 +1377,10 @@ async function handleTextMessage(event) {
 
   await ensureBaseStructure(targetSheetId);
 
+  if (text === "最近10筆") {
+    return await recentTenText(targetSheetId);
+  }
+
   const query = parseQuery(text);
   if (query) {
     return await querySummary(targetSheetId, query);
@@ -1264,7 +1401,7 @@ async function handleTextMessage(event) {
     const userName = await getProfileName(event);
 
     await ensureMonthSheet(targetSheetId, dated.dateInfo.monthSheet);
-    await writeExpense(
+    const writeResult = await writeExpense(
       targetSheetId,
       dated.dateInfo.monthSheet,
       expense,
@@ -1291,6 +1428,7 @@ async function handleTextMessage(event) {
       `填表人：${userName}`,
       `帳本：${userSheet.name}`,
       `寫入：${dated.dateInfo.monthSheet}`,
+      writeResult?.auditWarning ? "⚠️ 記帳成功，但排序紀錄未完成，請勿重複送出。" : null,
     ].filter(Boolean).join("\n");
   }
 

@@ -623,7 +623,19 @@ async function migrateMonthSheetColumns(sheetId, monthSheet) {
 }
 
 async function ensureMonthSheet(sheetId, monthSheet) {
-  await migrateMonthSheetColumns(sheetId, monthSheet);
+  // 先確認分頁是否存在，避免對不存在的月份讀取 A1:O 而發生 400。
+  // 已存在的月份完全不更動欄位或歷史資料。
+  const sheets = await getSheets();
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: sheetId,
+    fields: "sheets.properties.title",
+  });
+  const exists = (meta.data.sheets || []).some(
+    s => s.properties.title === monthSheet
+  );
+  if (exists) return;
+
+  // 只在缺少月份時建立新分頁及原程式的欄位標題。
   await ensureSheet(sheetId, monthSheet, [
     "場別",
     "收支類型",

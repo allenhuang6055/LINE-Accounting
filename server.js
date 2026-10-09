@@ -1278,6 +1278,13 @@ async function readAccountingLog(sheetId) {
 // 刪除確認狀態存在記憶體中，服務重新部署後需重新下指令。
 const pendingDeletions = new Map();
 const DELETE_CONFIRM_MS = 5 * 60 * 1000;
+// 僅 TESTING 服務可啟用；必須同時設定環境旗標與指定管理員 LINE ID。
+const ADMIN_TEST_DELETE_ENABLED = process.env.ENABLE_TEST_ID_DELETE === "true" && process.env.APP_ENV === "TESTING";
+const ADMIN_TEST_DELETE_USER_ID = process.env.TEST_ADMIN_LINE_USER_ID || "";
+function canTestDeleteById(userId) {
+  return ADMIN_TEST_DELETE_ENABLED && !!ADMIN_TEST_DELETE_USER_ID && userId === ADMIN_TEST_DELETE_USER_ID;
+}
+
 
 async function lastOwnEntry(sheetId, userId) {
   if (!userId) return null;
@@ -1297,26 +1304,60 @@ function formatDeletionEntry(e) {
 async function requestDeleteLast(sheetId, userId) {
   const entry = await lastOwnEntry(sheetId, userId);
   if (!entry) return "目前沒有可刪除的本人記帳。舊資料沒有 LINE User ID，為安全起見不能透過此指令刪除。";
-  pendingDeletions.set(`${sheetId}:${userId}`, { id: entry.id, expiresAt: Date.now() + DELETE_CONFIRM_MS });
+  pendingDeletions.set(`${sheetId}:${userId}`, { id: entry.id, mode: "own-last", expiresAt: Date.now() + DELETE_CONFIRM_MS });
   return `⚠️ 即將永久刪除你最後寫入的記帳\n\n${formatDeletionEntry(entry)}\n\n請於5分鐘內輸入「確認刪除」，或輸入「取消」。\n此操作會真正移除月份分頁中的整列。`;
+}
+
+async function requestTestDeleteById(sheetId, userId, id) {
+  if (!canTestDeleteById(userId)) return "❌ 無權限使用測試刪除。";
+  if (!/^TX-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+    return "❌ 記帳ID格式不正確。";
+  }
+  const entries = await readAccountingLog(sheetId);
+  const entry = entries.find(e => e.id === id && e.status !== "已刪除" && e.row >= 2 && /^\d{6}月$/.test(e.month));
+  if (!entry) return "❌ 找不到這筆有效記帳，未執行刪除。";
+  // 測試指令不得刪除無 LINE ID 的舊帳或非管理員本人所建的帳。
+  if (entry.userId !== userId) return "❌ 安全限制：只能指定刪除管理員本人新增的測試帳。";
+  // 強制指定測試金額及用途，避免誤刪正式帳目。
+  if (entry.amount !== 22 || entry.farm !== "草湖場") return "❌ 安全限制：只允許草湖場22元測試帳。";
+  const sheets = await getSheets();
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId, range: `'${entry.month}'!A${entry.row}:O${entry.row}`,
+    valueRenderOption: "FORMATTED_VALUE"
+  });
+  const head = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId, range: `'${entry.month}'!A1:O1`, valueRenderOption: "FORMATTED_VALUE"
+  });
+  const row = result.data.values?.[0] || [];
+  const headers = head.data.values?.[0] || [];
+  const purposeIndex = headerIndex(headers, ["用途說明"]);
+  if (purposeIndex < 0 || !String(row[purposeIndex] || "").includes("中間列測試B")) {
+    return "❌ 安全限制：月份資料不是『中間列測試B』，未執行刪除。";
+  }
+  pendingDeletions.set(`${sheetId}:${userId}`, { id, mode: "test-id", expiresAt: Date.now() + DELETE_CONFIRM_MS });
+  return `🧪 TESTING 中間列刪除測試（僅管理員本人測試帳）\n\n${formatDeletionEntry(entry)}\n\n5分鐘內輸入「確認測試刪除」，或輸入「取消」。\n此操作會永久移除月份分頁中的整列。`;
 }
 
 function sheetCell(value) {
   return { userEnteredValue: typeof value === "number" ? { numberValue: value } : { stringValue: String(value) } };
 }
 
-async function confirmDeleteLast(sheetId, userId) {
+async function confirmDeleteLast(sheetId, userId, expectedMode = "own-last") {
   const key = `${sheetId}:${userId}`;
   const pending = pendingDeletions.get(key);
   pendingDeletions.delete(key); // 一次性確認，避免重送
-  if (!pending || Date.now() > pending.expiresAt) return "⚠️ 沒有待確認的刪除，或已超過5分鐘。請重新輸入「刪除上一筆」。";
+  if (!pending || pending.mode !== expectedMode || Date.now() > pending.expiresAt) return "⚠️ 沒有相符的待確認刪除，或已超過5分鐘。請重新下指令。";
 
   const sheets = await getSheets();
   const entries = await readAccountingLog(sheetId);
   const entry = entries.find(e => e.id === pending.id && e.userId === userId && e.status !== "已刪除");
   if (!entry) return "❌ 找不到本人待刪除的有效記帳，已取消。";
-  const newest = await lastOwnEntry(sheetId, userId);
-  if (!newest || newest.id !== entry.id) return "⚠️ 期間又有新記帳，請重新輸入「刪除上一筆」。";
+  if (expectedMode === "own-last") {
+    const newest = await lastOwnEntry(sheetId, userId);
+    if (!newest || newest.id !== entry.id) return "⚠️ 期間又有新記帳，請重新輸入「刪除上一筆」。";
+  } else if (expectedMode === "test-id") {
+    if (!canTestDeleteById(userId) || entry.amount !== 22 || entry.farm !== "草湖場") return "❌ 測試刪除權限或資料不符。";
+  } else return "❌ 不支援的刪除模式。";
 
   const meta = await sheets.spreadsheets.get({
     spreadsheetId: sheetId, fields: "sheets.properties(sheetId,title)"
@@ -1343,6 +1384,13 @@ async function confirmDeleteLast(sheetId, userId) {
     return "❌ 月份分頁資料與記帳紀錄不一致，為避免刪錯帳已停止。請人工檢查。";
   }
 
+  if (expectedMode === "test-id") {
+    const descIndex = headerIndex(headers, ["用途說明"]);
+    if (descIndex < 0 || !String(row[descIndex] || "").includes("中間列測試B")) {
+      return "❌ 測試帳用途不符，未執行刪除。";
+    }
+  }
+
   // 一個 batchUpdate 同時刪除月份列、標記日誌刪除、調整後續列號。
   // 記帳ID不變；列號僅作定位，不能當作中央同步主鍵。
   const requests = [{ deleteDimension: {
@@ -1365,7 +1413,7 @@ async function confirmDeleteLast(sheetId, userId) {
     }
   }
   await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody: { requests } });
-  return `✅ 已永久刪除本人記帳\n\n${formatDeletionEntry(entry)}\n\n月份分頁已移除該列，系統日誌保留刪除狀態供日後中央同步。`;
+  return `✅ ${expectedMode === "test-id" ? "TESTING指定ID測試刪除完成" : "已永久刪除本人記帳"}\n\n${formatDeletionEntry(entry)}\n\n月份分頁已移除該列，系統日誌保留刪除狀態供日後中央同步。`;
 }
 
 async function recentTenText(sheetId) {
@@ -1496,6 +1544,14 @@ async function handleTextMessage(event) {
   await ensureBaseStructure(targetSheetId);
 
   const userId = event.source?.userId || "";
+  if (text.startsWith("測試刪除 ")) {
+    if (!canTestDeleteById(userId)) return "❌ 無權限使用測試刪除。";
+    return await requestTestDeleteById(targetSheetId, userId, text.slice("測試刪除 ".length).trim());
+  }
+  if (text === "確認測試刪除") {
+    if (!canTestDeleteById(userId)) return "❌ 無權限使用測試刪除。";
+    return await confirmDeleteLast(targetSheetId, userId, "test-id");
+  }
   if (text === "刪除上一筆") return await requestDeleteLast(targetSheetId, userId);
   if (text === "確認刪除") return await confirmDeleteLast(targetSheetId, userId);
   if (text === "取消") {

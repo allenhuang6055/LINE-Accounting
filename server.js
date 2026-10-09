@@ -1228,11 +1228,14 @@ function helpText() {
     "2026/9",
     "",
     "最近10筆",
-    "刪除上一筆（限本人新記帳，確認後永久刪除）",
+    "刪除上一筆（限本人新記帳）",
+    "刪除第2筆（須先查最近10筆，5分鐘內有效）",
+    "刪除 TX-完整記帳ID（限本人）",
+    "確認刪除 / 取消",
     "",
     "【查自己的 LINE ID】",
     "我的ID",
-  ].join("\\n");
+  ].join("\n");
 }
 
 
@@ -1278,13 +1281,18 @@ async function readAccountingLog(sheetId) {
 // 刪除確認狀態存在記憶體中，服務重新部署後需重新下指令。
 const pendingDeletions = new Map();
 const DELETE_CONFIRM_MS = 5 * 60 * 1000;
-// 僅 TESTING 服務可啟用；必須同時設定環境旗標與指定管理員 LINE ID。
-const ADMIN_TEST_DELETE_ENABLED = process.env.ENABLE_TEST_ID_DELETE === "true" && process.env.APP_ENV === "TESTING";
-const ADMIN_TEST_DELETE_USER_ID = process.env.TEST_ADMIN_LINE_USER_ID || "";
-function canTestDeleteById(userId) {
-  return ADMIN_TEST_DELETE_ENABLED && !!ADMIN_TEST_DELETE_USER_ID && userId === ADMIN_TEST_DELETE_USER_ID;
-}
+// 最近10筆編號快照：編號只在本人最近一次查詢後5分鐘有效。
+const recentSnapshots = new Map();
+const RECENT_SNAPSHOT_MS = 5 * 60 * 1000;
+const TX_ID_PATTERN = /^TX-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// V2 TESTING 保護：拒絕連到未明確指定的測試帳本。
+function assertTestingSheet(sheetId) {
+  if (process.env.APP_ENV !== "TESTING" || !process.env.TEST_ALLOWED_SHEET_ID ||
+      sheetId !== process.env.TEST_ALLOWED_SHEET_ID) {
+    throw new Error("V2 TESTING 安全檢查失敗：APP_ENV 或 TEST_ALLOWED_SHEET_ID 不符");
+  }
+}
 
 async function lastOwnEntry(sheetId, userId) {
   if (!userId) return null;
@@ -1308,56 +1316,47 @@ async function requestDeleteLast(sheetId, userId) {
   return `⚠️ 即將永久刪除你最後寫入的記帳\n\n${formatDeletionEntry(entry)}\n\n請於5分鐘內輸入「確認刪除」，或輸入「取消」。\n此操作會真正移除月份分頁中的整列。`;
 }
 
-async function requestTestDeleteById(sheetId, userId, id) {
-  if (!canTestDeleteById(userId)) return "❌ 無權限使用測試刪除。";
-  if (!/^TX-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
-    return "❌ 記帳ID格式不正確。";
-  }
+async function requestSelectedDelete(sheetId, userId, id) {
+  if (!userId || !TX_ID_PATTERN.test(id)) return "❌ 記帳ID格式不正確。";
   const entries = await readAccountingLog(sheetId);
-  const entry = entries.find(e => e.id === id && e.status !== "已刪除" && e.row >= 2 && /^\d{6}月$/.test(e.month));
-  if (!entry) return "❌ 找不到這筆有效記帳，未執行刪除。";
-  // 測試指令不得刪除無 LINE ID 的舊帳或非管理員本人所建的帳。
-  if (entry.userId !== userId) return "❌ 安全限制：只能指定刪除管理員本人新增的測試帳。";
-  // 強制指定測試金額及用途，避免誤刪正式帳目。
-  if (entry.amount !== 22 || entry.farm !== "草湖場") return "❌ 安全限制：只允許草湖場22元測試帳。";
-  const sheets = await getSheets();
-  const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: sheetId, range: `'${entry.month}'!A${entry.row}:O${entry.row}`,
-    valueRenderOption: "FORMATTED_VALUE"
+  const entry = entries.find(e => e.id.toLowerCase() === id.toLowerCase() &&
+    e.userId === userId && e.status !== "已刪除" &&
+    /^\d{6}月$/.test(e.month) && e.row >= 2);
+  if (!entry) return "❌ 找不到本人可刪除的有效記帳；舊資料或其他人的帳不能刪除。";
+  pendingDeletions.set(`${sheetId}:${userId}`, {
+    id: entry.id, mode: "selected", expiresAt: Date.now() + DELETE_CONFIRM_MS
   });
-  const head = await sheets.spreadsheets.values.get({
-    spreadsheetId: sheetId, range: `'${entry.month}'!A1:O1`, valueRenderOption: "FORMATTED_VALUE"
-  });
-  const row = result.data.values?.[0] || [];
-  const headers = head.data.values?.[0] || [];
-  const purposeIndex = headerIndex(headers, ["用途說明"]);
-  if (purposeIndex < 0 || !String(row[purposeIndex] || "").includes("中間列測試B")) {
-    return "❌ 安全限制：月份資料不是『中間列測試B』，未執行刪除。";
+  return `⚠️ 即將永久刪除指定記帳\n\n${formatDeletionEntry(entry)}\n\n請於5分鐘內輸入「確認刪除」，或輸入「取消」。\n此操作會真正移除月份分頁中的整列。`;
+}
+
+async function requestDeleteByNumber(sheetId, userId, number) {
+  const snapshot = recentSnapshots.get(`${sheetId}:${userId}`);
+  if (!snapshot || Date.now() > snapshot.expiresAt) {
+    return "⚠️ 查詢清單已過期，請先輸入「最近10筆」再指定刪除。";
   }
-  pendingDeletions.set(`${sheetId}:${userId}`, { id, mode: "test-id", expiresAt: Date.now() + DELETE_CONFIRM_MS });
-  return `🧪 TESTING 中間列刪除測試（僅管理員本人測試帳）\n\n${formatDeletionEntry(entry)}\n\n5分鐘內輸入「確認測試刪除」，或輸入「取消」。\n此操作會永久移除月份分頁中的整列。`;
+  const id = snapshot.ids[number - 1];
+  if (!id) return "❌ 這個編號沒有可刪除的本人記帳（舊帳或其他人記帳不可刪）。";
+  return requestSelectedDelete(sheetId, userId, id);
 }
 
 function sheetCell(value) {
   return { userEnteredValue: typeof value === "number" ? { numberValue: value } : { stringValue: String(value) } };
 }
 
-async function confirmDeleteLast(sheetId, userId, expectedMode = "own-last") {
+async function confirmDeleteLast(sheetId, userId) {
   const key = `${sheetId}:${userId}`;
   const pending = pendingDeletions.get(key);
   pendingDeletions.delete(key); // 一次性確認，避免重送
-  if (!pending || pending.mode !== expectedMode || Date.now() > pending.expiresAt) return "⚠️ 沒有相符的待確認刪除，或已超過5分鐘。請重新下指令。";
+  if (!pending || !["own-last", "selected"].includes(pending.mode) || Date.now() > pending.expiresAt) return "⚠️ 沒有相符的待確認刪除，或已超過5分鐘。請重新下指令。";
 
   const sheets = await getSheets();
   const entries = await readAccountingLog(sheetId);
   const entry = entries.find(e => e.id === pending.id && e.userId === userId && e.status !== "已刪除");
   if (!entry) return "❌ 找不到本人待刪除的有效記帳，已取消。";
-  if (expectedMode === "own-last") {
+  if (pending.mode === "own-last") {
     const newest = await lastOwnEntry(sheetId, userId);
     if (!newest || newest.id !== entry.id) return "⚠️ 期間又有新記帳，請重新輸入「刪除上一筆」。";
-  } else if (expectedMode === "test-id") {
-    if (!canTestDeleteById(userId) || entry.amount !== 22 || entry.farm !== "草湖場") return "❌ 測試刪除權限或資料不符。";
-  } else return "❌ 不支援的刪除模式。";
+  }
 
   const meta = await sheets.spreadsheets.get({
     spreadsheetId: sheetId, fields: "sheets.properties(sheetId,title)"
@@ -1384,13 +1383,6 @@ async function confirmDeleteLast(sheetId, userId, expectedMode = "own-last") {
     return "❌ 月份分頁資料與記帳紀錄不一致，為避免刪錯帳已停止。請人工檢查。";
   }
 
-  if (expectedMode === "test-id") {
-    const descIndex = headerIndex(headers, ["用途說明"]);
-    if (descIndex < 0 || !String(row[descIndex] || "").includes("中間列測試B")) {
-      return "❌ 測試帳用途不符，未執行刪除。";
-    }
-  }
-
   // 一個 batchUpdate 同時刪除月份列、標記日誌刪除、調整後續列號。
   // 記帳ID不變；列號僅作定位，不能當作中央同步主鍵。
   const requests = [{ deleteDimension: {
@@ -1413,10 +1405,10 @@ async function confirmDeleteLast(sheetId, userId, expectedMode = "own-last") {
     }
   }
   await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody: { requests } });
-  return `✅ ${expectedMode === "test-id" ? "TESTING指定ID測試刪除完成" : "已永久刪除本人記帳"}\n\n${formatDeletionEntry(entry)}\n\n月份分頁已移除該列，系統日誌保留刪除狀態供日後中央同步。`;
+  return `✅ 已永久刪除本人記帳\n\n${formatDeletionEntry(entry)}\n\n月份分頁已移除該列，系統日誌保留刪除狀態供日後中央同步。`;
 }
 
-async function recentTenText(sheetId) {
+async function recentTenText(sheetId, userId) {
   const sheets = await getSheets();
   const meta = await sheets.spreadsheets.get({
     spreadsheetId: sheetId,
@@ -1435,6 +1427,7 @@ async function recentTenText(sheetId) {
     logRows = (logResult.data.values || []).map(r => ({
       timestamp: String(r[0] || ""), month: String(r[1] || ""),
       row: Number(r[2]), status: String(r[10] || "有效"),
+      id: String(r[8] || ""), userId: String(r[9] || ""),
     })).filter(r => /^\d{6}月$/.test(r.month) && r.row >= 2 && !Number.isNaN(Date.parse(r.timestamp)) && r.status !== "已刪除");
   }
 
@@ -1475,7 +1468,7 @@ async function recentTenText(sheetId) {
     const row = (await monthRows(log.month)).find(r => r.row === log.row);
     if (!row) continue;
     used.add(key);
-    recent.push({ ...row, approximate: false });
+    recent.push({ ...row, approximate: false, id: log.id, ownerId: log.userId });
   }
 
   // 補齊沒有排序紀錄的舊資料。不能宣稱這些舊資料有精確寫入先後。
@@ -1487,13 +1480,20 @@ async function recentTenText(sheetId) {
         const key = `${month}:${row.row}`;
         if (used.has(key)) continue;
         used.add(key);
-        recent.push({ ...row, approximate: true });
+        recent.push({ ...row, approximate: true, id: "", ownerId: "" });
       }
       if (recent.length >= 10) break;
     }
   }
 
-  if (!recent.length) return "📒 最近10筆記帳\n\n目前沒有記帳資料。";
+  if (!recent.length) {
+    recentSnapshots.delete(`${sheetId}:${userId}`);
+    return "📒 最近10筆記帳\n\n目前沒有記帳資料。";
+  }
+  recentSnapshots.set(`${sheetId}:${userId}`, {
+    ids: recent.map(r => r.ownerId === userId && TX_ID_PATTERN.test(r.id) ? r.id : null),
+    expiresAt: Date.now() + RECENT_SNAPSHOT_MS
+  });
   const lines = ["📒 最近10筆記帳（同帳本所有人）", ""];
   for (let i = 0; i < recent.length; i++) {
     const r = recent[i];
@@ -1502,8 +1502,13 @@ async function recentTenText(sheetId) {
     const date = r.date.replace(/^\d{4}[\/-]/, "");
     lines.push(`${i + 1}. ${date} ${r.farm}｜${r.txType || "支出"}｜${r.item}｜${formatted}元${r.approximate ? " ※" : ""}`);
     lines.push(`   填表人：${r.recorder || "未填"}`);
+    if (r.ownerId === userId && TX_ID_PATTERN.test(r.id)) {
+      lines.push(`   可刪除：刪除第${i + 1}筆`);
+      lines.push(`   記帳ID：${r.id}`);
+    }
   }
   lines.push("", `共顯示 ${recent.length} 筆`);
+  lines.push("指定編號須在查詢後5分鐘內使用；只能刪除本人有記帳ID的紀錄。");
   if (recent.some(r => r.approximate)) {
     lines.push("※ 舊資料沒有寫入時間，只能按月份及列順序推估；補登可能不是實際先後。 ");
   }
@@ -1540,19 +1545,16 @@ async function handleTextMessage(event) {
   }
 
   const targetSheetId = userSheet.sheetId;
+  assertTestingSheet(targetSheetId);
 
   await ensureBaseStructure(targetSheetId);
 
   const userId = event.source?.userId || "";
-  if (text.startsWith("測試刪除 ")) {
-    if (!canTestDeleteById(userId)) return "❌ 無權限使用測試刪除。";
-    return await requestTestDeleteById(targetSheetId, userId, text.slice("測試刪除 ".length).trim());
-  }
-  if (text === "確認測試刪除") {
-    if (!canTestDeleteById(userId)) return "❌ 無權限使用測試刪除。";
-    return await confirmDeleteLast(targetSheetId, userId, "test-id");
-  }
   if (text === "刪除上一筆") return await requestDeleteLast(targetSheetId, userId);
+  const numberDelete = text.match(/^刪除第\s*(\d{1,2})\s*筆$/);
+  if (numberDelete) return await requestDeleteByNumber(targetSheetId, userId, Number(numberDelete[1]));
+  const idDelete = text.match(/^刪除\s+(TX-[0-9a-f-]+)$/i);
+  if (idDelete) return await requestSelectedDelete(targetSheetId, userId, idDelete[1]);
   if (text === "確認刪除") return await confirmDeleteLast(targetSheetId, userId);
   if (text === "取消") {
     pendingDeletions.delete(`${targetSheetId}:${userId}`);
@@ -1560,7 +1562,7 @@ async function handleTextMessage(event) {
   }
 
   if (text === "最近10筆") {
-    return await recentTenText(targetSheetId);
+    return await recentTenText(targetSheetId, userId);
   }
 
   const query = parseQuery(text);

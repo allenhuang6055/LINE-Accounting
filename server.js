@@ -16,32 +16,11 @@ const client = new line.messagingApi.MessagingApiClient({
 });
 
 const DEFAULT_SHEET_ID = process.env.GOOGLE_SHEET_ID;
-// 測試版專用使用者主檔；正式版 MASTER_SHEET_ID 一律禁止。
-const MASTER_SHEET_ID = process.env.TEST_USER_MASTER_SHEET_ID || "";
-const TEST_ALLOWED_SHEET_ID = process.env.TEST_ALLOWED_SHEET_ID || "";
+const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
 const ACCOUNT_MASTER_SHEET_ID = process.env.ACCOUNT_MASTER_SHEET_ID;
-// 測試版強制隔離：啟動時必須明確啟用，且不得使用正式多人主檔。
-if (process.env.TEST_MODE !== "1" || process.env.MASTER_SHEET_ID || process.env.CENTRAL_SHEET_ID) {
-  throw new Error("測試版安全鎖：需 TEST_MODE=1，不得設定正式 MASTER_SHEET_ID 或 CENTRAL_SHEET_ID");
-}
-if (Boolean(MASTER_SHEET_ID) !== Boolean(TEST_ALLOWED_SHEET_ID)) {
-  throw new Error("多人測試安全鎖：TEST_USER_MASTER_SHEET_ID 與 TEST_ALLOWED_SHEET_ID 必須同時設定");
-}
-if (MASTER_SHEET_ID && (
-  MASTER_SHEET_ID === TEST_ALLOWED_SHEET_ID ||
-  MASTER_SHEET_ID === DEFAULT_SHEET_ID ||
-  TEST_ALLOWED_SHEET_ID === DEFAULT_SHEET_ID ||
-  MASTER_SHEET_ID === process.env.TEST_CENTRAL_SHEET_ID ||
-  TEST_ALLOWED_SHEET_ID === process.env.TEST_CENTRAL_SHEET_ID
-)) {
-  throw new Error("多人測試安全鎖：測試主檔、測試帳本、原測試帳本、中央表不可互相混用");
-}
-if (!DEFAULT_SHEET_ID) throw new Error("測試版缺少 GOOGLE_SHEET_ID");
 
 // ===== 場別 =====
 const FARM_ALIASES = {
-  "測試": "測試場",
-  "測試場": "測試場",
   "東平": "東平場",
   "東平場": "東平場",
   "草湖": "草湖場",
@@ -484,11 +463,6 @@ async function resolveUserSheet(event) {
     };
   }
 
-  // 測試版只能寫入事先指定的埤北場測試帳本，禁止其他主檔列指向正式帳本。
-  if (sheetId !== TEST_ALLOWED_SHEET_ID) {
-    return { error: "❌ 安全鎖：這位使用者的帳本不是核准的測試帳本，已停止操作。" };
-  }
-
   return {
     sheetId,
     name,
@@ -649,7 +623,19 @@ async function migrateMonthSheetColumns(sheetId, monthSheet) {
 }
 
 async function ensureMonthSheet(sheetId, monthSheet) {
-  await migrateMonthSheetColumns(sheetId, monthSheet);
+  // 先確認分頁是否存在，避免對不存在的月份讀取 A1:O 而發生 400。
+  // 已存在的月份完全不更動欄位或歷史資料。
+  const sheets = await getSheets();
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: sheetId,
+    fields: "sheets.properties.title",
+  });
+  const exists = (meta.data.sheets || []).some(
+    s => s.properties.title === monthSheet
+  );
+  if (exists) return;
+
+  // 只在缺少月份時建立新分頁及原程式的欄位標題。
   await ensureSheet(sheetId, monthSheet, [
     "場別",
     "收支類型",
@@ -786,7 +772,7 @@ async function parseExpenseCommand(text) {
   };
 }
 
-async function writeExpense(sheetId, monthSheet, expense, dateText, userName, receiptMarker = "") {
+async function writeExpense(sheetId, monthSheet, expense, dateText, userName) {
   const sheets = await getSheets();
 
   const appendResult = await sheets.spreadsheets.values.append({
@@ -808,7 +794,7 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName, re
         expense.qty,
         expense.unitPrice,
         expense.txType === "收入" ? -Math.abs(expense.amount) : Math.abs(expense.amount),
-        receiptMarker,
+        "",
         expense.advanceTarget || "",
         userName || "",
       ]],
@@ -1212,12 +1198,6 @@ function helpText() {
     "9/28 草湖 支出 500 電風扇 / 三豐",
     "2026/9/28 仁愛 收入 5000 雞蛋銷售 / 客戶",
     "",
-    "【跨場代付測試】",
-    "草湖幫埤北付5000飼料",
-    "埤北還草湖3000",
-    "查代付",
-    "同步中央測試（只寫入中央主控表的測試分頁）",
-    "",
     "【查詢】",
     "今天",
     "本月",
@@ -1228,188 +1208,7 @@ function helpText() {
     "",
     "【查自己的 LINE ID】",
     "我的ID",
-  ].join("\n");
-}
-
-// ===== 中央主控表測試彙整：僅允許原中央主控表中的「測試_」分頁 =====
-// TEST_CENTRAL_SHEET_ID 必須是預先核准的中央表 ID；不得寫入正式分頁。
-const TEST_CENTRAL_SHEET_ID = process.env.TEST_CENTRAL_SHEET_ID || "";
-const PRODUCTION_CENTRAL_SHEET_ID = "1xy5sqJuR585wyE3Urq5VtSawa8_lY3FkykEitEVmx3c";
-const CENTRAL_TEST_HEADERS = {
-  "測試_全場收支彙整": ["交易編號","日期","帳務歸屬","付款場別","收支類型","付款來源","科目代號","科目分類","品項","用途說明","廠商名稱","數量","單價","金額","填表人","來源試算表ID"],
-  "測試_代付彙整": ["交易編號","日期","付款場別","帳務歸屬","科目分類","品項","代付金額","填表人","來源試算表ID"],
-  "測試_還款彙整": ["交易編號","日期","還款場別","收款場別","還款金額","付款來源","填表人","備註"]
-};
-
-function requireSafeCentralTarget(sourceId) {
-  if (TEST_CENTRAL_SHEET_ID !== PRODUCTION_CENTRAL_SHEET_ID || TEST_CENTRAL_SHEET_ID === sourceId)
-    throw new Error("安全鎖：TEST_CENTRAL_SHEET_ID 必須是指定中央主控表，且不可等於來源帳本");
-}
-
-async function buildCentralTestSnapshot(sourceId) {
-  const sheets = await getSheets();
-  const meta = await sheets.spreadsheets.get({spreadsheetId:sourceId,fields:"sheets.properties.title"});
-  const monthTabs = (meta.data.sheets || []).map(x=>x.properties.title)
-    .filter(x=>/^\d{6}月$/.test(x)).sort();
-  const incomeExpense = [];
-  for (const tab of monthTabs) {
-    const response = await sheets.spreadsheets.values.get({spreadsheetId:sourceId,range:`'${tab}'!A1:O`,valueRenderOption:"FORMATTED_VALUE"});
-    const values = response.data.values || [];
-    const headers = values[0] || [];
-    const idx = name => headers.indexOf(name);
-    const cell = (r,name) => {const i=idx(name);return i<0?"":(r[i]??"");};
-    values.slice(1).forEach((r,i)=>{
-      const kind=cell(r,"收支類型");
-      if (!(["支出","收入"].includes(kind))) return;
-      const raw=Number(String(cell(r,"金額")).replace(/,/g,""));
-      if (!Number.isFinite(raw) || !cell(r,"日期")) return;
-      const sourceMarker=cell(r,"發票或憑證");
-      const txId=sourceMarker.startsWith("TEST-TRANSFER:") ? sourceMarker : `${sourceId}:${tab}:${i+2}`;
-      const payment=String(cell(r,"付款來源"));
-      incomeExpense.push([txId,cell(r,"日期"),cell(r,"場別"),payment.startsWith("代付：")?payment.slice(3):cell(r,"場別"),kind,payment,cell(r,"科目代號"),cell(r,"科目分類"),cell(r,"品項"),cell(r,"用途說明"),cell(r,"廠商名稱"),cell(r,"數量"),cell(r,"單價"),kind==="收入"?-Math.abs(raw):Math.abs(raw),cell(r,"填表人"),sourceId]);
-    });
-  }
-  const transfers = (await transferRows(sourceId)).filter(r=>r.status==="完成");
-  const advances = transfers.filter(r=>r.type==="代付").map(r=>[r.id,r.date,r.payer,r.owner,"",r.description,Math.abs(r.amount),"",sourceId]);
-  const repayments = transfers.filter(r=>r.type==="還款").map(r=>[r.id,r.date,r.owner,r.payer,-Math.abs(r.amount),"","","還款（測試資料）"]);
-  return {"測試_全場收支彙整":incomeExpense,"測試_代付彙整":advances,"測試_還款彙整":repayments};
-}
-
-async function syncCentralTest(sourceId) {
-  requireSafeCentralTarget(sourceId);
-  const snapshot = await buildCentralTestSnapshot(sourceId);
-  const sheets = await getSheets();
-  // 先確認測試副本可存取，避免把不存在的 ID 當作成功。
-  await sheets.spreadsheets.get({spreadsheetId:TEST_CENTRAL_SHEET_ID,fields:"spreadsheetId"});
-  for (const [tab, rows] of Object.entries(snapshot)) {
-    // 白名單：僅允許程式內定義的三個測試分頁。
-    if (!Object.prototype.hasOwnProperty.call(CENTRAL_TEST_HEADERS, tab) || !tab.startsWith("測試_"))
-      throw new Error("拒絕寫入非測試分頁");
-    const expectedHeaders = CENTRAL_TEST_HEADERS[tab];
-    const current = await sheets.spreadsheets.values.get({
-      spreadsheetId: TEST_CENTRAL_SHEET_ID, range: `'${tab}'!A1:P`, valueRenderOption: "FORMATTED_VALUE"
-    });
-    const existing = current.data.values || [];
-    if (existing[0]?.some(x => String(x).trim()) && existing[0].join("|") !== expectedHeaders.join("|"))
-      throw new Error(`${tab} 的欄位與程式不同，已停止同步以免覆蓋資料`);
-    if (!existing[0]?.length) {
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: TEST_CENTRAL_SHEET_ID, range: `'${tab}'!A1`, valueInputOption: "RAW",
-        requestBody: {values: [expectedHeaders]}
-      });
-    }
-    // 僅新增未出現過的交易編號，不清除、不覆寫任何既有列。
-    const existingIds = new Set(existing.slice(1).map(r => String(r[0] || "")).filter(Boolean));
-    const missing = rows.filter(r => !existingIds.has(String(r[0])));
-    if (missing.length) {
-      await sheets.spreadsheets.values.append({
-        spreadsheetId: TEST_CENTRAL_SHEET_ID, range: `'${tab}'!A:P`,
-        valueInputOption: "RAW", insertDataOption: "INSERT_ROWS",
-        requestBody: {values: missing}
-      });
-    }
-  }
-  return `✅ 中央測試彙整完成\n全場收支：${snapshot["測試_全場收支彙整"].length} 筆\n代付：${snapshot["測試_代付彙整"].length} 筆\n還款：${snapshot["測試_還款彙整"].length} 筆\n只新增中央主控表「測試_」分頁中尚未同步的交易，不覆蓋原資料。`;
-}
-
-// 記帳已成功後才同步中央；同步失敗不得讓使用者誤以為記帳失敗而重送。
-async function autoSyncCentralAfterSaved(sourceId) {
-  try {
-    await syncCentralTest(sourceId);
-    return "📊 中央測試總表：已自動同步";
-  } catch (err) {
-    console.error("記帳成功，但中央自動同步失敗：", err);
-    return "⚠️ 帳本已記錄，但中央同步未完成。請勿重送記帳訊息；稍後傳「同步中央測試」補同步。";
-  }
-}
-
-// ===== 測試專用跨場往來 =====
-const TRANSFER_TAB = "跨場往來測試";
-const TRANSFER_HEADERS = ["訊息ID", "日期", "類型", "付款場別", "帳務歸屬", "金額", "用途", "狀態", "填表人"];
-function parseTransferCommand(body) {
-  const t = String(body || "").replace(/\s+/g, "").replace(/，/g, "");
-  let m = t.match(/^(.+?)幫(.+?)付([\d,]+(?:\.\d+)?)(.+)$/);
-  if (m) {
-    const payer = farmFromToken(m[1]), owner = farmFromToken(m[2]);
-    const amount = parseAmount(m[3]), description = m[4].trim();
-    if (!payer || !owner || payer === "全部" || owner === "全部" || payer === owner) return {error:"代付場別不正確，付款場與歸屬場必須不同。"};
-    if (!(amount > 0) || !description) return {error:"請填入有效金額及用途。"};
-    return {type:"代付",payer,owner,amount,description};
-  }
-  m = t.match(/^(.+?)還(.+?)([\d,]+(?:\.\d+)?)$/);
-  if (m) {
-    const owner = farmFromToken(m[1]), payer = farmFromToken(m[2]), amount = parseAmount(m[3]);
-    if (!payer || !owner || payer === "全部" || owner === "全部" || payer === owner || !(amount > 0)) return {error:"還款格式或金額不正確。"};
-    return {type:"還款",payer,owner,amount,description:"還款"};
-  }
-  return null;
-}
-async function transferRows(sheetId) {
-  const sheets = await getSheets();
-  await ensureSheet(sheetId, TRANSFER_TAB, TRANSFER_HEADERS);
-  const result = await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${TRANSFER_TAB}'!A2:I`,valueRenderOption:"FORMATTED_VALUE"});
-  return (result.data.values || []).map((r,i)=>({row:i+2,id:r[0]||"",date:r[1]||"",type:r[2]||"",payer:r[3]||"",owner:r[4]||"",amount:parseAmount(r[5])||0,description:r[6]||"",status:r[7]||""}));
-}
-// 相容舊資料：過去還款是正數，新版還款為負數；均以類型決定方向。
-function signedTransferAmount(row) {
-  if (row.type === "代付") return Math.abs(row.amount);
-  if (row.type === "還款") return -Math.abs(row.amount);
-  return 0;
-}
-function transferBalance(rows,payer,owner) {
-  return rows.filter(r=>r.status === "完成" && r.payer===payer && r.owner===owner)
-    .reduce((n,r)=>n+signedTransferAmount(r),0);
-}
-async function hasExpenseMarker(sheetId,monthSheet,marker) {
-  const sheets=await getSheets();
-  const result=await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${monthSheet}'!M2:M`,valueRenderOption:"FORMATTED_VALUE"});
-  return (result.data.values||[]).some(r=>r[0]===marker);
-}
-async function processTransfer(sheetId,event,dated,cmd,userName) {
-  const sheets=await getSheets();
-  const id=String(event.message?.id||"");
-  if (!id) return "❌ 無法取得訊息編號，為避免重複記帳，已取消操作。";
-  const rows=await transferRows(sheetId);
-  const previous=rows.find(r=>r.id===id);
-  if (previous?.status==="完成") return `✅ 這筆${cmd.type}已經記錄過，沒有重複寫入。`;
-  if (cmd.type==="還款" && !previous && cmd.amount>transferBalance(rows,cmd.payer,cmd.owner)) {
-    return `❌ 還款金額超過未結清代付：${transferBalance(rows,cmd.payer,cmd.owner).toLocaleString("zh-TW")} 元`;
-  }
-  let transferRow=previous?.row;
-  if (!previous) {
-    const added=await sheets.spreadsheets.values.append({spreadsheetId:sheetId,range:`'${TRANSFER_TAB}'!A:I`,valueInputOption:"USER_ENTERED",insertDataOption:"INSERT_ROWS",requestBody:{values:[[id,dated.dateInfo.dateText,cmd.type,cmd.payer,cmd.owner,cmd.type==="還款"?-Math.abs(cmd.amount):Math.abs(cmd.amount),cmd.description,"處理中",userName]]}});
-    const updated=added.data.updates?.updatedRange||"";
-    const match=updated.match(/![A-Z]+(\d+):/);
-    if (!match) throw new Error("跨場紀錄已新增但無法確認列號，請先檢查測試表，不要重送。");
-    transferRow=Number(match[1]);
-  }
-  if (cmd.type==="代付") {
-    const marker=`TEST-TRANSFER:${id}`;
-    await ensureMonthSheet(sheetId,dated.dateInfo.monthSheet);
-    if (!(await hasExpenseMarker(sheetId,dated.dateInfo.monthSheet,marker))) {
-      const selected=await autoChooseItem(cmd.description);
-      if (!selected) throw new Error("找不到對應科目");
-      await writeExpense(sheetId,dated.dateInfo.monthSheet,{
-        farm:cmd.owner,txType:"支出",paymentSource:"代付："+cmd.payer,
-        code:selected.code,className:selected.className,accountItem:selected.item,
-        description:cmd.description,vendor:"",qty:1,unitPrice:cmd.amount,amount:cmd.amount,
-        advanceTarget:cmd.payer
-      },dated.dateInfo.dateText,userName,marker);
-    }
-  }
-  await sheets.spreadsheets.values.update({spreadsheetId:sheetId,range:`'${TRANSFER_TAB}'!H${transferRow}`,valueInputOption:"RAW",requestBody:{values:[["完成"]]}});
-  const newRows=await transferRows(sheetId);
-  const balance=transferBalance(newRows,cmd.payer,cmd.owner);
-  return [`✅ ${cmd.type}測試記錄完成`,`付款場別：${cmd.payer}`,`帳務歸屬：${cmd.owner}`,`金額：${cmd.amount.toLocaleString("zh-TW")} 元`,cmd.type==="代付"?`用途：${cmd.description}`:null,`目前 ${cmd.owner} 欠 ${cmd.payer}：${balance.toLocaleString("zh-TW")} 元`,`紀錄：${TRANSFER_TAB}`].filter(Boolean).join("\n");
-}
-async function transferSummary(sheetId) {
-  const rows=(await transferRows(sheetId)).filter(r=>r.status==="完成");
-  const pairs=new Map();
-  for(const r of rows){const key=`${r.owner} → ${r.payer}`;const item=pairs.get(key)||{paid:0,repaid:0};if(r.type==="代付")item.paid+=Math.abs(r.amount);if(r.type==="還款")item.repaid+=Math.abs(r.amount);pairs.set(key,item);}
-  const lines=["📒 測試版跨場代付餘額"];
-  for(const [key,v] of pairs) {const n=v.paid-v.repaid;if(n!==0) lines.push(`${key}\n代付：${v.paid.toLocaleString("zh-TW")} 元\n還款：${v.repaid.toLocaleString("zh-TW")} 元\n尚欠：${n.toLocaleString("zh-TW")} 元`);}
-  if(lines.length===1) lines.push("目前沒有未結清代付款。");
-  return lines.join("\n");
+  ].join("\\n");
 }
 
 async function handleTextMessage(event) {
@@ -1443,14 +1242,7 @@ async function handleTextMessage(event) {
 
   const targetSheetId = userSheet.sheetId;
 
-  // 唯讀核對指令，不新增、不修改任何帳本資料。
-  if (text === "測試帳本") {
-    return `🔎 測試分流檢查\n使用者：${userSheet.name}\n來源：${userSheet.source}\n帳本 ID：${targetSheetId}\n尚未寫入任何資料。`;
-  }
-
   await ensureBaseStructure(targetSheetId);
-  if (text === "查代付") return await transferSummary(targetSheetId);
-  if (text === "同步中央測試") return await syncCentralTest(targetSheetId);
 
   const query = parseQuery(text);
   if (query) {
@@ -1460,15 +1252,6 @@ async function handleTextMessage(event) {
   const dated = parseOptionalDatePrefix(text);
   if (dated.error) {
     return `❌ ${dated.error}`;
-  }
-
-  const transfer = parseTransferCommand(dated.body);
-  if (transfer?.error) return `❌ ${transfer.error}`;
-  if (transfer) {
-    const result = await processTransfer(targetSheetId,event,dated,transfer,await getProfileName(event));
-    // 拒絕/重複的指令不觸發同步；完成記帳後才同步。
-    if (!result.startsWith("✅") || result.includes("已經記錄過")) return result;
-    return result + "\n\n" + await autoSyncCentralAfterSaved(targetSheetId);
   }
 
   const expense = await parseExpenseCommand(dated.body);
@@ -1489,8 +1272,6 @@ async function handleTextMessage(event) {
       userName
     );
 
-    const centralSyncStatus = await autoSyncCentralAfterSaved(targetSheetId);
-
     return [
       `✅ ${expense.txType}記錄完成`,
       "",
@@ -1510,8 +1291,6 @@ async function handleTextMessage(event) {
       `填表人：${userName}`,
       `帳本：${userSheet.name}`,
       `寫入：${dated.dateInfo.monthSheet}`,
-      "",
-      centralSyncStatus,
     ].filter(Boolean).join("\n");
   }
 

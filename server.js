@@ -16,9 +16,32 @@ const client = new line.messagingApi.MessagingApiClient({
   channelAccessToken: config.channelAccessToken,
 });
 
-const DEFAULT_SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
-const ACCOUNT_MASTER_SHEET_ID = process.env.ACCOUNT_MASTER_SHEET_ID;
+// TESTING candidate based on MAIN V2. Never deploy this file to MAIN.
+// Fail closed: require an explicit test environment and test-only spreadsheet IDs.
+if (process.env.APP_ENV !== "TESTING") {
+  throw new Error("TESTING 安全檢查：APP_ENV 必須是 TESTING");
+}
+const DEFAULT_SHEET_ID = (process.env.GOOGLE_SHEET_ID || "").trim();
+const MASTER_SHEET_ID = (process.env.TEST_USER_MASTER_SHEET_ID || "").trim();
+const ACCOUNT_MASTER_SHEET_ID = (process.env.TEST_CENTRAL_SHEET_ID || "").trim();
+const TEST_ALLOWED_SHEET_IDS = new Set(
+  [process.env.TEST_ALLOWED_SHEET_ID || "", ...(process.env.TEST_ALLOWED_SHEET_IDS || "").split(",")]
+    .map(s => s.trim()).filter(Boolean)
+);
+if (!DEFAULT_SHEET_ID || !MASTER_SHEET_ID || !ACCOUNT_MASTER_SHEET_ID || !TEST_ALLOWED_SHEET_IDS.size) {
+  throw new Error("TESTING 安全檢查：缺少測試帳本、使用者主檔、中央科目主檔或帳本白名單設定");
+}
+if (!TEST_ALLOWED_SHEET_IDS.has(DEFAULT_SHEET_ID)) {
+  throw new Error("TESTING 安全檢查：GOOGLE_SHEET_ID 不在測試帳本白名單");
+}
+if (TEST_ALLOWED_SHEET_IDS.has(MASTER_SHEET_ID) || TEST_ALLOWED_SHEET_IDS.has(ACCOUNT_MASTER_SHEET_ID)) {
+  throw new Error("TESTING 安全檢查：主檔不得同時列為記帳帳本");
+}
+function assertTestingSheet(sheetId) {
+  if (!sheetId || !TEST_ALLOWED_SHEET_IDS.has(String(sheetId).trim())) {
+    throw new Error("TESTING 安全檢查：使用者主檔指向非白名單帳本，已拒絕存取");
+  }
+}
 
 // ===== 場別 =====
 const FARM_ALIASES = {
@@ -464,6 +487,8 @@ async function resolveUserSheet(event) {
     };
   }
 
+  // Reject any unapproved destination BEFORE a read, write, query, or deletion.
+  assertTestingSheet(sheetId);
   return {
     sheetId,
     name,
@@ -1286,14 +1311,6 @@ const recentSnapshots = new Map();
 const RECENT_SNAPSHOT_MS = 5 * 60 * 1000;
 const TX_ID_PATTERN = /^TX-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// V2 TESTING 保護：拒絕連到未明確指定的測試帳本。
-function assertTestingSheet(sheetId) {
-  if (process.env.APP_ENV !== "TESTING" || !process.env.TEST_ALLOWED_SHEET_ID ||
-      sheetId !== process.env.TEST_ALLOWED_SHEET_ID) {
-    throw new Error("V2 TESTING 安全檢查失敗：APP_ENV 或 TEST_ALLOWED_SHEET_ID 不符");
-  }
-}
-
 async function lastOwnEntry(sheetId, userId) {
   if (!userId) return null;
   const entries = await readAccountingLog(sheetId);
@@ -1545,7 +1562,6 @@ async function handleTextMessage(event) {
   }
 
   const targetSheetId = userSheet.sheetId;
-  assertTestingSheet(targetSheetId);
 
   await ensureBaseStructure(targetSheetId);
 

@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const line = require("@line/bot-sdk");
 const { google } = require("googleapis");
+const { randomUUID } = require("node:crypto");
 
 const app = express();
 
@@ -772,7 +773,7 @@ async function parseExpenseCommand(text) {
   };
 }
 
-async function writeExpense(sheetId, monthSheet, expense, dateText, userName) {
+async function writeExpense(sheetId, monthSheet, expense, dateText, userName, userId) {
   const sheets = await getSheets();
 
   const appendResult = await sheets.spreadsheets.values.append({
@@ -810,6 +811,7 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName) {
     const rowNumber = rowMatch ? Number(rowMatch[1]) : null;
     if (!rowNumber) throw new Error("Google Sheets 未回傳寫入列號");
     await appendAccountingLog(sheetId, {
+      id: `TX-${randomUUID()}`, userId: userId || "",
       timestamp: new Date().toISOString(), monthSheet, rowNumber,
       farm: expense.farm, txType: expense.txType || "支出",
       item: expense.accountItem, amount: expense.amount, recorder: userName || "",
@@ -1226,6 +1228,7 @@ function helpText() {
     "2026/9",
     "",
     "最近10筆",
+    "刪除上一筆（限本人新記帳，確認後永久刪除）",
     "",
     "【查自己的 LINE ID】",
     "我的ID",
@@ -1235,19 +1238,134 @@ function helpText() {
 
 // 最近10筆專用：獨立記錄分頁，不改動每月 A～O 15 欄。
 const RECENT_LOG_TAB = "系統記帳順序";
-const RECENT_LOG_HEADERS = ["寫入時間UTC", "月份分頁", "列號", "場別", "收支類型", "品項", "金額", "填表人"];
+const RECENT_LOG_HEADERS = ["寫入時間UTC", "月份分頁", "列號", "場別", "收支類型", "品項", "金額", "填表人", "記帳ID", "LINE User ID", "狀態", "刪除時間UTC"];
 
 async function appendAccountingLog(sheetId, record) {
   await ensureSheet(sheetId, RECENT_LOG_TAB, RECENT_LOG_HEADERS);
   const sheets = await getSheets();
   await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
-    range: `'${RECENT_LOG_TAB}'!A:H`,
+    range: `'${RECENT_LOG_TAB}'!A:L`,
     valueInputOption: "RAW",
     insertDataOption: "INSERT_ROWS",
     requestBody: { values: [[record.timestamp, record.monthSheet, record.rowNumber,
-      record.farm, record.txType, record.item, record.amount, record.recorder]] },
+      record.farm, record.txType, record.item, record.amount, record.recorder,
+      record.id, record.userId, "有效", ""]] },
   });
+}
+
+// 所有新資料均有永久記帳ID。舊日誌的 I、J 欄為空，不能用於本人刪除。
+async function readAccountingLog(sheetId) {
+  const sheets = await getSheets();
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: sheetId, fields: "sheets.properties(title)"
+  });
+  if (!(meta.data.sheets || []).some(s => s.properties.title === RECENT_LOG_TAB)) return [];
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId, range: `'${RECENT_LOG_TAB}'!A2:L`,
+    valueRenderOption: "FORMATTED_VALUE"
+  });
+  return (result.data.values || []).map((r, index) => ({
+    logRow: index + 2, timestamp: String(r[0] || ""), month: String(r[1] || ""),
+    row: Number(r[2]), farm: String(r[3] || ""), txType: String(r[4] || ""),
+    item: String(r[5] || ""), amount: Number(String(r[6] || "").replace(/,/g, "")),
+    recorder: String(r[7] || ""), id: String(r[8] || ""),
+    userId: String(r[9] || ""), status: String(r[10] || "有效"),
+    deletedAt: String(r[11] || "")
+  }));
+}
+
+// 刪除確認狀態存在記憶體中，服務重新部署後需重新下指令。
+const pendingDeletions = new Map();
+const DELETE_CONFIRM_MS = 5 * 60 * 1000;
+
+async function lastOwnEntry(sheetId, userId) {
+  if (!userId) return null;
+  const entries = await readAccountingLog(sheetId);
+  return entries.filter(e => e.id && e.userId === userId && e.status !== "已刪除" &&
+    /^\d{6}月$/.test(e.month) && e.row >= 2 && !Number.isNaN(Date.parse(e.timestamp)))
+    .sort((a, b) => b.timestamp.localeCompare(a.timestamp))[0] || null;
+}
+
+function formatDeletionEntry(e) {
+  return [`日期所在分頁：${e.month}`, `場別：${e.farm}`,
+    `品項：${e.item}`, `收支類型：${e.txType}`,
+    `金額：${Math.abs(e.amount).toLocaleString("zh-TW")} 元`,
+    `填表人：${e.recorder}`, `記帳ID：${e.id}`].join("\n");
+}
+
+async function requestDeleteLast(sheetId, userId) {
+  const entry = await lastOwnEntry(sheetId, userId);
+  if (!entry) return "目前沒有可刪除的本人記帳。舊資料沒有 LINE User ID，為安全起見不能透過此指令刪除。";
+  pendingDeletions.set(`${sheetId}:${userId}`, { id: entry.id, expiresAt: Date.now() + DELETE_CONFIRM_MS });
+  return `⚠️ 即將永久刪除你最後寫入的記帳\n\n${formatDeletionEntry(entry)}\n\n請於5分鐘內輸入「確認刪除」，或輸入「取消」。\n此操作會真正移除月份分頁中的整列。`;
+}
+
+function sheetCell(value) {
+  return { userEnteredValue: typeof value === "number" ? { numberValue: value } : { stringValue: String(value) } };
+}
+
+async function confirmDeleteLast(sheetId, userId) {
+  const key = `${sheetId}:${userId}`;
+  const pending = pendingDeletions.get(key);
+  pendingDeletions.delete(key); // 一次性確認，避免重送
+  if (!pending || Date.now() > pending.expiresAt) return "⚠️ 沒有待確認的刪除，或已超過5分鐘。請重新輸入「刪除上一筆」。";
+
+  const sheets = await getSheets();
+  const entries = await readAccountingLog(sheetId);
+  const entry = entries.find(e => e.id === pending.id && e.userId === userId && e.status !== "已刪除");
+  if (!entry) return "❌ 找不到本人待刪除的有效記帳，已取消。";
+  const newest = await lastOwnEntry(sheetId, userId);
+  if (!newest || newest.id !== entry.id) return "⚠️ 期間又有新記帳，請重新輸入「刪除上一筆」。";
+
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: sheetId, fields: "sheets.properties(sheetId,title)"
+  });
+  const tabs = (meta.data.sheets || []).map(s => s.properties);
+  const monthTab = tabs.find(t => t.title === entry.month);
+  const logTab = tabs.find(t => t.title === RECENT_LOG_TAB);
+  if (!monthTab || !logTab) return "❌ 分頁不存在，未執行刪除。";
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId, range: `'${entry.month}'!A${entry.row}:O${entry.row}`,
+    valueRenderOption: "FORMATTED_VALUE"
+  });
+  const row = result.data.values?.[0] || [];
+  const headResult = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId, range: `'${entry.month}'!A1:O1`,
+    valueRenderOption: "FORMATTED_VALUE"
+  });
+  const headers = headResult.data.values?.[0] || [];
+  const value = (name) => { const i = headerIndex(headers, [name]); return i >= 0 ? String(row[i] || "").trim() : ""; };
+  const rowAmount = Number(value("金額").replace(/,/g, ""));
+  if (!row.length || value("場別") !== entry.farm ||
+      (value("收支類型") || "支出") !== entry.txType || value("品項") !== entry.item ||
+      Math.abs(rowAmount) !== Math.abs(entry.amount) || value("填表人") !== entry.recorder) {
+    return "❌ 月份分頁資料與記帳紀錄不一致，為避免刪錯帳已停止。請人工檢查。";
+  }
+
+  // 一個 batchUpdate 同時刪除月份列、標記日誌刪除、調整後續列號。
+  // 記帳ID不變；列號僅作定位，不能當作中央同步主鍵。
+  const requests = [{ deleteDimension: {
+    range: { sheetId: monthTab.sheetId, dimension: "ROWS", startIndex: entry.row - 1, endIndex: entry.row }
+  }}];
+  for (const e of entries) {
+    if (e.id === entry.id) {
+      requests.push({ updateCells: {
+        range: { sheetId: logTab.sheetId, startRowIndex: e.logRow - 1,
+          endRowIndex: e.logRow, startColumnIndex: 10, endColumnIndex: 12 },
+        rows: [{ values: [sheetCell("已刪除"), sheetCell(new Date().toISOString())] }],
+        fields: "userEnteredValue"
+      }});
+    } else if (e.month === entry.month && e.row > entry.row && e.status !== "已刪除") {
+      requests.push({ updateCells: {
+        range: { sheetId: logTab.sheetId, startRowIndex: e.logRow - 1,
+          endRowIndex: e.logRow, startColumnIndex: 2, endColumnIndex: 3 },
+        rows: [{ values: [sheetCell(e.row - 1)] }], fields: "userEnteredValue"
+      }});
+    }
+  }
+  await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody: { requests } });
+  return `✅ 已永久刪除本人記帳\n\n${formatDeletionEntry(entry)}\n\n月份分頁已移除該列，系統日誌保留刪除狀態供日後中央同步。`;
 }
 
 async function recentTenText(sheetId) {
@@ -1263,13 +1381,13 @@ async function recentTenText(sheetId) {
   if (hasLog) {
     const logResult = await sheets.spreadsheets.values.get({
       spreadsheetId: sheetId,
-      range: `'${RECENT_LOG_TAB}'!A2:H`,
+      range: `'${RECENT_LOG_TAB}'!A2:L`,
       valueRenderOption: "FORMATTED_VALUE",
     });
     logRows = (logResult.data.values || []).map(r => ({
       timestamp: String(r[0] || ""), month: String(r[1] || ""),
-      row: Number(r[2]),
-    })).filter(r => /^\d{6}月$/.test(r.month) && r.row >= 2 && !Number.isNaN(Date.parse(r.timestamp)));
+      row: Number(r[2]), status: String(r[10] || "有效"),
+    })).filter(r => /^\d{6}月$/.test(r.month) && r.row >= 2 && !Number.isNaN(Date.parse(r.timestamp)) && r.status !== "已刪除");
   }
 
   // 先依實際寫入時間排序；舊資料沒有時間紀錄時只能用月份及列號近似。
@@ -1377,6 +1495,14 @@ async function handleTextMessage(event) {
 
   await ensureBaseStructure(targetSheetId);
 
+  const userId = event.source?.userId || "";
+  if (text === "刪除上一筆") return await requestDeleteLast(targetSheetId, userId);
+  if (text === "確認刪除") return await confirmDeleteLast(targetSheetId, userId);
+  if (text === "取消") {
+    pendingDeletions.delete(`${targetSheetId}:${userId}`);
+    return "已取消刪除。";
+  }
+
   if (text === "最近10筆") {
     return await recentTenText(targetSheetId);
   }
@@ -1406,7 +1532,8 @@ async function handleTextMessage(event) {
       dated.dateInfo.monthSheet,
       expense,
       dated.dateInfo.dateText,
-      userName
+      userName,
+      event.source?.userId || ""
     );
 
     return [

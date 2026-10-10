@@ -16,32 +16,9 @@ const client = new line.messagingApi.MessagingApiClient({
   channelAccessToken: config.channelAccessToken,
 });
 
-// TESTING candidate based on MAIN V2. Never deploy this file to MAIN.
-// Fail closed: require an explicit test environment and test-only spreadsheet IDs.
-if (process.env.APP_ENV !== "TESTING") {
-  throw new Error("TESTING 安全檢查：APP_ENV 必須是 TESTING");
-}
-const DEFAULT_SHEET_ID = (process.env.GOOGLE_SHEET_ID || "").trim();
-const MASTER_SHEET_ID = (process.env.TEST_USER_MASTER_SHEET_ID || "").trim();
-const ACCOUNT_MASTER_SHEET_ID = (process.env.TEST_ACCOUNT_MASTER_SHEET_ID || "").trim();
-const TEST_ALLOWED_SHEET_IDS = new Set(
-  [process.env.TEST_ALLOWED_SHEET_ID || "", ...(process.env.TEST_ALLOWED_SHEET_IDS || "").split(",")]
-    .map(s => s.trim()).filter(Boolean)
-);
-if (!DEFAULT_SHEET_ID || !MASTER_SHEET_ID || !ACCOUNT_MASTER_SHEET_ID || !TEST_ALLOWED_SHEET_IDS.size) {
-  throw new Error("TESTING 安全檢查：缺少測試帳本、使用者主檔、中央科目主檔或帳本白名單設定");
-}
-if (!TEST_ALLOWED_SHEET_IDS.has(DEFAULT_SHEET_ID)) {
-  throw new Error("TESTING 安全檢查：GOOGLE_SHEET_ID 不在測試帳本白名單");
-}
-if (TEST_ALLOWED_SHEET_IDS.has(MASTER_SHEET_ID) || TEST_ALLOWED_SHEET_IDS.has(ACCOUNT_MASTER_SHEET_ID)) {
-  throw new Error("TESTING 安全檢查：主檔不得同時列為記帳帳本");
-}
-function assertTestingSheet(sheetId) {
-  if (!sheetId || !TEST_ALLOWED_SHEET_IDS.has(String(sheetId).trim())) {
-    throw new Error("TESTING 安全檢查：使用者主檔指向非白名單帳本，已拒絕存取");
-  }
-}
+const DEFAULT_SHEET_ID = process.env.GOOGLE_SHEET_ID;
+const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
+const ACCOUNT_MASTER_SHEET_ID = process.env.ACCOUNT_MASTER_SHEET_ID;
 
 // ===== 場別 =====
 const FARM_ALIASES = {
@@ -411,53 +388,6 @@ async function autoChooseItem(description) {
   return rows.find(r => r.item === "雜項費用") || rows[0] || null;
 }
 
-
-// ===== TESTING 權限管理 V1：僅讀取測試使用者主檔的「權限設定」 =====
-// 注意：ADMIN 在 V1 可操作目前綁定的測試帳本內所有場別；跨帳本路由尚未實作。
-const PERMISSION_TAB = "權限設定";
-const VALID_FARMS = new Set(Object.values(FARM_ALIASES).filter(x => x !== "全部" && x !== "共用"));
-
-async function resolvePermission(userId) {
-  if (!userId) return { error: "❌ 無法辨識 LINE 使用者，拒絕操作。" };
-  const sheets = await getSheets();
-  const response = await sheets.spreadsheets.values.get({
-    spreadsheetId: MASTER_SHEET_ID,
-    range: `'${PERMISSION_TAB}'!A1:D`,
-    valueRenderOption: "FORMATTED_VALUE",
-  });
-  const values = response.data.values || [];
-  const expected = ["LINE User ID", "身分", "可管理場別", "是否啟用"];
-  if (expected.some((h, i) => String(values[0]?.[i] || "").trim() !== h)) {
-    return { error: "❌ TESTING 權限設定欄位不正確，已拒絕操作。" };
-  }
-  const matches = values.slice(1).filter(r => String(r[0] || "").trim() === userId);
-  if (matches.length !== 1) return { error: "❌ 未找到唯一且有效的權限設定，請聯絡管理者。" };
-  const row = matches[0];
-  const role = String(row[1] || "").trim().toUpperCase();
-  const enabled = String(row[3] || "").trim().toUpperCase();
-  if (enabled !== "Y" || !["ADMIN", "USER"].includes(role)) {
-    return { error: "❌ 你的帳號沒有啟用的記帳權限。" };
-  }
-  const rawScope = String(row[2] || "").trim();
-  if (role === "ADMIN") {
-    if (rawScope !== "ALL") return { error: "❌ ADMIN 權限設定必須是 ALL。" };
-    return { role, farms: null };
-  }
-  const tokens = rawScope.split(/[,，、;；]/).map(v => v.trim()).filter(Boolean);
-  const farms = tokens.map(farmFromToken);
-  if (!tokens.length || farms.some(f => !f || !VALID_FARMS.has(f)) || rawScope.toUpperCase() === "ALL") {
-    return { error: "❌ 可管理場別設定無效，已拒絕操作。" };
-  }
-  return { role, farms: new Set(farms) };
-}
-
-function canManageFarm(permission, farm) {
-  return permission.role === "ADMIN" || permission.farms.has(farm);
-}
-function filterPermittedRows(rows, permission) {
-  return permission.role === "ADMIN" ? rows : rows.filter(r => canManageFarm(permission, r.farm));
-}
-
 async function getMasterSheetTitle() {
   if (!MASTER_SHEET_ID) return null;
 
@@ -475,10 +405,11 @@ async function getMasterSheetTitle() {
 }
 
 async function resolveUserSheet(event) {
+  requireCentralTestConfig();
   const userId = event.source?.userId || "";
 
   // 如果尚未設定主檔，暫時沿用原本單人版 Sheet。
-  if (!MASTER_SHEET_ID) {
+  if (!TEST_MASTER_ID) {
     if (!DEFAULT_SHEET_ID) {
       throw new Error("缺少 MASTER_SHEET_ID 與 GOOGLE_SHEET_ID");
     }
@@ -494,14 +425,14 @@ async function resolveUserSheet(event) {
     throw new Error("無法取得 LINE User ID");
   }
 
-  const masterTitle = await getMasterSheetTitle();
+  const masterTitle = "使用者名單";
   if (!masterTitle) {
     throw new Error("使用者主檔沒有可讀取的分頁");
   }
 
   const sheets = await getSheets();
   const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: MASTER_SHEET_ID,
+    spreadsheetId: TEST_MASTER_ID,
     range: `'${masterTitle}'!A2:F`,
     valueRenderOption: "FORMATTED_VALUE",
   });
@@ -528,9 +459,12 @@ async function resolveUserSheet(event) {
     };
   }
 
-  // V2 不再使用「使用者名單」D 欄決定記帳目的地。
-  // 即使此欄未填或仍指向舊個人帳本，也一律由帳務主檔路由；
-  // 目的地會在 getTestingRouting() 統一檢查 TEST_ALLOWED_SHEET_IDS。
+  if (!sheetId) {
+    return {
+      error: `❌ ${name} 尚未設定 Google Sheet ID。`,
+    };
+  }
+
   return {
     sheetId,
     name,
@@ -1179,8 +1113,7 @@ function summaryText(rows, farm, title) {
   return lines.join("\n");
 }
 
-async function querySummary(sheetId, query, permission) {
-  if (query.farm !== "全部" && !canManageFarm(permission, query.farm)) return "❌ 你沒有這個場別的查詢權限。";
+async function querySummary(sheetId, query) {
   const now = taipeiNow();
 
   if (query.mode === "指定月份") {
@@ -1207,7 +1140,7 @@ async function querySummary(sheetId, query, permission) {
     await normalizeMonthAmountSigns(sheetId, monthSheet);
     const rows = await readMonthRows(sheetId, monthSheet);
     return summaryText(
-      filterPermittedRows(rows, permission),
+      rows,
       query.farm,
       `${query.year}年${query.month}月收支`
     );
@@ -1226,14 +1159,14 @@ async function querySummary(sheetId, query, permission) {
         d.day === Number(now.day);
     });
 
-    return summaryText(filterPermittedRows(todayRows, permission), query.farm, "今日收支");
+    return summaryText(todayRows, query.farm, "今日收支");
   }
 
   if (query.mode === "本月") {
     await ensureMonthSheet(sheetId, now.monthSheet);
     await normalizeMonthAmountSigns(sheetId, now.monthSheet);
     const rows = await readMonthRows(sheetId, now.monthSheet);
-    return summaryText(filterPermittedRows(rows, permission), query.farm, `${Number(now.month)}月收支`);
+    return summaryText(rows, query.farm, `${Number(now.month)}月收支`);
   }
 
   // 今年
@@ -1255,7 +1188,7 @@ async function querySummary(sheetId, query, permission) {
     rows = rows.concat(await readMonthRows(sheetId, monthSheet));
   }
 
-  return summaryText(filterPermittedRows(rows, permission), query.farm, `${now.year}年收支`);
+  return summaryText(rows, query.farm, `${now.year}年收支`);
 }
 
 async function getProfileName(event) {
@@ -1270,7 +1203,7 @@ async function getProfileName(event) {
 
 function helpText() {
   return [
-    "📒 雞場記帳 TESTING V2",
+    "📒 雞場記帳正式簡化版",
     "",
     "【支出】",
     "草湖 支出 500 電風扇 / 三豐",
@@ -1295,7 +1228,15 @@ function helpText() {
     "仁愛 9月",
     "2026/9",
     "",
-    "⚠️ 最近10筆與刪除：V2 暫停（跨帳本安全保護）",
+    "最近10筆",
+    "刪除上一筆（限本人新記帳）",
+    "刪除第2筆（須先查最近10筆，5分鐘內有效）",
+    "刪除 TX-完整記帳ID（限本人）",
+    "確認刪除 / 取消",
+    "",
+    "【中央查帳（僅測試管理員）】",
+    "中央 本月 / 中央 202609 / 中央 今日明細",
+    "中央 場別統計 / 中央 同步",
     "",
     "【查自己的 LINE ID】",
     "我的ID",
@@ -1365,43 +1306,41 @@ function formatDeletionEntry(e) {
     `填表人：${e.recorder}`, `記帳ID：${e.id}`].join("\n");
 }
 
-async function requestDeleteLast(sheetId, userId, permission) {
+async function requestDeleteLast(sheetId, userId) {
   const entry = await lastOwnEntry(sheetId, userId);
   if (!entry) return "目前沒有可刪除的本人記帳。舊資料沒有 LINE User ID，為安全起見不能透過此指令刪除。";
-  if (!canManageFarm(permission, entry.farm)) return "❌ 你沒有這個場別的刪除權限。";
   pendingDeletions.set(`${sheetId}:${userId}`, { id: entry.id, mode: "own-last", expiresAt: Date.now() + DELETE_CONFIRM_MS });
   return `⚠️ 即將永久刪除你最後寫入的記帳\n\n${formatDeletionEntry(entry)}\n\n請於5分鐘內輸入「確認刪除」，或輸入「取消」。\n此操作會真正移除月份分頁中的整列。`;
 }
 
-async function requestSelectedDelete(sheetId, userId, id, permission) {
+async function requestSelectedDelete(sheetId, userId, id) {
   if (!userId || !TX_ID_PATTERN.test(id)) return "❌ 記帳ID格式不正確。";
   const entries = await readAccountingLog(sheetId);
   const entry = entries.find(e => e.id.toLowerCase() === id.toLowerCase() &&
     e.userId === userId && e.status !== "已刪除" &&
     /^\d{6}月$/.test(e.month) && e.row >= 2);
   if (!entry) return "❌ 找不到本人可刪除的有效記帳；舊資料或其他人的帳不能刪除。";
-  if (!canManageFarm(permission, entry.farm)) return "❌ 你沒有這個場別的刪除權限。";
   pendingDeletions.set(`${sheetId}:${userId}`, {
     id: entry.id, mode: "selected", expiresAt: Date.now() + DELETE_CONFIRM_MS
   });
   return `⚠️ 即將永久刪除指定記帳\n\n${formatDeletionEntry(entry)}\n\n請於5分鐘內輸入「確認刪除」，或輸入「取消」。\n此操作會真正移除月份分頁中的整列。`;
 }
 
-async function requestDeleteByNumber(sheetId, userId, number, permission) {
+async function requestDeleteByNumber(sheetId, userId, number) {
   const snapshot = recentSnapshots.get(`${sheetId}:${userId}`);
   if (!snapshot || Date.now() > snapshot.expiresAt) {
     return "⚠️ 查詢清單已過期，請先輸入「最近10筆」再指定刪除。";
   }
   const id = snapshot.ids[number - 1];
   if (!id) return "❌ 這個編號沒有可刪除的本人記帳（舊帳或其他人記帳不可刪）。";
-  return requestSelectedDelete(sheetId, userId, id, permission);
+  return requestSelectedDelete(sheetId, userId, id);
 }
 
 function sheetCell(value) {
   return { userEnteredValue: typeof value === "number" ? { numberValue: value } : { stringValue: String(value) } };
 }
 
-async function confirmDeleteLast(sheetId, userId, permission) {
+async function confirmDeleteLast(sheetId, userId) {
   const key = `${sheetId}:${userId}`;
   const pending = pendingDeletions.get(key);
   pendingDeletions.delete(key); // 一次性確認，避免重送
@@ -1411,7 +1350,6 @@ async function confirmDeleteLast(sheetId, userId, permission) {
   const entries = await readAccountingLog(sheetId);
   const entry = entries.find(e => e.id === pending.id && e.userId === userId && e.status !== "已刪除");
   if (!entry) return "❌ 找不到本人待刪除的有效記帳，已取消。";
-  if (!canManageFarm(permission, entry.farm)) return "❌ 你沒有這個場別的刪除權限。";
   if (pending.mode === "own-last") {
     const newest = await lastOwnEntry(sheetId, userId);
     if (!newest || newest.id !== entry.id) return "⚠️ 期間又有新記帳，請重新輸入「刪除上一筆」。";
@@ -1467,7 +1405,7 @@ async function confirmDeleteLast(sheetId, userId, permission) {
   return `✅ 已永久刪除本人記帳\n\n${formatDeletionEntry(entry)}\n\n月份分頁已移除該列，系統日誌保留刪除狀態供日後中央同步。`;
 }
 
-async function recentTenText(sheetId, userId, permission) {
+async function recentTenText(sheetId, userId) {
   const sheets = await getSheets();
   const meta = await sheets.spreadsheets.get({
     spreadsheetId: sheetId,
@@ -1527,7 +1465,7 @@ async function recentTenText(sheetId, userId, permission) {
     const row = (await monthRows(log.month)).find(r => r.row === log.row);
     if (!row) continue;
     used.add(key);
-    if (canManageFarm(permission, row.farm)) recent.push({ ...row, approximate: false, id: log.id, ownerId: log.userId });
+    recent.push({ ...row, approximate: false, id: log.id, ownerId: log.userId });
   }
 
   // 補齊沒有排序紀錄的舊資料。不能宣稱這些舊資料有精確寫入先後。
@@ -1539,7 +1477,7 @@ async function recentTenText(sheetId, userId, permission) {
         const key = `${month}:${row.row}`;
         if (used.has(key)) continue;
         used.add(key);
-        if (canManageFarm(permission, row.farm)) recent.push({ ...row, approximate: true, id: "", ownerId: "" });
+        recent.push({ ...row, approximate: true, id: "", ownerId: "" });
       }
       if (recent.length >= 10) break;
     }
@@ -1575,205 +1513,175 @@ async function recentTenText(sheetId, userId, permission) {
 }
 
 
-// ===== TESTING V2：帳務主檔 F 欄場別 -> 共享帳本路由 =====
-// 安全規則：不接受重複場別、不接受非測試白名單帳本、不回退到使用者帳本。
-const ROUTING_TAB = "帳務主檔";
-const ROUTING_HEADERS = ["帳務名稱", "Google Sheet ID", "類型", "是否啟用", "備註", "管理場別"];
-const ROUTING_CACHE_MS = 30 * 1000;
-let routingCache = { loadedAt: 0, entries: null, byFarm: null };
+// ===== 中央查帳（候選版；僅供隔離 TESTING） =====
+// 所有跨帳本操作只讀來源帳本。只有明確下「中央 同步」且配置
+// TEST_CENTRAL_REPORT_SHEET_ID 才會寫入隔離的測試報表，不寫入正式中央主控表。
+const CENTRAL_TEST_MODE = process.env.APP_ENV === "TESTING";
+const TEST_ALLOWED_IDS = new Set(String(process.env.TEST_ALLOWED_SHEET_IDS || "")
+  .split(",").map(s => s.trim()).filter(Boolean));
+const TEST_MASTER_ID = process.env.TEST_USER_MASTER_SHEET_ID || "";
+const TEST_REPORT_ID = process.env.TEST_CENTRAL_REPORT_SHEET_ID || "";
 
-async function getTestingRouting() {
-  if (routingCache.entries && Date.now() - routingCache.loadedAt < ROUTING_CACHE_MS) return routingCache;
+function requireCentralTestConfig() {
+  if (!CENTRAL_TEST_MODE || !TEST_MASTER_ID || !TEST_ALLOWED_IDS.size) {
+    throw new Error("中央測試未隔離：需 APP_ENV=TESTING、TEST_USER_MASTER_SHEET_ID、TEST_ALLOWED_SHEET_IDS");
+  }
+  if (TEST_MASTER_ID === MASTER_SHEET_ID) {
+    throw new Error("測試使用者主檔不可與正式 MASTER_SHEET_ID 相同");
+  }
+}
+
+async function centralMasterRows() {
+  requireCentralTestConfig();
   const sheets = await getSheets();
-  const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: MASTER_SHEET_ID,
-    range: `'${ROUTING_TAB}'!A1:F`,
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: TEST_MASTER_ID,
+    range: "'使用者名單'!A2:F",
     valueRenderOption: "FORMATTED_VALUE",
   });
-  const values = result.data.values || [];
-  if (ROUTING_HEADERS.some((h, i) => String(values[0]?.[i] || "").trim() !== h)) {
-    throw new Error("TESTING V2：帳務主檔 A1:F1 標題不正確，已停止帳本操作");
-  }
-  const entries = [];
-  const byFarm = new Map();
-  for (const [i, row] of values.slice(1).entries()) {
-    if (String(row[3] || "").trim().toUpperCase() !== "Y") continue;
-    const name = String(row[0] || "").trim();
-    const sheetId = String(row[1] || "").trim();
-    const tokens = String(row[5] || "").split(/[,，、;；\n]/).map(x => x.trim()).filter(Boolean);
-    if (!name || !sheetId || !tokens.length) {
-      throw new Error(`TESTING V2：帳務主檔第 ${i + 2} 列缺少名稱、Sheet ID 或管理場別`);
-    }
-    assertTestingSheet(sheetId);
-    const farms = [];
-    for (const token of tokens) {
-      const farm = farmFromToken(token);
-      if (!farm || !VALID_FARMS.has(farm)) throw new Error(`TESTING V2：帳務主檔第 ${i + 2} 列有無效場別 ${token}`);
-      if (byFarm.has(farm)) throw new Error(`TESTING V2：${farm} 重複對應不同帳務設定，已停止操作`);
-      farms.push(farm);
-    }
-    const entry = { name, sheetId, farms };
-    entries.push(entry);
-    for (const farm of farms) byFarm.set(farm, entry);
-  }
-  if (!entries.length) throw new Error("TESTING V2：帳務主檔沒有啟用的場別帳本");
-  routingCache = { loadedAt: Date.now(), entries, byFarm };
-  return routingCache;
+  return (response.data.values || []).map(r => ({
+    name: String(r[0] || "").trim(),
+    userId: String(r[2] || "").trim(),
+    sheetId: String(r[3] || "").trim(),
+    enabled: ["Y", "YES", "TRUE", "1", "啟用"].includes(String(r[4] || "").trim().toUpperCase()),
+  }));
 }
 
-function getAllowedRoutingEntries(routing, permission, requestedFarm = "全部") {
-  if (requestedFarm !== "全部" && !canManageFarm(permission, requestedFarm)) return [];
-  return routing.entries.filter(entry => entry.farms.some(farm =>
-    (requestedFarm === "全部" || farm === requestedFarm) && canManageFarm(permission, farm)
-  ));
-}
-
-async function readExistingMonthRowsV2(sheetId, monthSheet) {
+async function assertCentralAdmin(userId) {
+  requireCentralTestConfig();
   const sheets = await getSheets();
-  const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: "sheets.properties.title" });
-  const exists = (meta.data.sheets || []).some(s => s.properties.title === monthSheet);
-  return exists ? readMonthRows(sheetId, monthSheet) : [];
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: TEST_MASTER_ID,
+    range: "'權限設定'!A2:D",
+    valueRenderOption: "FORMATTED_VALUE",
+  });
+  const matches = (result.data.values || []).filter(r => String(r[0] || "").trim() === userId);
+  if (matches.length !== 1) return false;
+  const r = matches[0];
+  return String(r[1] || "").trim().toUpperCase() === "ADMIN" &&
+    String(r[2] || "").trim().toUpperCase() === "ALL" &&
+    ["Y", "YES", "TRUE", "1", "啟用"].includes(String(r[3] || "").trim().toUpperCase());
 }
 
-async function querySummaryV2(routing, query, permission) {
-  if (query.farm !== "全部" && !canManageFarm(permission, query.farm)) return "❌ 你沒有這個場別的查詢權限。";
-  if (query.farm !== "全部" && !routing.byFarm.has(query.farm)) return "❌ 此場別尚未設定測試帳本。";
-  const entries = getAllowedRoutingEntries(routing, permission, query.farm);
-  if (!entries.length) return "📒 目前沒有可查詢的授權場別帳本。";
-  const now = taipeiNow();
-  let title;
-  let monthSheets;
-  if (query.mode === "今天" || query.mode === "本月") {
-    monthSheets = [now.monthSheet];
-    title = query.mode === "今天" ? "今日收支" : `${Number(now.month)}月收支`;
-  } else if (query.mode === "指定月份") {
-    monthSheets = [`${query.year}${pad2(query.month)}月`];
-    title = `${query.year}年${query.month}月收支`;
-  } else {
-    monthSheets = null;
-    title = `${now.year}年收支`;
+async function centralRead(months) {
+  const users = (await centralMasterRows()).filter(r => r.enabled && r.sheetId);
+  const unique = new Map();
+  for (const u of users) {
+    if (!TEST_ALLOWED_IDS.has(u.sheetId)) continue; // 禁止測試版讀取未核准帳本
+    if (!unique.has(u.sheetId)) unique.set(u.sheetId, u.name || "未命名帳本");
   }
-  const allRows = [];
-  for (const entry of entries) {
-    const sheets = await getSheets();
-    const meta = await sheets.spreadsheets.get({ spreadsheetId: entry.sheetId, fields: "sheets.properties.title" });
-    const existing = new Set((meta.data.sheets || []).map(s => s.properties.title));
-    const selected = monthSheets || [...existing].filter(t => new RegExp(`^${now.year}\\d{2}月$`).test(t)).sort();
-    for (const monthSheet of selected) {
-      if (!existing.has(monthSheet)) continue;
-      // 查詢一律唯讀，不執行舊版 normalizeMonthAmountSigns 自動改帳。
-      const rows = await readMonthRows(entry.sheetId, monthSheet);
-      for (const row of rows) {
-        // 雙重過濾：使用者授權 + 該帳本登記的場別；防止共用帳本越權洩漏。
-        if (!entry.farms.includes(row.farm) || !canManageFarm(permission, row.farm)) continue;
-        if (query.mode === "今天") {
-          const d = parseDateText(row.date);
-          if (!d || d.year !== Number(now.year) || d.month !== Number(now.month) || d.day !== Number(now.day)) continue;
-        }
-        if (query.farm !== "全部" && row.farm !== query.farm) continue;
-        allRows.push(row);
+  const sheets = await getSheets();
+  const all = [], failures = [];
+  for (const [sheetId, owner] of unique) {
+    try {
+      const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: "sheets.properties.title" });
+      const exists = new Set((meta.data.sheets || []).map(t => t.properties.title));
+      for (const month of months) {
+        if (!exists.has(month)) continue;
+        const rows = await readMonthRows(sheetId, month); // 純讀取，不呼叫 normalizeMonthAmountSigns
+        for (const r of rows) all.push({ ...r, owner, month });
       }
+    } catch (e) {
+      failures.push(`${owner}：讀取失敗（${e.code || "權限或網路問題"}）`);
     }
   }
-  return summaryText(allRows, query.farm, title);
+  return { all, failures, accounts: unique.size, registered: users.length };
 }
 
-
-// ===== V2 production-readiness candidate: cross-book recent/delete =====
-// This candidate remains TESTING-only. Never deploy it to MAIN.
-// Serialize webhook operations within one Node process. This is NOT a distributed lock.
-let accountingQueue = Promise.resolve();
-function serializeAccountingOperation(fn) {
-  const result = accountingQueue.then(fn);
-  accountingQueue = result.catch(() => {});
-  return result;
+function centralTotals(rows) {
+  const valid = rows.filter(r => ["收入", "支出"].includes(r.txType || "支出"));
+  const expense = valid.filter(r => (r.txType || "支出") === "支出")
+    .reduce((n, r) => n + Math.abs(r.amount), 0);
+  const income = valid.filter(r => r.txType === "收入")
+    .reduce((n, r) => n + Math.abs(r.amount), 0);
+  return { expense, income, net: expense - income, count: valid.length };
 }
-const crossBookSnapshots = new Map();
-const crossBookPending = new Map();
 
-async function collectAuthorizedLogEntries(routing, permission) {
-  const result = [];
-  const visited = new Set();
-  for (const entry of getAllowedRoutingEntries(routing, permission)) {
-    if (visited.has(entry.sheetId)) continue;
-    visited.add(entry.sheetId);
-    assertTestingSheet(entry.sheetId);
-    const logs = await readAccountingLog(entry.sheetId);
-    for (const log of logs) {
-      if (log.status === "已刪除" || !TX_ID_PATTERN.test(log.id) ||
-          !canManageFarm(permission, log.farm) ||
-          routing.byFarm.get(log.farm)?.sheetId !== entry.sheetId ||
-          !/^\d{6}月$/.test(log.month) || log.row < 2 ||
-          !Number.isFinite(Date.parse(log.timestamp))) continue;
-      result.push({ ...log, sheetId: entry.sheetId });
+function centralFmt(n) { return Number(n).toLocaleString("zh-TW"); }
+function centralMonthFromCommand(text) {
+  const now = taipeiNow();
+  if (text === "中央 本月" || text === "中央 場別統計" || text === "中央 同步") return `${now.year}${now.month}月`;
+  const m = text.match(/^中央\s+(\d{4})(\d{2})$/);
+  if (m && Number(m[2]) >= 1 && Number(m[2]) <= 12) return `${m[1]}${m[2]}月`;
+  return null;
+}
+
+async function centralQuery(text) {
+  const now = taipeiNow();
+  const month = centralMonthFromCommand(text) || now.monthSheet;
+  const { all, failures, accounts, registered } = await centralRead([month]);
+  let rows = all;
+  if (text === "中央 今日明細") {
+    rows = all.filter(r => r.date.replace(/-/g, "/") === now.dateText);
+  }
+  const totals = centralTotals(rows);
+  const lines = [
+    `📊 中央查帳｜${text === "中央 今日明細" ? now.dateText : month}`,
+    `帳本：${accounts} 份（啟用使用者 ${registered} 位，重複帳本僅計一次）`,
+    `支出：${centralFmt(totals.expense)} 元`,
+    `收入：${centralFmt(totals.income)} 元`,
+    `淨支出：${centralFmt(totals.net)} 元`,
+    `筆數：${totals.count}`,
+  ];
+  if (text === "中央 場別統計") {
+    const farms = new Map();
+    for (const r of rows) {
+      const k = r.farm || "未指定";
+      if (!farms.has(k)) farms.set(k, []);
+      farms.get(k).push(r);
+    }
+    lines.push("", "【場別統計】");
+    for (const [farm, records] of [...farms].sort((a,b) => a[0].localeCompare(b[0], "zh-TW"))) {
+      const t = centralTotals(records);
+      lines.push(`${farm}：支出 ${centralFmt(t.expense)}／收入 ${centralFmt(t.income)} 元`);
+    }
+  } else if (text === "中央 今日明細") {
+    lines.push("", "【今日明細（最多20筆）】");
+    for (const r of rows.slice(0, 20)) {
+      lines.push(`${r.owner}｜${r.farm}｜${r.txType}｜${r.item}｜${centralFmt(Math.abs(r.amount))}`);
+    }
+    if (rows.length > 20) lines.push(`另有 ${rows.length - 20} 筆未顯示，請至中央報表查看。`);
+  }
+  if (failures.length) lines.push("", `⚠️ ${failures.length} 份帳本讀取失敗，以上不是完整總額。`, ...failures.slice(0, 5));
+  if (!accounts) lines.push("⚠️ 尚未有核准的測試帳本，請設定 TEST_ALLOWED_SHEET_IDS。");
+  return { text: lines.join("\n"), rows, failures, month };
+}
+
+async function centralSyncTestReport() {
+  requireCentralTestConfig();
+  if (!TEST_REPORT_ID || TEST_REPORT_ID === MASTER_SHEET_ID || TEST_REPORT_ID === TEST_MASTER_ID ||
+      TEST_ALLOWED_IDS.has(TEST_REPORT_ID)) {
+    throw new Error("未設定獨立的 TEST_CENTRAL_REPORT_SHEET_ID，或報表與帳本/主檔衝突");
+  }
+  const now = taipeiNow();
+  const { all, failures, accounts } = await centralRead([now.monthSheet]);
+  if (failures.length || !accounts) return "❌ 有帳本讀取失敗或無核准帳本，已停止同步，避免產生不完整報表。";
+  const sheets = await getSheets();
+  const tabs = [
+    ["中央流水帳", ["帳本持有人", "月份", "場別", "收支類型", "付款來源", "日期", "品項", "用途說明", "廠商名稱", "金額", "填表人"],
+      all.map(r => [r.owner, r.month, r.farm, r.txType, r.paymentSource, r.date, r.item, r.description, r.vendor, r.amount, r.recorder])],
+    ["中央月報", ["月份", "場別", "支出", "收入", "淨支出", "筆數"], (() => {
+      const groups = new Map();
+      for (const r of all) { const key = r.farm || "未指定"; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(r); }
+      return [...groups].map(([farm, rows]) => { const t = centralTotals(rows); return [now.monthSheet, farm, t.expense, t.income, t.net, t.count]; });
+    })()],
+    ["同步紀錄", ["同步時間UTC", "月份", "帳本數", "明細筆數", "狀態"], [[new Date().toISOString(), now.monthSheet, accounts, all.length, "成功"]]],
+  ];
+  // 只寫入明確指定的隔離測試報表；不修改原始帳本。
+  for (const [name, headers, data] of tabs) {
+    await ensureSheet(TEST_REPORT_ID, name, headers);
+    if (name !== "同步紀錄") {
+      await sheets.spreadsheets.values.clear({ spreadsheetId: TEST_REPORT_ID, range: `'${name}'!A2:Z` });
+      if (data.length) await sheets.spreadsheets.values.update({
+        spreadsheetId: TEST_REPORT_ID, range: `'${name}'!A2`, valueInputOption: "RAW",
+        requestBody: { values: data },
+      });
+    } else {
+      await sheets.spreadsheets.values.append({ spreadsheetId: TEST_REPORT_ID, range: `'${name}'!A:E`,
+        valueInputOption: "RAW", insertDataOption: "INSERT_ROWS", requestBody: { values: data } });
     }
   }
-  return result.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-}
-
-async function crossBookRecentTen(routing, permission, userId) {
-  const logs = await collectAuthorizedLogEntries(routing, permission);
-  const selected = logs.slice(0, 10);
-  crossBookSnapshots.set(userId, {
-    expiresAt: Date.now() + RECENT_SNAPSHOT_MS,
-    entries: selected.map(e => ({ sheetId: e.sheetId, id: e.id, userId: e.userId }))
-  });
-  if (!selected.length) return "📒 最近10筆（跨授權帳本）\n\n目前沒有可辨識記帳ID的紀錄。舊資料仍可在原始帳本查詢。";
-  const lines = ["📒 最近10筆（跨授權帳本，按記帳時間）", ""];
-  selected.forEach((e, i) => {
-    lines.push(`${i + 1}. ${e.month}｜${e.farm}｜${e.txType}｜${e.item}｜${Math.abs(e.amount).toLocaleString("zh-TW")}元`);
-    lines.push(`   填表人：${e.recorder || "未填"}`);
-    if (e.userId === userId) {
-      lines.push(`   可刪除：刪除第${i + 1}筆`);
-      lines.push(`   記帳ID：${e.id}`);
-    }
-  });
-  lines.push("", "僅本人記帳可刪除；編號5分鐘有效。沒有記帳ID的舊資料不會顯示於此清單。");
-  return lines.join("\n");
-}
-
-async function crossBookRequestDelete(routing, permission, userId, text) {
-  const entries = await collectAuthorizedLogEntries(routing, permission);
-  let match;
-  let mode = "selected";
-  if (text === "刪除上一筆") {
-    match = entries.find(e => e.userId === userId);
-    mode = "own-last";
-  } else if (/^刪除第\s*\d+\s*筆$/.test(text)) {
-    const n = Number(text.match(/\d+/)[0]);
-    const snap = crossBookSnapshots.get(userId);
-    if (!snap || Date.now() > snap.expiresAt) return "⚠️ 清單已過期，請先輸入「最近10筆」。";
-    const chosen = snap.entries[n - 1];
-    if (!chosen || chosen.userId !== userId) return "❌ 只能刪除清單中本人有記帳ID的資料。";
-    match = entries.find(e => e.id === chosen.id && e.sheetId === chosen.sheetId);
-  } else {
-    const id = text.match(/^刪除\s+(TX-[0-9a-f-]+)$/i)?.[1];
-    if (!id || !TX_ID_PATTERN.test(id)) return "❌ 記帳ID格式不正確。";
-    match = entries.find(e => e.id.toLowerCase() === id.toLowerCase() && e.userId === userId);
-  }
-  if (!match || match.userId !== userId) return "❌ 找不到本人可刪除的有效記帳。";
-  crossBookPending.set(userId, { sheetId: match.sheetId, id: match.id,
-    mode, expiresAt: Date.now() + DELETE_CONFIRM_MS });
-  return `⚠️ 即將永久刪除本人記帳\n\n${formatDeletionEntry(match)}\n\n請在5分鐘內輸入「確認刪除」或「取消」。`;
-}
-
-async function crossBookConfirmDelete(routing, permission, userId) {
-  const pending = crossBookPending.get(userId);
-  crossBookPending.delete(userId);
-  if (!pending || Date.now() > pending.expiresAt) return "⚠️ 沒有有效的待確認刪除，請重新下指令。";
-  assertTestingSheet(pending.sheetId);
-  const entries = await collectAuthorizedLogEntries(routing, permission);
-  const entry = entries.find(e => e.id === pending.id && e.sheetId === pending.sheetId && e.userId === userId);
-  if (!entry) return "❌ 記帳已異動、場別權限已變更或原始帳本不一致，取消刪除。";
-  if (pending.mode === "own-last") {
-    const newest = entries.find(e => e.userId === userId);
-    if (!newest || newest.id !== entry.id) return "⚠️ 期間有更新的本人記帳，請重新輸入「刪除上一筆」。";
-  }
-  // Reuse original per-book delete checks and atomic Sheets batchUpdate.
-  pendingDeletions.set(`${entry.sheetId}:${userId}`, {
-    id: entry.id, mode: pending.mode, expiresAt: pending.expiresAt
-  });
-  return confirmDeleteLast(entry.sheetId, userId, permission);
+  return `✅ 已同步 ${accounts} 份測試帳本、${all.length} 筆到隔離測試報表（${now.monthSheet}）。`;
 }
 
 async function handleTextMessage(event) {
@@ -1805,54 +1713,91 @@ async function handleTextMessage(event) {
     return userSheet.error;
   }
 
-  // 使用者主檔只負責辨識身分；實際帳本由「帳務主檔」決定。
-  const permission = await resolvePermission(event.source?.userId || "");
-  if (permission.error) return permission.error;
-  const routing = await getTestingRouting();
+  // 測試版保護：所有既有寫入、刪除、查詢均不得觸及正式帳本。
+  requireCentralTestConfig();
+  if (!TEST_ALLOWED_IDS.has(userSheet.sheetId)) {
+    return "❌ TESTING 安全限制：你的帳本不在測試白名單，未執行操作。";
+  }
+
+  if (text.startsWith("中央 ")) {
+    if (!(await assertCentralAdmin(event.source?.userId || ""))) return "❌ 僅管理員可使用中央查帳。";
+    if (text === "中央 同步") return await centralSyncTestReport();
+    if (centralMonthFromCommand(text) || text === "中央 今日明細") {
+      return (await centralQuery(text)).text;
+    }
+    return "中央指令：中央 本月／中央 202609／中央 今日明細／中央 場別統計／中央 同步";
+  }
+
+  const targetSheetId = userSheet.sheetId;
+
+  await ensureBaseStructure(targetSheetId);
+
   const userId = event.source?.userId || "";
+  if (text === "刪除上一筆") return await requestDeleteLast(targetSheetId, userId);
+  const numberDelete = text.match(/^刪除第\s*(\d{1,2})\s*筆$/);
+  if (numberDelete) return await requestDeleteByNumber(targetSheetId, userId, Number(numberDelete[1]));
+  const idDelete = text.match(/^刪除\s+(TX-[0-9a-f-]+)$/i);
+  if (idDelete) return await requestSelectedDelete(targetSheetId, userId, idDelete[1]);
+  if (text === "確認刪除") return await confirmDeleteLast(targetSheetId, userId);
+  if (text === "取消") {
+    pendingDeletions.delete(`${targetSheetId}:${userId}`);
+    return "已取消刪除。";
+  }
+
+  if (text === "最近10筆") {
+    return await recentTenText(targetSheetId, userId);
+  }
 
   const query = parseQuery(text);
-  if (query) return querySummaryV2(routing, query, permission);
+  if (query) {
+    return await querySummary(targetSheetId, query);
+  }
 
   const dated = parseOptionalDatePrefix(text);
-  if (dated.error) return `❌ ${dated.error}`;
-  const expense = await parseExpenseCommand(dated.body);
-  if (expense?.error) return `❌ ${expense.error}`;
-  if (expense) {
-    if (!canManageFarm(permission, expense.farm)) return "❌ 你沒有這個場別的記帳權限。";
-    const entry = routing.byFarm.get(expense.farm);
-    if (!entry) return "❌ 此場別尚未設定測試帳本，未執行記帳。";
-    const targetSheetId = entry.sheetId;
-    assertTestingSheet(targetSheetId);
-    await ensureBaseStructure(targetSheetId);
-    const userName = await getProfileName(event);
-    await ensureMonthSheet(targetSheetId, dated.dateInfo.monthSheet);
-    const writeResult = await writeExpense(targetSheetId, dated.dateInfo.monthSheet,
-      expense, dated.dateInfo.dateText, userName, userId);
-    return [
-      `✅ ${expense.txType}記錄完成`, "",
-      dated.isCustomDate ? "🗓️ 補登日期" : null,
-      `場別：${expense.farm}`, `日期：${dated.dateInfo.dateText}`,
-      `品項：${expense.accountItem}`, `用途：${expense.description}`,
-      expense.vendor ? `廠商：${expense.vendor}` : null,
-      `數量：${expense.qty}`, `單價：${expense.unitPrice.toLocaleString("zh-TW")} 元`,
-      `金額：${expense.amount.toLocaleString("zh-TW")} 元`,
-      expense.paymentSource ? `付款來源：${expense.paymentSource}` : null,
-      `收支類型：${expense.txType}`, `科目代號：${expense.code}`,
-      `科目分類：${expense.className}`, `填表人：${userName}`,
-      `帳本：${entry.name}`, `寫入：${dated.dateInfo.monthSheet}`,
-      writeResult?.auditWarning ? "⚠️ 記帳成功，但排序紀錄未完成，請勿重複送出。" : null,
-    ].filter(Boolean).join("\n");
+  if (dated.error) {
+    return `❌ ${dated.error}`;
   }
 
-  if (text === "最近10筆") return crossBookRecentTen(routing, permission, userId);
-  if (text === "刪除上一筆" || /^刪除第\s*\d+\s*筆$/.test(text) || /^刪除\s+TX-/i.test(text)) {
-    return crossBookRequestDelete(routing, permission, userId, text);
+  const expense = await parseExpenseCommand(dated.body);
+
+  if (expense?.error) {
+    return `❌ ${expense.error}`;
   }
-  if (text === "確認刪除") return crossBookConfirmDelete(routing, permission, userId);
-  if (text === "取消") {
-    crossBookPending.delete(userId);
-    return "✅ 已取消待確認刪除。";
+
+  if (expense) {
+    const userName = await getProfileName(event);
+
+    await ensureMonthSheet(targetSheetId, dated.dateInfo.monthSheet);
+    const writeResult = await writeExpense(
+      targetSheetId,
+      dated.dateInfo.monthSheet,
+      expense,
+      dated.dateInfo.dateText,
+      userName,
+      event.source?.userId || ""
+    );
+
+    return [
+      `✅ ${expense.txType}記錄完成`,
+      "",
+      dated.isCustomDate ? "🗓️ 補登日期" : null,
+      `場別：${expense.farm}`,
+      `日期：${dated.dateInfo.dateText}`,
+      `品項：${expense.accountItem}`,
+      `用途：${expense.description}`,
+      expense.vendor ? `廠商：${expense.vendor}` : null,
+      `數量：${expense.qty}`,
+      `單價：${expense.unitPrice.toLocaleString("zh-TW")} 元`,
+      `金額：${expense.amount.toLocaleString("zh-TW")} 元`,
+      expense.paymentSource ? `付款來源：${expense.paymentSource}` : null,
+      `收支類型：${expense.txType}`,
+      `科目代號：${expense.code}`,
+      `科目分類：${expense.className}`,
+      `填表人：${userName}`,
+      `帳本：${userSheet.name}`,
+      `寫入：${dated.dateInfo.monthSheet}`,
+      writeResult?.auditWarning ? "⚠️ 記帳成功，但排序紀錄未完成，請勿重複送出。" : null,
+    ].filter(Boolean).join("\n");
   }
 
   return helpText();
@@ -1862,7 +1807,7 @@ async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return null;
 
   try {
-    const replyText = await serializeAccountingOperation(() => handleTextMessage(event));
+    const replyText = await handleTextMessage(event);
 
     await client.replyMessage({
       replyToken: event.replyToken,
@@ -1888,7 +1833,7 @@ async function handleEvent(event) {
 }
 
 app.get("/", (req, res) => {
-  res.send("Chicken Farm Accounting Bot - V2 Candidate TESTING-ONLY is running.");
+  res.send("Chicken Farm Accounting Bot - Simplified Income Expense + Keyword Master Version is running.");
 });
 
 app.post("/webhook", line.middleware(config), async (req, res) => {
@@ -1903,6 +1848,10 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
+if (!CENTRAL_TEST_MODE) {
+  console.error("安全停止：此候選檔僅允許 APP_ENV=TESTING，禁止部署 MAIN。");
+  process.exit(1);
+}
 app.listen(PORT, () => {
-  console.log(`Chicken Farm Accounting Bot - V2 Candidate TESTING-ONLY running on port ${PORT}`);
+  console.log(`Chicken Farm Accounting Bot - Simplified Income Expense + Keyword Master Version running on port ${PORT}`);
 });

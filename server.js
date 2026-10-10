@@ -23,7 +23,7 @@ if (process.env.APP_ENV !== "TESTING") {
 }
 const DEFAULT_SHEET_ID = (process.env.GOOGLE_SHEET_ID || "").trim();
 const MASTER_SHEET_ID = (process.env.TEST_USER_MASTER_SHEET_ID || "").trim();
-const ACCOUNT_MASTER_SHEET_ID = (process.env.TEST_CENTRAL_SHEET_ID || "").trim();
+const ACCOUNT_MASTER_SHEET_ID = (process.env.TEST_ACCOUNT_MASTER_SHEET_ID || "").trim();
 const TEST_ALLOWED_SHEET_IDS = new Set(
   [process.env.TEST_ALLOWED_SHEET_ID || "", ...(process.env.TEST_ALLOWED_SHEET_IDS || "").split(",")]
     .map(s => s.trim()).filter(Boolean)

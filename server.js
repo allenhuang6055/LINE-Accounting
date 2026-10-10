@@ -16,9 +16,77 @@ const client = new line.messagingApi.MessagingApiClient({
   channelAccessToken: config.channelAccessToken,
 });
 
-const DEFAULT_SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const MASTER_SHEET_ID = process.env.MASTER_SHEET_ID;
-const ACCOUNT_MASTER_SHEET_ID = process.env.ACCOUNT_MASTER_SHEET_ID;
+// ===== MAIN 候選版的 TESTING 專用隔離層 =====
+// 啟動前先檢查環境；不依賴正式 MASTER_SHEET_ID 或正式科目主檔。
+if (process.env.APP_ENV !== "TESTING") {
+  throw new Error("安全停止：本檔只能在 APP_ENV=TESTING 啟動，不得部署 MAIN");
+}
+const TEST_MASTER_SHEET_ID = String(process.env.TEST_USER_MASTER_SHEET_ID || "").trim();
+const TEST_ALLOWED_SHEET_IDS = new Set(String(process.env.TEST_ALLOWED_SHEET_IDS || "")
+  .split(",").map(s => s.trim()).filter(Boolean));
+const PRODUCTION_MASTER_ID = String(process.env.MASTER_SHEET_ID || "").trim();
+const PRODUCTION_ACCOUNT_ID = String(process.env.ACCOUNT_MASTER_SHEET_ID || "").trim();
+if (!TEST_MASTER_SHEET_ID || !TEST_ALLOWED_SHEET_IDS.size) {
+  throw new Error("安全停止：缺少 TEST_USER_MASTER_SHEET_ID 或 TEST_ALLOWED_SHEET_IDS");
+}
+const PROTECTED_IDS = [TEST_MASTER_SHEET_ID, PRODUCTION_MASTER_ID, PRODUCTION_ACCOUNT_ID].filter(Boolean);
+if ((PRODUCTION_MASTER_ID && TEST_MASTER_SHEET_ID === PRODUCTION_MASTER_ID) ||
+    (PRODUCTION_ACCOUNT_ID && TEST_MASTER_SHEET_ID === PRODUCTION_ACCOUNT_ID) ||
+    PROTECTED_IDS.some(id => TEST_ALLOWED_SHEET_IDS.has(id))) {
+  throw new Error("安全停止：測試帳本白名單與中央主控表或正式科目主檔衝突");
+}
+// 測試版不讀取正式科目主檔，改用原 MAIN 程式內建的科目對照。
+const DEFAULT_SHEET_ID = null;
+const MASTER_SHEET_ID = TEST_MASTER_SHEET_ID;
+const ACCOUNT_MASTER_SHEET_ID = null;
+
+function assertTestSheetAccess(sheetId, operation) {
+  const id = String(sheetId || "").trim();
+  const isTestMaster = id === TEST_MASTER_SHEET_ID;
+  const isTestBook = TEST_ALLOWED_SHEET_IDS.has(id);
+  if (!id || (!isTestMaster && !isTestBook)) {
+    throw new Error("TESTING 安全阻擋：禁止存取未核准的 Google Sheet ID");
+  }
+  if (operation !== "get" && isTestMaster) {
+    throw new Error("TESTING 安全阻擋：禁止寫入測試中央主控表");
+  }
+}
+
+// 在 Google Sheets API 邊界強制檢查每次讀寫的 spreadsheetId，
+// 不只依賴中央查帳路由，連原 MAIN 的記帳/刪除指令也受隔離限制。
+function guardTestSheetsApi(api) {
+  const guardMethods = (target, methods) => new Proxy(target, {
+    get(obj, key) {
+      const value = obj[key];
+      if (typeof value !== "function") return value;
+      if (!methods.has(key)) return value.bind(obj);
+      return (args, ...rest) => {
+        assertTestSheetAccess(args?.spreadsheetId, key === "get" ? "get" : "write");
+        return value.call(obj, args, ...rest);
+      };
+    }
+  });
+  const sheets = api.spreadsheets;
+  const guardedValues = guardMethods(sheets.values,
+    new Set(["get", "batchGet", "append", "update", "batchUpdate", "clear", "batchClear"]));
+  const guardedSpreadsheets = new Proxy(sheets, {
+    get(obj, key) {
+      if (key === "values") return guardedValues;
+      const value = obj[key];
+      if (typeof value !== "function") return value;
+      if (!["get", "batchUpdate", "create", "delete", "getByDataFilter"].includes(key)) return value.bind(obj);
+      return (args, ...rest) => {
+        assertTestSheetAccess(args?.spreadsheetId, key === "get" || key === "getByDataFilter" ? "get" : "write");
+        return value.call(obj, args, ...rest);
+      };
+    }
+  });
+  return new Proxy(api, { get(obj, key) {
+    if (key === "spreadsheets") return guardedSpreadsheets;
+    const value = obj[key];
+    return typeof value === "function" ? value.bind(obj) : value;
+  }});
+}
 
 // ===== 場別 =====
 const FARM_ALIASES = {
@@ -164,7 +232,7 @@ function getGoogleAuth() {
 }
 
 async function getSheets() {
-  return google.sheets({ version: "v4", auth: getGoogleAuth() });
+  return guardTestSheetsApi(google.sheets({ version: "v4", auth: getGoogleAuth() }));
 }
 
 function taipeiNow() {
@@ -405,11 +473,10 @@ async function getMasterSheetTitle() {
 }
 
 async function resolveUserSheet(event) {
-  requireCentralTestConfig();
   const userId = event.source?.userId || "";
 
   // 如果尚未設定主檔，暫時沿用原本單人版 Sheet。
-  if (!TEST_MASTER_ID) {
+  if (!MASTER_SHEET_ID) {
     if (!DEFAULT_SHEET_ID) {
       throw new Error("缺少 MASTER_SHEET_ID 與 GOOGLE_SHEET_ID");
     }
@@ -425,14 +492,14 @@ async function resolveUserSheet(event) {
     throw new Error("無法取得 LINE User ID");
   }
 
-  const masterTitle = "使用者名單";
+  const masterTitle = await getMasterSheetTitle();
   if (!masterTitle) {
     throw new Error("使用者主檔沒有可讀取的分頁");
   }
 
   const sheets = await getSheets();
   const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: TEST_MASTER_ID,
+    spreadsheetId: MASTER_SHEET_ID,
     range: `'${masterTitle}'!A2:F`,
     valueRenderOption: "FORMATTED_VALUE",
   });
@@ -463,6 +530,9 @@ async function resolveUserSheet(event) {
     return {
       error: `❌ ${name} 尚未設定 Google Sheet ID。`,
     };
+  }
+  if (!TEST_ALLOWED_SHEET_IDS.has(sheetId)) {
+    return { error: "❌ TESTING 安全阻擋：此帳號未綁定核准的測試帳本。" };
   }
 
   return {
@@ -1234,10 +1304,6 @@ function helpText() {
     "刪除 TX-完整記帳ID（限本人）",
     "確認刪除 / 取消",
     "",
-    "【中央查帳（僅測試管理員）】",
-    "中央 本月 / 中央 202609 / 中央 今日明細",
-    "中央 場別統計 / 中央 同步",
-    "",
     "【查自己的 LINE ID】",
     "我的ID",
   ].join("\n");
@@ -1513,191 +1579,139 @@ async function recentTenText(sheetId, userId) {
 }
 
 
-// ===== 中央查帳（候選版；僅供隔離 TESTING） =====
-// 所有跨帳本操作只讀來源帳本。只有明確下「中央 同步」且配置
-// TEST_CENTRAL_REPORT_SHEET_ID 才會寫入隔離的測試報表，不寫入正式中央主控表。
-const CENTRAL_TEST_MODE = process.env.APP_ENV === "TESTING";
-const TEST_ALLOWED_IDS = new Set(String(process.env.TEST_ALLOWED_SHEET_IDS || "")
-  .split(",").map(s => s.trim()).filter(Boolean));
-const TEST_MASTER_ID = process.env.TEST_USER_MASTER_SHEET_ID || "";
-const TEST_REPORT_ID = process.env.TEST_CENTRAL_REPORT_SHEET_ID || "";
+// ===== 中央查帳正式候選版：唯讀，預設關閉 =====
+// 不提供「中央 同步」，不修改任何來源帳本或主控表。
+const CENTRAL_READONLY_ENABLED = true; // TESTING 專用：中央唯讀查帳開啟
+const CENTRAL_ALLOWED_SHEET_IDS = TEST_ALLOWED_SHEET_IDS; // 沿用既有測試白名單
 
-function requireCentralTestConfig() {
-  if (!CENTRAL_TEST_MODE || !TEST_MASTER_ID || !TEST_ALLOWED_IDS.size) {
-    throw new Error("中央測試未隔離：需 APP_ENV=TESTING、TEST_USER_MASTER_SHEET_ID、TEST_ALLOWED_SHEET_IDS");
+function centralRequireConfig() {
+  if (!CENTRAL_READONLY_ENABLED) return false;
+  if (!MASTER_SHEET_ID || CENTRAL_ALLOWED_SHEET_IDS.size === 0) {
+    throw new Error("中央查帳未設定正式主控表或核准帳本清單");
   }
-  if (TEST_MASTER_ID === MASTER_SHEET_ID) {
-    throw new Error("測試使用者主檔不可與正式 MASTER_SHEET_ID 相同");
+  if (CENTRAL_ALLOWED_SHEET_IDS.has(MASTER_SHEET_ID) ||
+      (ACCOUNT_MASTER_SHEET_ID && CENTRAL_ALLOWED_SHEET_IDS.has(ACCOUNT_MASTER_SHEET_ID))) {
+    throw new Error("中央查帳白名單不得包含主控表或科目主檔");
   }
-  // 測試帳本白名單不得包含中央主控表或中央科目主檔（含測試主控表）。
-  const protectedIds = [MASTER_SHEET_ID, ACCOUNT_MASTER_SHEET_ID, TEST_MASTER_ID]
-    .filter(Boolean).map(id => String(id).trim());
-  if (protectedIds.some(id => TEST_ALLOWED_IDS.has(id))) {
-    throw new Error("TEST_ALLOWED_SHEET_IDS 含中央主控表或科目主檔 ID，已拒絕中央測試操作");
-  }
+  return true;
 }
 
-async function centralMasterRows() {
-  requireCentralTestConfig();
-  const sheets = await getSheets();
-  const response = await sheets.spreadsheets.values.get({
-    spreadsheetId: TEST_MASTER_ID,
-    range: "'使用者名單'!A2:F",
-    valueRenderOption: "FORMATTED_VALUE",
-  });
-  return (response.data.values || []).map(r => ({
-    name: String(r[0] || "").trim(),
-    userId: String(r[2] || "").trim(),
-    sheetId: String(r[3] || "").trim(),
-    enabled: ["Y", "YES", "TRUE", "1", "啟用"].includes(String(r[4] || "").trim().toUpperCase()),
-  }));
-}
-
-async function assertCentralAdmin(userId) {
-  requireCentralTestConfig();
+async function centralReadTab(range) {
   const sheets = await getSheets();
   const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: TEST_MASTER_ID,
-    range: "'權限設定'!A2:D",
-    valueRenderOption: "FORMATTED_VALUE",
+    spreadsheetId: MASTER_SHEET_ID, range, valueRenderOption: "FORMATTED_VALUE"
   });
-  const matches = (result.data.values || []).filter(r => String(r[0] || "").trim() === userId);
-  if (matches.length !== 1) return false;
+  return result.data.values || [];
+}
+
+async function centralIsAdmin(userId) {
+  if (!userId) return false;
+  const rows = await centralReadTab("'權限設定'!A2:D");
+  const matches = rows.filter(r => String(r[0] || "").trim() === userId);
+  if (matches.length !== 1) return false; // 權限重複時拒絕
   const r = matches[0];
   return String(r[1] || "").trim().toUpperCase() === "ADMIN" &&
     String(r[2] || "").trim().toUpperCase() === "ALL" &&
     ["Y", "YES", "TRUE", "1", "啟用"].includes(String(r[3] || "").trim().toUpperCase());
 }
 
-async function centralRead(months) {
-  const users = (await centralMasterRows()).filter(r => r.enabled && r.sheetId);
-  const unique = new Map();
-  for (const u of users) {
-    if (!TEST_ALLOWED_IDS.has(u.sheetId)) continue; // 禁止測試版讀取未核准帳本
-    if (!unique.has(u.sheetId)) unique.set(u.sheetId, u.name || "未命名帳本");
+function centralParseCommand(text) {
+  if (text === "中央 本月" || text === "中央 場別統計" || text === "中央 今日明細") {
+    return { month: taipeiNow().monthSheet, mode: text };
   }
-  const sheets = await getSheets();
-  const all = [], failures = [];
-  for (const [sheetId, owner] of unique) {
-    try {
-      const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: "sheets.properties.title" });
-      const exists = new Set((meta.data.sheets || []).map(t => t.properties.title));
-      for (const month of months) {
-        if (!exists.has(month)) continue;
-        const rows = await readMonthRows(sheetId, month); // 純讀取，不呼叫 normalizeMonthAmountSigns
-        for (const r of rows) all.push({ ...r, owner, month });
-      }
-    } catch (e) {
-      failures.push(`${owner}：讀取失敗（${e.code || "權限或網路問題"}）`);
-    }
+  const match = text.match(/^中央\s+(\d{4})(\d{2})$/);
+  if (match && Number(match[2]) >= 1 && Number(match[2]) <= 12) {
+    return { month: `${match[1]}${match[2]}月`, mode: "中央 指定月份" };
   }
-  return { all, failures, accounts: unique.size, registered: users.length };
+  return null;
 }
 
 function centralTotals(rows) {
   const valid = rows.filter(r => ["收入", "支出"].includes(r.txType || "支出"));
   const expense = valid.filter(r => (r.txType || "支出") === "支出")
-    .reduce((n, r) => n + Math.abs(r.amount), 0);
+    .reduce((sum, r) => sum + Math.abs(r.amount), 0);
   const income = valid.filter(r => r.txType === "收入")
-    .reduce((n, r) => n + Math.abs(r.amount), 0);
+    .reduce((sum, r) => sum + Math.abs(r.amount), 0);
   return { expense, income, net: expense - income, count: valid.length };
 }
 
-function centralFmt(n) { return Number(n).toLocaleString("zh-TW"); }
-function centralMonthFromCommand(text) {
-  const now = taipeiNow();
-  if (text === "中央 本月" || text === "中央 場別統計" || text === "中央 同步") return `${now.year}${now.month}月`;
-  const m = text.match(/^中央\s+(\d{4})(\d{2})$/);
-  if (m && Number(m[2]) >= 1 && Number(m[2]) <= 12) return `${m[1]}${m[2]}月`;
-  return null;
-}
+async function centralReadOnlyQuery(text, userId) {
+  if (!centralRequireConfig()) return "❌ 中央查帳尚未開放。";
+  if (!(await centralIsAdmin(userId))) return "❌ 僅授權管理員可使用中央查帳。";
+  const cmd = centralParseCommand(text);
+  if (!cmd) return "中央唯讀指令：中央 本月／中央 202609／中央 今日明細／中央 場別統計（不支援中央 同步）";
 
-async function centralQuery(text) {
-  const now = taipeiNow();
-  const month = centralMonthFromCommand(text) || now.monthSheet;
-  const { all, failures, accounts, registered } = await centralRead([month]);
-  // 任一帳本讀取失敗時，不輸出可能誤導使用者的部分總額。
-  if (failures.length) {
-    return {
-      text: [
-        `❌ 中央查帳未完成：${failures.length} 份帳本讀取失敗，已停止顯示統計總額。`,
-        ...failures.slice(0, 5),
-        "請確認測試帳本讀取權限後重試。",
-      ].join("\n"),
-      rows: [], failures, month,
-    };
-  }
-  let rows = all;
-  if (text === "中央 今日明細") {
-    rows = all.filter(r => r.date.replace(/-/g, "/") === now.dateText);
-  }
-  const totals = centralTotals(rows);
-  const lines = [
-    `📊 中央查帳｜${text === "中央 今日明細" ? now.dateText : month}`,
-    `帳本：${accounts} 份（啟用使用者 ${registered} 位，重複帳本僅計一次）`,
-    `支出：${centralFmt(totals.expense)} 元`,
-    `收入：${centralFmt(totals.income)} 元`,
-    `淨支出：${centralFmt(totals.net)} 元`,
-    `筆數：${totals.count}`,
-  ];
-  if (text === "中央 場別統計") {
-    const farms = new Map();
-    for (const r of rows) {
-      const k = r.farm || "未指定";
-      if (!farms.has(k)) farms.set(k, []);
-      farms.get(k).push(r);
-    }
-    lines.push("", "【場別統計】");
-    for (const [farm, records] of [...farms].sort((a,b) => a[0].localeCompare(b[0], "zh-TW"))) {
-      const t = centralTotals(records);
-      lines.push(`${farm}：支出 ${centralFmt(t.expense)}／收入 ${centralFmt(t.income)} 元`);
-    }
-  } else if (text === "中央 今日明細") {
-    lines.push("", "【今日明細（最多20筆）】");
-    for (const r of rows.slice(0, 20)) {
-      lines.push(`${r.owner}｜${r.farm}｜${r.txType}｜${r.item}｜${centralFmt(Math.abs(r.amount))}`);
-    }
-    if (rows.length > 20) lines.push(`另有 ${rows.length - 20} 筆未顯示，請至中央報表查看。`);
-  }
-  if (!accounts) lines.push("⚠️ 尚未有核准的測試帳本，請設定 TEST_ALLOWED_SHEET_IDS。");
-  return { text: lines.join("\n"), rows, failures, month };
-}
+  const users = (await centralReadTab("'使用者名單'!A2:F")).map(r => ({
+    name: String(r[0] || "").trim() || "未命名帳本",
+    sheetId: String(r[3] || "").trim(),
+    enabled: ["Y", "YES", "TRUE", "1", "啟用"].includes(String(r[4] || "").trim().toUpperCase())
+  })).filter(u => u.enabled && u.sheetId);
 
-async function centralSyncTestReport() {
-  requireCentralTestConfig();
-  if (!TEST_REPORT_ID || TEST_REPORT_ID === MASTER_SHEET_ID || TEST_REPORT_ID === TEST_MASTER_ID ||
-      TEST_ALLOWED_IDS.has(TEST_REPORT_ID)) {
-    throw new Error("未設定獨立的 TEST_CENTRAL_REPORT_SHEET_ID，或報表與帳本/主檔衝突");
+  const unique = new Map();
+  for (const u of users) {
+    if (CENTRAL_ALLOWED_SHEET_IDS.has(u.sheetId) && !unique.has(u.sheetId)) {
+      unique.set(u.sheetId, u.name);
+    }
   }
-  const now = taipeiNow();
-  const { all, failures, accounts } = await centralRead([now.monthSheet]);
-  if (failures.length || !accounts) return "❌ 有帳本讀取失敗或無核准帳本，已停止同步，避免產生不完整報表。";
+  if (!unique.size) return "❌ 尚無核准的正式帳本，中央查帳已停止。";
+
   const sheets = await getSheets();
-  const tabs = [
-    ["中央流水帳", ["帳本持有人", "月份", "場別", "收支類型", "付款來源", "日期", "品項", "用途說明", "廠商名稱", "金額", "填表人"],
-      all.map(r => [r.owner, r.month, r.farm, r.txType, r.paymentSource, r.date, r.item, r.description, r.vendor, r.amount, r.recorder])],
-    ["中央月報", ["月份", "場別", "支出", "收入", "淨支出", "筆數"], (() => {
-      const groups = new Map();
-      for (const r of all) { const key = r.farm || "未指定"; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(r); }
-      return [...groups].map(([farm, rows]) => { const t = centralTotals(rows); return [now.monthSheet, farm, t.expense, t.income, t.net, t.count]; });
-    })()],
-    ["同步紀錄", ["同步時間UTC", "月份", "帳本數", "明細筆數", "狀態"], [[new Date().toISOString(), now.monthSheet, accounts, all.length, "成功"]]],
-  ];
-  // 只寫入明確指定的隔離測試報表；不修改原始帳本。
-  for (const [name, headers, data] of tabs) {
-    await ensureSheet(TEST_REPORT_ID, name, headers);
-    if (name !== "同步紀錄") {
-      await sheets.spreadsheets.values.clear({ spreadsheetId: TEST_REPORT_ID, range: `'${name}'!A2:Z` });
-      if (data.length) await sheets.spreadsheets.values.update({
-        spreadsheetId: TEST_REPORT_ID, range: `'${name}'!A2`, valueInputOption: "RAW",
-        requestBody: { values: data },
+  const rows = [], failures = [];
+  for (const [sheetId, owner] of unique) {
+    try {
+      const meta = await sheets.spreadsheets.get({
+        spreadsheetId: sheetId, fields: "sheets.properties.title"
       });
-    } else {
-      await sheets.spreadsheets.values.append({ spreadsheetId: TEST_REPORT_ID, range: `'${name}'!A:E`,
-        valueInputOption: "RAW", insertDataOption: "INSERT_ROWS", requestBody: { values: data } });
+      const exists = (meta.data.sheets || []).some(s => s.properties.title === cmd.month);
+      if (!exists) {
+        failures.push(`${owner}（缺少 ${cmd.month} 分頁）`);
+        continue;
+      }
+      // 僅讀取；不可使用 querySummary()，其內含 normalizeMonthAmountSigns() 寫入流程。
+      // readMonthRows() 為原 MAIN 的純讀取解析器，沿用原有欄位邏輯。
+      const items = await readMonthRows(sheetId, cmd.month);
+      for (const r of items) rows.push({ ...r, owner });
+    } catch (e) {
+      console.warn("中央查帳讀取帳本失敗", { owner, code: e.code || "unknown" });
+      failures.push(owner);
     }
   }
-  return `✅ 已同步 ${accounts} 份測試帳本、${all.length} 筆到隔離測試報表（${now.monthSheet}）。`;
+  // 有任何讀取失敗時，拒絕回報不完整總額。
+  if (failures.length) return `❌ 中央查帳未完成：${failures.length} 份帳本讀取失敗（${failures.slice(0, 5).join("、")}）。已停止統計，請檢查帳本權限。`;
+
+  const now = taipeiNow();
+  const selected = cmd.mode === "中央 今日明細"
+    ? rows.filter(r => r.date.replace(/-/g, "/") === now.dateText) : rows;
+  const t = centralTotals(selected);
+  const fmt = n => Number(n).toLocaleString("zh-TW");
+  const out = [
+    `📊 中央唯讀查帳｜${cmd.mode === "中央 今日明細" ? now.dateText : cmd.month}`,
+    `帳本：${unique.size} 份（啟用使用者 ${users.length} 位；重複帳本只計一次）`,
+    `支出：${fmt(t.expense)} 元`, `收入：${fmt(t.income)} 元`,
+    `淨支出：${fmt(t.net)} 元`, `筆數：${t.count}`
+  ];
+  if (cmd.mode === "中央 場別統計") {
+    const groups = new Map();
+    for (const r of selected) {
+      const farm = r.farm || "未指定";
+      if (!groups.has(farm)) groups.set(farm, []);
+      groups.get(farm).push(r);
+    }
+    out.push("", "【場別統計】");
+    for (const [farm, entries] of [...groups].sort((a,b) => a[0].localeCompare(b[0], "zh-TW"))) {
+      const g = centralTotals(entries);
+      out.push(`${farm}：支出 ${fmt(g.expense)}／收入 ${fmt(g.income)} 元`);
+    }
+  } else if (cmd.mode === "中央 今日明細") {
+    out.push("", "【今日明細（最多20筆）】");
+    for (const r of selected.slice(0, 20)) {
+      out.push(`${r.owner}｜${r.farm}｜${r.txType}｜${r.item}｜${fmt(Math.abs(r.amount))}`);
+    }
+    if (selected.length > 20) out.push(`另有 ${selected.length - 20} 筆未顯示。`);
+  }
+  // LINE 單則文字訊息有長度限制，避免回覆失敗。
+  const result = out.join("\n");
+  return result.length <= 4500 ? result : result.slice(0, 4450) + "\n…內容過長，請縮小查詢範圍。";
 }
 
 async function handleTextMessage(event) {
@@ -1729,19 +1743,9 @@ async function handleTextMessage(event) {
     return userSheet.error;
   }
 
-  // 測試版保護：所有既有寫入、刪除、查詢均不得觸及正式帳本。
-  requireCentralTestConfig();
-  if (!TEST_ALLOWED_IDS.has(userSheet.sheetId)) {
-    return "❌ TESTING 安全限制：你的帳本不在測試白名單，未執行操作。";
-  }
-
-  if (text.startsWith("中央 ")) {
-    if (!(await assertCentralAdmin(event.source?.userId || ""))) return "❌ 僅管理員可使用中央查帳。";
-    if (text === "中央 同步") return await centralSyncTestReport();
-    if (centralMonthFromCommand(text) || text === "中央 今日明細") {
-      return (await centralQuery(text)).text;
-    }
-    return "中央指令：中央 本月／中央 202609／中央 今日明細／中央 場別統計／中央 同步";
+  // 中央指令先檢查管理員權限；不得落入一般記帳流程。
+  if (text === "中央" || text.startsWith("中央 ")) {
+    return await centralReadOnlyQuery(text, event.source?.userId || "");
   }
 
   const targetSheetId = userSheet.sheetId;
@@ -1864,10 +1868,6 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-if (!CENTRAL_TEST_MODE) {
-  console.error("安全停止：此候選檔僅允許 APP_ENV=TESTING，禁止部署 MAIN。");
-  process.exit(1);
-}
 app.listen(PORT, () => {
   console.log(`Chicken Farm Accounting Bot - Simplified Income Expense + Keyword Master Version running on port ${PORT}`);
 });

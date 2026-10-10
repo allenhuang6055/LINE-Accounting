@@ -1529,6 +1529,12 @@ function requireCentralTestConfig() {
   if (TEST_MASTER_ID === MASTER_SHEET_ID) {
     throw new Error("測試使用者主檔不可與正式 MASTER_SHEET_ID 相同");
   }
+  // 測試帳本白名單不得包含中央主控表或中央科目主檔（含測試主控表）。
+  const protectedIds = [MASTER_SHEET_ID, ACCOUNT_MASTER_SHEET_ID, TEST_MASTER_ID]
+    .filter(Boolean).map(id => String(id).trim());
+  if (protectedIds.some(id => TEST_ALLOWED_IDS.has(id))) {
+    throw new Error("TEST_ALLOWED_SHEET_IDS 含中央主控表或科目主檔 ID，已拒絕中央測試操作");
+  }
 }
 
 async function centralMasterRows() {
@@ -1610,6 +1616,17 @@ async function centralQuery(text) {
   const now = taipeiNow();
   const month = centralMonthFromCommand(text) || now.monthSheet;
   const { all, failures, accounts, registered } = await centralRead([month]);
+  // 任一帳本讀取失敗時，不輸出可能誤導使用者的部分總額。
+  if (failures.length) {
+    return {
+      text: [
+        `❌ 中央查帳未完成：${failures.length} 份帳本讀取失敗，已停止顯示統計總額。`,
+        ...failures.slice(0, 5),
+        "請確認測試帳本讀取權限後重試。",
+      ].join("\n"),
+      rows: [], failures, month,
+    };
+  }
   let rows = all;
   if (text === "中央 今日明細") {
     rows = all.filter(r => r.date.replace(/-/g, "/") === now.dateText);
@@ -1642,7 +1659,6 @@ async function centralQuery(text) {
     }
     if (rows.length > 20) lines.push(`另有 ${rows.length - 20} 筆未顯示，請至中央報表查看。`);
   }
-  if (failures.length) lines.push("", `⚠️ ${failures.length} 份帳本讀取失敗，以上不是完整總額。`, ...failures.slice(0, 5));
   if (!accounts) lines.push("⚠️ 尚未有核准的測試帳本，請設定 TEST_ALLOWED_SHEET_IDS。");
   return { text: lines.join("\n"), rows, failures, month };
 }

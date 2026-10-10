@@ -55,37 +55,37 @@ function assertTestSheetAccess(sheetId, operation) {
 // 在 Google Sheets API 邊界強制檢查每次讀寫的 spreadsheetId，
 // 不只依賴中央查帳路由，連原 MAIN 的記帳/刪除指令也受隔離限制。
 function guardTestSheetsApi(api) {
-  const guardMethods = (target, methods) => new Proxy(target, {
-    get(obj, key) {
-      const value = obj[key];
-      if (typeof value !== "function") return value;
-      if (!methods.has(key)) return value.bind(obj);
-      return (args, ...rest) => {
-        assertTestSheetAccess(args?.spreadsheetId, key === "get" ? "get" : "write");
-        return value.call(obj, args, ...rest);
-      };
+  // 不對 googleapis Resource$Sheets 建立 Proxy：spreadsheets 是不可配置的唯讀屬性，
+  // Proxy 攔截回傳替代物件會觸發 JS invariant TypeError。
+  // 改回傳獨立 facade，僅開放明確列出的 Sheets API 方法。
+  const resource = api.spreadsheets;
+  const values = resource.values;
+  function wrap(target, method, operation) {
+    if (typeof target[method] !== "function") {
+      throw new Error(`TESTING 安全停止：Google Sheets API 缺少 ${method}`);
     }
+    return (args, ...rest) => {
+      assertTestSheetAccess(args?.spreadsheetId, operation);
+      return target[method].call(target, args, ...rest);
+    };
+  }
+  const guardedValues = Object.freeze({
+    get: wrap(values, "get", "get"),
+    batchGet: wrap(values, "batchGet", "get"),
+    append: wrap(values, "append", "write"),
+    update: wrap(values, "update", "write"),
+    batchUpdate: wrap(values, "batchUpdate", "write"),
+    clear: wrap(values, "clear", "write"),
+    batchClear: wrap(values, "batchClear", "write"),
   });
-  const sheets = api.spreadsheets;
-  const guardedValues = guardMethods(sheets.values,
-    new Set(["get", "batchGet", "append", "update", "batchUpdate", "clear", "batchClear"]));
-  const guardedSpreadsheets = new Proxy(sheets, {
-    get(obj, key) {
-      if (key === "values") return guardedValues;
-      const value = obj[key];
-      if (typeof value !== "function") return value;
-      if (!["get", "batchUpdate", "create", "delete", "getByDataFilter"].includes(key)) return value.bind(obj);
-      return (args, ...rest) => {
-        assertTestSheetAccess(args?.spreadsheetId, key === "get" || key === "getByDataFilter" ? "get" : "write");
-        return value.call(obj, args, ...rest);
-      };
-    }
+  const guardedSpreadsheets = Object.freeze({
+    values: guardedValues,
+    get: wrap(resource, "get", "get"),
+    getByDataFilter: wrap(resource, "getByDataFilter", "get"),
+    batchUpdate: wrap(resource, "batchUpdate", "write"),
+    // create 不使用 spreadsheetId，不能以 ID 白名單安全驗證，故不開放。
   });
-  return new Proxy(api, { get(obj, key) {
-    if (key === "spreadsheets") return guardedSpreadsheets;
-    const value = obj[key];
-    return typeof value === "function" ? value.bind(obj) : value;
-  }});
+  return Object.freeze({ spreadsheets: guardedSpreadsheets });
 }
 
 // ===== 場別 =====

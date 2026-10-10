@@ -1678,6 +1678,104 @@ async function querySummaryV2(routing, query, permission) {
   return summaryText(allRows, query.farm, title);
 }
 
+
+// ===== V2 production-readiness candidate: cross-book recent/delete =====
+// This candidate remains TESTING-only. Never deploy it to MAIN.
+// Serialize webhook operations within one Node process. This is NOT a distributed lock.
+let accountingQueue = Promise.resolve();
+function serializeAccountingOperation(fn) {
+  const result = accountingQueue.then(fn);
+  accountingQueue = result.catch(() => {});
+  return result;
+}
+const crossBookSnapshots = new Map();
+const crossBookPending = new Map();
+
+async function collectAuthorizedLogEntries(routing, permission) {
+  const result = [];
+  const visited = new Set();
+  for (const entry of getAllowedRoutingEntries(routing, permission)) {
+    if (visited.has(entry.sheetId)) continue;
+    visited.add(entry.sheetId);
+    assertTestingSheet(entry.sheetId);
+    const logs = await readAccountingLog(entry.sheetId);
+    for (const log of logs) {
+      if (log.status === "已刪除" || !TX_ID_PATTERN.test(log.id) ||
+          !canManageFarm(permission, log.farm) ||
+          routing.byFarm.get(log.farm)?.sheetId !== entry.sheetId ||
+          !/^\d{6}月$/.test(log.month) || log.row < 2 ||
+          !Number.isFinite(Date.parse(log.timestamp))) continue;
+      result.push({ ...log, sheetId: entry.sheetId });
+    }
+  }
+  return result.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+}
+
+async function crossBookRecentTen(routing, permission, userId) {
+  const logs = await collectAuthorizedLogEntries(routing, permission);
+  const selected = logs.slice(0, 10);
+  crossBookSnapshots.set(userId, {
+    expiresAt: Date.now() + RECENT_SNAPSHOT_MS,
+    entries: selected.map(e => ({ sheetId: e.sheetId, id: e.id, userId: e.userId }))
+  });
+  if (!selected.length) return "📒 最近10筆（跨授權帳本）\n\n目前沒有可辨識記帳ID的紀錄。舊資料仍可在原始帳本查詢。";
+  const lines = ["📒 最近10筆（跨授權帳本，按記帳時間）", ""];
+  selected.forEach((e, i) => {
+    lines.push(`${i + 1}. ${e.month}｜${e.farm}｜${e.txType}｜${e.item}｜${Math.abs(e.amount).toLocaleString("zh-TW")}元`);
+    lines.push(`   填表人：${e.recorder || "未填"}`);
+    if (e.userId === userId) {
+      lines.push(`   可刪除：刪除第${i + 1}筆`);
+      lines.push(`   記帳ID：${e.id}`);
+    }
+  });
+  lines.push("", "僅本人記帳可刪除；編號5分鐘有效。沒有記帳ID的舊資料不會顯示於此清單。");
+  return lines.join("\n");
+}
+
+async function crossBookRequestDelete(routing, permission, userId, text) {
+  const entries = await collectAuthorizedLogEntries(routing, permission);
+  let match;
+  let mode = "selected";
+  if (text === "刪除上一筆") {
+    match = entries.find(e => e.userId === userId);
+    mode = "own-last";
+  } else if (/^刪除第\s*\d+\s*筆$/.test(text)) {
+    const n = Number(text.match(/\d+/)[0]);
+    const snap = crossBookSnapshots.get(userId);
+    if (!snap || Date.now() > snap.expiresAt) return "⚠️ 清單已過期，請先輸入「最近10筆」。";
+    const chosen = snap.entries[n - 1];
+    if (!chosen || chosen.userId !== userId) return "❌ 只能刪除清單中本人有記帳ID的資料。";
+    match = entries.find(e => e.id === chosen.id && e.sheetId === chosen.sheetId);
+  } else {
+    const id = text.match(/^刪除\s+(TX-[0-9a-f-]+)$/i)?.[1];
+    if (!id || !TX_ID_PATTERN.test(id)) return "❌ 記帳ID格式不正確。";
+    match = entries.find(e => e.id.toLowerCase() === id.toLowerCase() && e.userId === userId);
+  }
+  if (!match || match.userId !== userId) return "❌ 找不到本人可刪除的有效記帳。";
+  crossBookPending.set(userId, { sheetId: match.sheetId, id: match.id,
+    mode, expiresAt: Date.now() + DELETE_CONFIRM_MS });
+  return `⚠️ 即將永久刪除本人記帳\n\n${formatDeletionEntry(match)}\n\n請在5分鐘內輸入「確認刪除」或「取消」。`;
+}
+
+async function crossBookConfirmDelete(routing, permission, userId) {
+  const pending = crossBookPending.get(userId);
+  crossBookPending.delete(userId);
+  if (!pending || Date.now() > pending.expiresAt) return "⚠️ 沒有有效的待確認刪除，請重新下指令。";
+  assertTestingSheet(pending.sheetId);
+  const entries = await collectAuthorizedLogEntries(routing, permission);
+  const entry = entries.find(e => e.id === pending.id && e.sheetId === pending.sheetId && e.userId === userId);
+  if (!entry) return "❌ 記帳已異動、場別權限已變更或原始帳本不一致，取消刪除。";
+  if (pending.mode === "own-last") {
+    const newest = entries.find(e => e.userId === userId);
+    if (!newest || newest.id !== entry.id) return "⚠️ 期間有更新的本人記帳，請重新輸入「刪除上一筆」。";
+  }
+  // Reuse original per-book delete checks and atomic Sheets batchUpdate.
+  pendingDeletions.set(`${entry.sheetId}:${userId}`, {
+    id: entry.id, mode: pending.mode, expiresAt: pending.expiresAt
+  });
+  return confirmDeleteLast(entry.sheetId, userId, permission);
+}
+
 async function handleTextMessage(event) {
   const text = String(event.message.text || "").trim();
 
@@ -1747,11 +1845,14 @@ async function handleTextMessage(event) {
     ].filter(Boolean).join("\n");
   }
 
-  // 跨帳本的最近10筆與刪除需另做記帳ID定位及作廢稽核；先禁止舊版物理刪除。
-  if (text === "最近10筆" || text === "刪除上一筆" ||
-      /^刪除第\s*\d+\s*筆$/.test(text) || /^刪除\s+TX-/i.test(text) ||
-      text === "確認刪除" || text === "取消") {
-    return "⚠️ TESTING V2 已啟用跨帳本路由；最近10筆與刪除暫停使用，避免跨帳本刪錯資料。後續版本會加入跨帳本查詢及作廢紀錄。";
+  if (text === "最近10筆") return crossBookRecentTen(routing, permission, userId);
+  if (text === "刪除上一筆" || /^刪除第\s*\d+\s*筆$/.test(text) || /^刪除\s+TX-/i.test(text)) {
+    return crossBookRequestDelete(routing, permission, userId, text);
+  }
+  if (text === "確認刪除") return crossBookConfirmDelete(routing, permission, userId);
+  if (text === "取消") {
+    crossBookPending.delete(userId);
+    return "✅ 已取消待確認刪除。";
   }
 
   return helpText();
@@ -1761,7 +1862,7 @@ async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return null;
 
   try {
-    const replyText = await handleTextMessage(event);
+    const replyText = await serializeAccountingOperation(() => handleTextMessage(event));
 
     await client.replyMessage({
       replyToken: event.replyToken,
@@ -1787,7 +1888,7 @@ async function handleEvent(event) {
 }
 
 app.get("/", (req, res) => {
-  res.send("Chicken Farm Accounting Bot - TESTING V2 Farm Routing is running.");
+  res.send("Chicken Farm Accounting Bot - V2 Candidate TESTING-ONLY is running.");
 });
 
 app.post("/webhook", line.middleware(config), async (req, res) => {
@@ -1803,5 +1904,5 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`Chicken Farm Accounting Bot - TESTING V2 Farm Routing running on port ${PORT}`);
+  console.log(`Chicken Farm Accounting Bot - V2 Candidate TESTING-ONLY running on port ${PORT}`);
 });

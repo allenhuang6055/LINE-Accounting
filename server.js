@@ -411,6 +411,53 @@ async function autoChooseItem(description) {
   return rows.find(r => r.item === "雜項費用") || rows[0] || null;
 }
 
+
+// ===== TESTING 權限管理 V1：僅讀取測試使用者主檔的「權限設定」 =====
+// 注意：ADMIN 在 V1 可操作目前綁定的測試帳本內所有場別；跨帳本路由尚未實作。
+const PERMISSION_TAB = "權限設定";
+const VALID_FARMS = new Set(Object.values(FARM_ALIASES).filter(x => x !== "全部" && x !== "共用"));
+
+async function resolvePermission(userId) {
+  if (!userId) return { error: "❌ 無法辨識 LINE 使用者，拒絕操作。" };
+  const sheets = await getSheets();
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: MASTER_SHEET_ID,
+    range: `'${PERMISSION_TAB}'!A1:D`,
+    valueRenderOption: "FORMATTED_VALUE",
+  });
+  const values = response.data.values || [];
+  const expected = ["LINE User ID", "身分", "可管理場別", "是否啟用"];
+  if (expected.some((h, i) => String(values[0]?.[i] || "").trim() !== h)) {
+    return { error: "❌ TESTING 權限設定欄位不正確，已拒絕操作。" };
+  }
+  const matches = values.slice(1).filter(r => String(r[0] || "").trim() === userId);
+  if (matches.length !== 1) return { error: "❌ 未找到唯一且有效的權限設定，請聯絡管理者。" };
+  const row = matches[0];
+  const role = String(row[1] || "").trim().toUpperCase();
+  const enabled = String(row[3] || "").trim().toUpperCase();
+  if (enabled !== "Y" || !["ADMIN", "USER"].includes(role)) {
+    return { error: "❌ 你的帳號沒有啟用的記帳權限。" };
+  }
+  const rawScope = String(row[2] || "").trim();
+  if (role === "ADMIN") {
+    if (rawScope !== "ALL") return { error: "❌ ADMIN 權限設定必須是 ALL。" };
+    return { role, farms: null };
+  }
+  const tokens = rawScope.split(/[,，、;；]/).map(v => v.trim()).filter(Boolean);
+  const farms = tokens.map(farmFromToken);
+  if (!tokens.length || farms.some(f => !f || !VALID_FARMS.has(f)) || rawScope.toUpperCase() === "ALL") {
+    return { error: "❌ 可管理場別設定無效，已拒絕操作。" };
+  }
+  return { role, farms: new Set(farms) };
+}
+
+function canManageFarm(permission, farm) {
+  return permission.role === "ADMIN" || permission.farms.has(farm);
+}
+function filterPermittedRows(rows, permission) {
+  return permission.role === "ADMIN" ? rows : rows.filter(r => canManageFarm(permission, r.farm));
+}
+
 async function getMasterSheetTitle() {
   if (!MASTER_SHEET_ID) return null;
 
@@ -1137,7 +1184,8 @@ function summaryText(rows, farm, title) {
   return lines.join("\n");
 }
 
-async function querySummary(sheetId, query) {
+async function querySummary(sheetId, query, permission) {
+  if (query.farm !== "全部" && !canManageFarm(permission, query.farm)) return "❌ 你沒有這個場別的查詢權限。";
   const now = taipeiNow();
 
   if (query.mode === "指定月份") {
@@ -1164,7 +1212,7 @@ async function querySummary(sheetId, query) {
     await normalizeMonthAmountSigns(sheetId, monthSheet);
     const rows = await readMonthRows(sheetId, monthSheet);
     return summaryText(
-      rows,
+      filterPermittedRows(rows, permission),
       query.farm,
       `${query.year}年${query.month}月收支`
     );
@@ -1183,14 +1231,14 @@ async function querySummary(sheetId, query) {
         d.day === Number(now.day);
     });
 
-    return summaryText(todayRows, query.farm, "今日收支");
+    return summaryText(filterPermittedRows(todayRows, permission), query.farm, "今日收支");
   }
 
   if (query.mode === "本月") {
     await ensureMonthSheet(sheetId, now.monthSheet);
     await normalizeMonthAmountSigns(sheetId, now.monthSheet);
     const rows = await readMonthRows(sheetId, now.monthSheet);
-    return summaryText(rows, query.farm, `${Number(now.month)}月收支`);
+    return summaryText(filterPermittedRows(rows, permission), query.farm, `${Number(now.month)}月收支`);
   }
 
   // 今年
@@ -1212,7 +1260,7 @@ async function querySummary(sheetId, query) {
     rows = rows.concat(await readMonthRows(sheetId, monthSheet));
   }
 
-  return summaryText(rows, query.farm, `${now.year}年收支`);
+  return summaryText(filterPermittedRows(rows, permission), query.farm, `${now.year}年收支`);
 }
 
 async function getProfileName(event) {
@@ -1326,41 +1374,43 @@ function formatDeletionEntry(e) {
     `填表人：${e.recorder}`, `記帳ID：${e.id}`].join("\n");
 }
 
-async function requestDeleteLast(sheetId, userId) {
+async function requestDeleteLast(sheetId, userId, permission) {
   const entry = await lastOwnEntry(sheetId, userId);
   if (!entry) return "目前沒有可刪除的本人記帳。舊資料沒有 LINE User ID，為安全起見不能透過此指令刪除。";
+  if (!canManageFarm(permission, entry.farm)) return "❌ 你沒有這個場別的刪除權限。";
   pendingDeletions.set(`${sheetId}:${userId}`, { id: entry.id, mode: "own-last", expiresAt: Date.now() + DELETE_CONFIRM_MS });
   return `⚠️ 即將永久刪除你最後寫入的記帳\n\n${formatDeletionEntry(entry)}\n\n請於5分鐘內輸入「確認刪除」，或輸入「取消」。\n此操作會真正移除月份分頁中的整列。`;
 }
 
-async function requestSelectedDelete(sheetId, userId, id) {
+async function requestSelectedDelete(sheetId, userId, id, permission) {
   if (!userId || !TX_ID_PATTERN.test(id)) return "❌ 記帳ID格式不正確。";
   const entries = await readAccountingLog(sheetId);
   const entry = entries.find(e => e.id.toLowerCase() === id.toLowerCase() &&
     e.userId === userId && e.status !== "已刪除" &&
     /^\d{6}月$/.test(e.month) && e.row >= 2);
   if (!entry) return "❌ 找不到本人可刪除的有效記帳；舊資料或其他人的帳不能刪除。";
+  if (!canManageFarm(permission, entry.farm)) return "❌ 你沒有這個場別的刪除權限。";
   pendingDeletions.set(`${sheetId}:${userId}`, {
     id: entry.id, mode: "selected", expiresAt: Date.now() + DELETE_CONFIRM_MS
   });
   return `⚠️ 即將永久刪除指定記帳\n\n${formatDeletionEntry(entry)}\n\n請於5分鐘內輸入「確認刪除」，或輸入「取消」。\n此操作會真正移除月份分頁中的整列。`;
 }
 
-async function requestDeleteByNumber(sheetId, userId, number) {
+async function requestDeleteByNumber(sheetId, userId, number, permission) {
   const snapshot = recentSnapshots.get(`${sheetId}:${userId}`);
   if (!snapshot || Date.now() > snapshot.expiresAt) {
     return "⚠️ 查詢清單已過期，請先輸入「最近10筆」再指定刪除。";
   }
   const id = snapshot.ids[number - 1];
   if (!id) return "❌ 這個編號沒有可刪除的本人記帳（舊帳或其他人記帳不可刪）。";
-  return requestSelectedDelete(sheetId, userId, id);
+  return requestSelectedDelete(sheetId, userId, id, permission);
 }
 
 function sheetCell(value) {
   return { userEnteredValue: typeof value === "number" ? { numberValue: value } : { stringValue: String(value) } };
 }
 
-async function confirmDeleteLast(sheetId, userId) {
+async function confirmDeleteLast(sheetId, userId, permission) {
   const key = `${sheetId}:${userId}`;
   const pending = pendingDeletions.get(key);
   pendingDeletions.delete(key); // 一次性確認，避免重送
@@ -1370,6 +1420,7 @@ async function confirmDeleteLast(sheetId, userId) {
   const entries = await readAccountingLog(sheetId);
   const entry = entries.find(e => e.id === pending.id && e.userId === userId && e.status !== "已刪除");
   if (!entry) return "❌ 找不到本人待刪除的有效記帳，已取消。";
+  if (!canManageFarm(permission, entry.farm)) return "❌ 你沒有這個場別的刪除權限。";
   if (pending.mode === "own-last") {
     const newest = await lastOwnEntry(sheetId, userId);
     if (!newest || newest.id !== entry.id) return "⚠️ 期間又有新記帳，請重新輸入「刪除上一筆」。";
@@ -1425,7 +1476,7 @@ async function confirmDeleteLast(sheetId, userId) {
   return `✅ 已永久刪除本人記帳\n\n${formatDeletionEntry(entry)}\n\n月份分頁已移除該列，系統日誌保留刪除狀態供日後中央同步。`;
 }
 
-async function recentTenText(sheetId, userId) {
+async function recentTenText(sheetId, userId, permission) {
   const sheets = await getSheets();
   const meta = await sheets.spreadsheets.get({
     spreadsheetId: sheetId,
@@ -1485,7 +1536,7 @@ async function recentTenText(sheetId, userId) {
     const row = (await monthRows(log.month)).find(r => r.row === log.row);
     if (!row) continue;
     used.add(key);
-    recent.push({ ...row, approximate: false, id: log.id, ownerId: log.userId });
+    if (canManageFarm(permission, row.farm)) recent.push({ ...row, approximate: false, id: log.id, ownerId: log.userId });
   }
 
   // 補齊沒有排序紀錄的舊資料。不能宣稱這些舊資料有精確寫入先後。
@@ -1497,7 +1548,7 @@ async function recentTenText(sheetId, userId) {
         const key = `${month}:${row.row}`;
         if (used.has(key)) continue;
         used.add(key);
-        recent.push({ ...row, approximate: true, id: "", ownerId: "" });
+        if (canManageFarm(permission, row.farm)) recent.push({ ...row, approximate: true, id: "", ownerId: "" });
       }
       if (recent.length >= 10) break;
     }
@@ -1562,28 +1613,31 @@ async function handleTextMessage(event) {
   }
 
   const targetSheetId = userSheet.sheetId;
+  // 先驗證權限，才允許讀寫、查詢或刪除帳本。
+  const permission = await resolvePermission(event.source?.userId || "");
+  if (permission.error) return permission.error;
 
   await ensureBaseStructure(targetSheetId);
 
   const userId = event.source?.userId || "";
-  if (text === "刪除上一筆") return await requestDeleteLast(targetSheetId, userId);
+  if (text === "刪除上一筆") return await requestDeleteLast(targetSheetId, userId, permission);
   const numberDelete = text.match(/^刪除第\s*(\d{1,2})\s*筆$/);
-  if (numberDelete) return await requestDeleteByNumber(targetSheetId, userId, Number(numberDelete[1]));
+  if (numberDelete) return await requestDeleteByNumber(targetSheetId, userId, Number(numberDelete[1]), permission);
   const idDelete = text.match(/^刪除\s+(TX-[0-9a-f-]+)$/i);
-  if (idDelete) return await requestSelectedDelete(targetSheetId, userId, idDelete[1]);
-  if (text === "確認刪除") return await confirmDeleteLast(targetSheetId, userId);
+  if (idDelete) return await requestSelectedDelete(targetSheetId, userId, idDelete[1], permission);
+  if (text === "確認刪除") return await confirmDeleteLast(targetSheetId, userId, permission);
   if (text === "取消") {
     pendingDeletions.delete(`${targetSheetId}:${userId}`);
     return "已取消刪除。";
   }
 
   if (text === "最近10筆") {
-    return await recentTenText(targetSheetId, userId);
+    return await recentTenText(targetSheetId, userId, permission);
   }
 
   const query = parseQuery(text);
   if (query) {
-    return await querySummary(targetSheetId, query);
+    return await querySummary(targetSheetId, query, permission);
   }
 
   const dated = parseOptionalDatePrefix(text);
@@ -1598,6 +1652,7 @@ async function handleTextMessage(event) {
   }
 
   if (expense) {
+    if (!canManageFarm(permission, expense.farm)) return "❌ 你沒有這個場別的記帳權限。";
     const userName = await getProfileName(event);
 
     await ensureMonthSheet(targetSheetId, dated.dateInfo.monthSheet);

@@ -855,13 +855,43 @@ async function parseCrossFarmCommand(text) {
     advanceTarget: ownerFarm };
 }
 
+// V2: 個人帳本 P/Q 欄只存帳務歸屬與付款場別，不更動 A:O 舊欄位。
+// 先檢查標題，避免覆蓋使用者自行放在 P/Q 的資料。
+async function ensurePersonalFarmColumns(sheetId, monthSheet) {
+  const sheets = await getSheets();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId, range: `'${monthSheet}'!A1:Q`,
+    valueRenderOption: "FORMATTED_VALUE"
+  });
+  const rows = res.data.values || [];
+  const expected = ["場別", "收支類型", "付款來源", "科目代號", "科目分類", "日期", "品項", "用途說明", "廠商名稱", "數量", "單價", "金額", "發票或憑證", "代墊對象", "填表人"];
+  if (expected.some((name, i) => String(rows[0]?.[i] || "").trim() !== name)) {
+    throw new Error("個人帳本 A:O 標題不符合預期，已停止寫入避免錯欄");
+  }
+  const p = String(rows[0]?.[15] || "").trim();
+  const q = String(rows[0]?.[16] || "").trim();
+  if ((p && p !== "帳務歸屬") || (q && q !== "付款場別")) {
+    throw new Error("個人帳本 P/Q 已有其他標題，已停止寫入避免覆蓋");
+  }
+  if ((!p || !q) && rows.slice(1).some(r => (!p && String(r[15] || "").trim()) || (!q && String(r[16] || "").trim()))) {
+    throw new Error("個人帳本 P/Q 有既有資料但缺少標題，已停止寫入避免覆蓋");
+  }
+  if (!p || !q) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: sheetId, range: `'${monthSheet}'!P1:Q1`,
+      valueInputOption: "RAW", requestBody: { values: [["帳務歸屬", "付款場別"]] }
+    });
+  }
+}
+
 async function writeExpense(sheetId, monthSheet, expense, dateText, userName, userId) {
   const sheets = await getSheets();
+  await ensurePersonalFarmColumns(sheetId, monthSheet);
 
   const txId = `TX-${randomUUID()}`;
   const appendResult = await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
-    range: `'${monthSheet}'!A:O`,
+    range: `'${monthSheet}'!A:Q`,
     valueInputOption: "USER_ENTERED",
     insertDataOption: "INSERT_ROWS",
     requestBody: {
@@ -881,6 +911,8 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName, us
         "",
         expense.advanceTarget || "",
         userName || "",
+        expense.farm,                 // P 帳務歸屬
+        expense.payerFarm || expense.farm, // Q 付款場別
       ]],
     },
   });
@@ -961,8 +993,8 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName, us
   } catch (formatErr) {
     console.warn("套用列顏色失敗，不影響記帳：", formatErr.message);
   }
-  let centralWarning = false;
-  if (!auditWarning) {
+  let centralWarning = !CENTRAL_SYNC_ENABLED;
+  if (!auditWarning && CENTRAL_SYNC_ENABLED) {
     try {
       await syncCentralCreate({ txId, dateText, expense, userName, sourceSheetId: sheetId, monthSheet });
     } catch (err) {
@@ -1694,8 +1726,8 @@ async function handleTextMessage(event) {
       `✅ ${expense.txType}記錄完成`,
       "",
       dated.isCustomDate ? "🗓️ 補登日期" : null,
-      `場別：${expense.farm}`,
-      expense.payerFarm ? `付款場別：${expense.payerFarm}` : null,
+      `帳務歸屬：${expense.farm}`,
+      `付款場別：${expense.payerFarm || expense.farm}`,
       `日期：${dated.dateInfo.dateText}`,
       `品項：${expense.accountItem}`,
       `用途：${expense.description}`,

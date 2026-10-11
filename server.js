@@ -7,6 +7,23 @@ const { randomUUID } = require("node:crypto");
 
 const app = express();
 
+// TESTING-only: never connect this build to production bookkeeping.
+if (process.env.APP_ENV !== "TESTING") {
+  throw new Error("此版本僅供 TESTING：請設定 APP_ENV=TESTING，不能部署至正式環境");
+}
+const TEST_ALLOWED_SHEET_IDS = new Set(
+  (process.env.TEST_ALLOWED_SHEET_IDS || "").split(",").map(x => x.trim()).filter(Boolean)
+);
+if (!TEST_ALLOWED_SHEET_IDS.size) {
+  throw new Error("請設定 TEST_ALLOWED_SHEET_IDS 為測試個人帳本 ID（逗號分隔）");
+}
+function assertTestingPersonalSheet(sheetId) {
+  if (!TEST_ALLOWED_SHEET_IDS.has(sheetId)) {
+    throw new Error("帳本不在 TEST_ALLOWED_SHEET_IDS，已阻止寫入／查詢；請確認這是測試帳本");
+  }
+}
+
+
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
@@ -20,28 +37,13 @@ const DEFAULT_SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const MASTER_SHEET_ID = process.env.TEST_USER_MASTER_SHEET_ID; // TESTING 專用，不讀正式 MASTER_SHEET_ID
 const ACCOUNT_MASTER_SHEET_ID = process.env.ACCOUNT_MASTER_SHEET_ID;
 const CENTRAL_SHEET_ID = process.env.CENTRAL_SHEET_ID;
+if (TEST_ALLOWED_SHEET_IDS.has(MASTER_SHEET_ID) ||
+    TEST_ALLOWED_SHEET_IDS.has(ACCOUNT_MASTER_SHEET_ID) ||
+    TEST_ALLOWED_SHEET_IDS.has(CENTRAL_SHEET_ID)) {
+  throw new Error("測試個人帳本白名單不能包含使用者主檔、科目主檔或中央流水帳 ID");
+}
 // TESTING 安全開關：只有明確設為 true 才會同步。
 const CENTRAL_SYNC_ENABLED = process.env.CENTRAL_SYNC_ENABLED === "true";
-
-// V2.1 TESTING guard: fail closed before the server starts.
-if (process.env.APP_ENV !== "TESTING") throw new Error("V2.1 僅允許 APP_ENV=TESTING");
-const TEST_ALLOWED_IDS = new Set((process.env.TEST_ALLOWED_SHEET_IDS || "").split(",").map(x => x.trim()).filter(Boolean));
-if (!TEST_ALLOWED_IDS.size || !DEFAULT_SHEET_ID || !TEST_ALLOWED_IDS.has(DEFAULT_SHEET_ID)) {
-  throw new Error("V2.1 必須設定測試帳本白名單，且 GOOGLE_SHEET_ID 必須在白名單內");
-}
-if (!MASTER_SHEET_ID || !ACCOUNT_MASTER_SHEET_ID || !CENTRAL_SHEET_ID || !CENTRAL_SYNC_ENABLED) {
-  throw new Error("V2.1 必須設定測試使用者、科目、中央主檔及啟用中央同步");
-}
-if ([MASTER_SHEET_ID, ACCOUNT_MASTER_SHEET_ID, CENTRAL_SHEET_ID].some(id => TEST_ALLOWED_IDS.has(id))) {
-  throw new Error("V2.1 主檔不得被列為個人記帳白名單");
-}
-if (new Set([MASTER_SHEET_ID, ACCOUNT_MASTER_SHEET_ID, CENTRAL_SHEET_ID]).size !== 3) {
-  throw new Error("V2.1 三份主檔必須分離");
-}
-function assertTestBook(sheetId) {
-  if (!TEST_ALLOWED_IDS.has(String(sheetId || "").trim())) throw new Error("拒絕操作非 TESTING 白名單帳本");
-}
-
 
 // ===== 場別 =====
 const FARM_ALIASES = {
@@ -545,99 +547,6 @@ async function ensureBaseStructure(sheetId) {
 }
 
 
-async function migrateMonthSheetColumns(sheetId, monthSheet) {
-  const sheets = await getSheets();
-
-  const desiredHeaders = [
-    "場別",
-    "收支類型",
-    "付款來源",
-    "科目代號",
-    "科目分類",
-    "日期",
-    "品項",
-    "用途說明",
-    "廠商名稱",
-    "數量",
-    "單價",
-    "金額",
-    "發票或憑證",
-    "代墊對象",
-    "填表人",
-  ];
-
-  const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: sheetId,
-    range: `'${monthSheet}'!A1:O`,
-    valueRenderOption: "FORMATTED_VALUE",
-  });
-
-  const values = result.data.values || [];
-  const currentHeaders = values[0] || [];
-
-  if (currentHeaders.join("|") === desiredHeaders.join("|")) {
-    return;
-  }
-
-  const oldHeaders = [
-    "場別",
-    "科目代號",
-    "科目分類",
-    "日期",
-    "品項",
-    "用途說明",
-    "廠商名稱",
-    "數量",
-    "單價",
-    "金額",
-    "發票或憑證",
-    "付款來源",
-    "收支類型",
-    "代墊對象",
-    "填表人",
-  ];
-
-  // 只有辨識到舊版欄位順序時才自動搬移，避免誤改其他格式。
-  const looksLikeOldLayout =
-    currentHeaders.slice(0, oldHeaders.length).join("|") === oldHeaders.join("|");
-
-  if (!looksLikeOldLayout) {
-    return;
-  }
-
-  const rows = values.slice(1).map(r => [
-    r[0] || "",   // 場別
-    r[12] || "支出", // 收支類型
-    r[11] || "",  // 付款來源
-    r[1] || "",   // 科目代號
-    r[2] || "",   // 科目分類
-    r[3] || "",   // 日期
-    r[4] || "",   // 品項
-    r[5] || "",   // 用途說明
-    r[6] || "",   // 廠商名稱
-    r[7] || "",   // 數量
-    r[8] || "",   // 單價
-    r[9] || "",   // 金額
-    r[10] || "",  // 發票或憑證
-    r[13] || "",  // 代墊對象
-    r[14] || "",  // 填表人
-  ]);
-
-  await sheets.spreadsheets.values.clear({
-    spreadsheetId: sheetId,
-    range: `'${monthSheet}'!A:O`,
-  });
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: sheetId,
-    range: `'${monthSheet}'!A1:O${Math.max(1, rows.length + 1)}`,
-    valueInputOption: "USER_ENTERED",
-    requestBody: {
-      values: [desiredHeaders, ...rows],
-    },
-  });
-}
-
 async function ensureMonthSheet(sheetId, monthSheet) {
   // 先確認分頁是否存在，避免對不存在的月份讀取 A1:O 而發生 400。
   // 已存在的月份完全不更動欄位或歷史資料。
@@ -651,24 +560,8 @@ async function ensureMonthSheet(sheetId, monthSheet) {
   );
   if (exists) return;
 
-  // 只在缺少月份時建立新分頁及原程式的欄位標題。
-  await ensureSheet(sheetId, monthSheet, [
-    "場別",
-    "收支類型",
-    "付款來源",
-    "科目代號",
-    "科目分類",
-    "日期",
-    "品項",
-    "用途說明",
-    "廠商名稱",
-    "數量",
-    "單價",
-    "金額",
-    "發票或憑證",
-    "代墊對象",
-    "填表人",
-  ]);
+  // 新月份建立 A=帳務歸屬、B=付款場別；不再建立舊 A:O 格式。
+  await ensureSheet(sheetId, monthSheet, PERSONAL_HEADERS);
 }
 
 async function parseExpenseCommand(text) {
@@ -875,32 +768,23 @@ async function parseCrossFarmCommand(text) {
     advanceTarget: ownerFarm };
 }
 
-// V2: 個人帳本 P/Q 欄只存帳務歸屬與付款場別，不更動 A:O 舊欄位。
-// 先檢查標題，避免覆蓋使用者自行放在 P/Q 的資料。
+// A 沿用原「場別」作為「帳務歸屬」；B 新插入「付款場別」。
+// 原本 B:O 順延至 C:P，舊 P/Q 僅保留在 Q/R 供人工核對，不參與新記帳。
+const PERSONAL_HEADERS = [
+  "帳務歸屬", "付款場別", "收支類型", "付款來源", "科目代號",
+  "科目分類", "日期", "品項", "用途說明", "廠商名稱",
+  "數量", "單價", "金額", "發票或憑證", "代墊對象", "填表人"
+];
+
 async function ensurePersonalFarmColumns(sheetId, monthSheet) {
   const sheets = await getSheets();
   const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: sheetId, range: `'${monthSheet}'!A1:Q`,
+    spreadsheetId: sheetId, range: `'${monthSheet}'!A1:R1`,
     valueRenderOption: "FORMATTED_VALUE"
   });
-  const rows = res.data.values || [];
-  const expected = ["場別", "收支類型", "付款來源", "科目代號", "科目分類", "日期", "品項", "用途說明", "廠商名稱", "數量", "單價", "金額", "發票或憑證", "代墊對象", "填表人"];
-  if (expected.some((name, i) => String(rows[0]?.[i] || "").trim() !== name)) {
-    throw new Error("個人帳本 A:O 標題不符合預期，已停止寫入避免錯欄");
-  }
-  const p = String(rows[0]?.[15] || "").trim();
-  const q = String(rows[0]?.[16] || "").trim();
-  if ((p && p !== "帳務歸屬") || (q && q !== "付款場別")) {
-    throw new Error("個人帳本 P/Q 已有其他標題，已停止寫入避免覆蓋");
-  }
-  if ((!p || !q) && rows.slice(1).some(r => (!p && String(r[15] || "").trim()) || (!q && String(r[16] || "").trim()))) {
-    throw new Error("個人帳本 P/Q 有既有資料但缺少標題，已停止寫入避免覆蓋");
-  }
-  if (!p || !q) {
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: sheetId, range: `'${monthSheet}'!P1:Q1`,
-      valueInputOption: "RAW", requestBody: { values: [["帳務歸屬", "付款場別"]] }
-    });
+  const headers = res.data.values?.[0] || [];
+  if (PERSONAL_HEADERS.some((name, i) => String(headers[i] || "").trim() !== name)) {
+    throw new Error(`月份 ${monthSheet} 尚未搬移成 A=帳務歸屬、B=付款場別。已停止寫入，避免錯欄。`);
   }
 }
 
@@ -911,28 +795,27 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName, us
   const txId = `TX-${randomUUID()}`;
   const appendResult = await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
-    range: `'${monthSheet}'!A:Q`,
+    range: `'${monthSheet}'!A:P`,
     valueInputOption: "USER_ENTERED",
     insertDataOption: "INSERT_ROWS",
     requestBody: {
       values: [[
-        expense.farm,
-        expense.txType || "支出",
-        expense.paymentSource || "",
-        expense.code,
-        expense.className,
-        dateText,
-        expense.accountItem,
-        expense.description,
-        expense.vendor,
-        expense.qty,
-        expense.unitPrice,
-        expense.txType === "收入" ? -Math.abs(expense.amount) : Math.abs(expense.amount),
-        "",
-        expense.advanceTarget || "",
-        userName || "",
-        expense.farm,                 // P 帳務歸屬
-        expense.payerFarm || expense.farm, // Q 付款場別
+        expense.farm,                                  // A 帳務歸屬
+        expense.payerFarm || expense.farm,             // B 付款場別
+        expense.txType || "支出",                      // C 收支類型
+        expense.paymentSource || "",                  // D 付款來源
+        expense.code,                                 // E 科目代號
+        expense.className,                            // F 科目分類
+        dateText,                                     // G 日期
+        expense.accountItem,                          // H 品項
+        expense.description,                          // I 用途說明
+        expense.vendor,                               // J 廠商名稱
+        expense.qty,                                  // K 數量
+        expense.unitPrice,                            // L 單價
+        expense.txType === "收入" ? -Math.abs(expense.amount) : Math.abs(expense.amount), // M 金額
+        "",                                           // N 發票或憑證
+        expense.advanceTarget || "",                  // O 代墊對象
+        userName || "",                               // P 填表人
       ]],
     },
   });
@@ -996,7 +879,7 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName, us
                   startRowIndex: rowNumber - 1,
                   endRowIndex: rowNumber,
                   startColumnIndex: 0,
-                  endColumnIndex: 15,
+                  endColumnIndex: 16,
                 },
                 cell: {
                   userEnteredFormat: {
@@ -1050,7 +933,7 @@ async function readMonthRows(sheetId, monthSheet) {
   const headers = values[0] || [];
 
   // 不再假設固定欄位位置，直接依標題找欄位。
-  const iFarm = headerIndex(headers, ["場別"]);
+  const iFarm = headerIndex(headers, ["帳務歸屬", "場別"]);
   const iType = headerIndex(headers, ["收支類型"]);
   const iPayment = headerIndex(headers, ["付款來源"]);
   const iCode = headerIndex(headers, ["科目代號"]);
@@ -1388,7 +1271,7 @@ function helpText() {
 }
 
 
-// 最近10筆專用：獨立記錄分頁，不改動每月 A～O 15 欄。
+// 最近10筆專用：獨立記錄分頁，不改動每月的月帳本欄位。
 const RECENT_LOG_TAB = "系統記帳順序";
 const RECENT_LOG_HEADERS = ["寫入時間UTC", "月份分頁", "列號", "場別", "收支類型", "品項", "金額", "填表人", "記帳ID", "LINE User ID", "狀態", "刪除時間UTC"];
 
@@ -1507,18 +1390,18 @@ async function confirmDeleteLast(sheetId, userId) {
   const logTab = tabs.find(t => t.title === RECENT_LOG_TAB);
   if (!monthTab || !logTab) return "❌ 分頁不存在，未執行刪除。";
   const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: sheetId, range: `'${entry.month}'!A${entry.row}:O${entry.row}`,
+    spreadsheetId: sheetId, range: `'${entry.month}'!A${entry.row}:R${entry.row}`,
     valueRenderOption: "FORMATTED_VALUE"
   });
   const row = result.data.values?.[0] || [];
   const headResult = await sheets.spreadsheets.values.get({
-    spreadsheetId: sheetId, range: `'${entry.month}'!A1:O1`,
+    spreadsheetId: sheetId, range: `'${entry.month}'!A1:R1`,
     valueRenderOption: "FORMATTED_VALUE"
   });
   const headers = headResult.data.values?.[0] || [];
   const value = (name) => { const i = headerIndex(headers, [name]); return i >= 0 ? String(row[i] || "").trim() : ""; };
   const rowAmount = Number(value("金額").replace(/,/g, ""));
-  if (!row.length || value("場別") !== entry.farm ||
+  if (!row.length || (value("帳務歸屬") || value("場別")) !== entry.farm ||
       (value("收支類型") || "支出") !== entry.txType || value("品項") !== entry.item ||
       Math.abs(rowAmount) !== Math.abs(entry.amount) || value("填表人") !== entry.recorder) {
     return "❌ 月份分頁資料與記帳紀錄不一致，為避免刪錯帳已停止。請人工檢查。";
@@ -1586,7 +1469,7 @@ async function recentTenText(sheetId, userId) {
   async function monthRows(month) {
     if (byMonth.has(month)) return byMonth.get(month);
     const result = await sheets.spreadsheets.values.get({
-      spreadsheetId: sheetId, range: `'${month}'!A1:O`,
+      spreadsheetId: sheetId, range: `'${month}'!A1:R`,
       valueRenderOption: "FORMATTED_VALUE",
     });
     const values = result.data.values || [];
@@ -1694,7 +1577,7 @@ async function handleTextMessage(event) {
   }
 
   const targetSheetId = userSheet.sheetId;
-  assertTestBook(targetSheetId);
+  assertTestingPersonalSheet(targetSheetId);
 
   await ensureBaseStructure(targetSheetId);
 
@@ -1728,10 +1611,6 @@ async function handleTextMessage(event) {
 
   if (expense?.error) {
     return `❌ ${expense.error}`;
-  }
-
-  if (expense?.payerFarm && expense.payerFarm !== expense.farm) {
-    return "⚠️ V2.1 安全測試版暫停跨場代付：雙帳本配對與權限檢查尚未完成，未寫入任何資料。";
   }
 
   if (expense) {
@@ -1808,25 +1687,9 @@ app.get("/", (req, res) => {
   res.send("Chicken Farm Accounting Bot - Simplified Income Expense + Keyword Master Version is running.");
 });
 
-// In-process duplicate protection only; restart/multiple Render instances need durable event ledger.
-const seenEvents = new Map();
-let webhookQueue = Promise.resolve();
-async function processWebhookEvents(events) {
-  for (const event of events) {
-    const key = event.webhookEventId || event.message?.id;
-    if (key && seenEvents.has(key)) continue;
-    if (key) seenEvents.set(key, Date.now());
-    try { await handleEvent(event); }
-    catch (e) { if (key) seenEvents.delete(key); throw e; }
-  }
-  const cutoff = Date.now() - 24 * 3600 * 1000;
-  for (const [key, time] of seenEvents) if (time < cutoff) seenEvents.delete(key);
-}
 app.post("/webhook", line.middleware(config), async (req, res) => {
   try {
-    const job = webhookQueue.then(() => processWebhookEvents(req.body.events));
-    webhookQueue = job.catch(err => console.error("Webhook queue error", err));
-    await job;
+    await Promise.all(req.body.events.map(handleEvent));
     res.status(200).end();
   } catch (err) {
     console.error("Webhook Error:", err);

@@ -783,8 +783,13 @@ async function ensurePersonalFarmColumns(sheetId, monthSheet) {
     valueRenderOption: "FORMATTED_VALUE"
   });
   const headers = res.data.values?.[0] || [];
-  if (PERSONAL_HEADERS.some((name, i) => String(headers[i] || "").trim() !== name)) {
-    throw new Error(`月份 ${monthSheet} 尚未搬移成 A=帳務歸屬、B=付款場別。已停止寫入，避免錯欄。`);
+  const normalizeHeader = v => String(v ?? "").replace(/^\uFEFF/, "").replace(/[\s\u200B-\u200D\u2060]/g, "").trim();
+  const mismatches = PERSONAL_HEADERS.map((expected, i) => ({
+    column: columnLetter(i + 1), expected, actual: String(headers[i] ?? "").trim()
+  })).filter(x => normalizeHeader(x.expected) !== normalizeHeader(x.actual));
+  if (mismatches.length) {
+    const detail = mismatches.map(x => `${x.column}欄應為「${x.expected}」，目前為「${x.actual || "空白"}」`).join("；");
+    throw new Error(`月份 ${monthSheet} 欄位檢查未通過：${detail}。已停止寫入，請勿自行插欄或重複送出。`);
   }
 }
 
@@ -1165,7 +1170,6 @@ async function querySummary(sheetId, query) {
       ].join("\n");
     }
 
-    await normalizeMonthAmountSigns(sheetId, monthSheet);
     const rows = await readMonthRows(sheetId, monthSheet);
     return summaryText(
       rows,
@@ -1175,8 +1179,9 @@ async function querySummary(sheetId, query) {
   }
 
   if (query.mode === "今天") {
-    await ensureMonthSheet(sheetId, now.monthSheet);
-    await normalizeMonthAmountSigns(sheetId, now.monthSheet);
+    const sheets = await getSheets();
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: "sheets.properties.title" });
+    if (!(meta.data.sheets || []).some(x => x.properties.title === now.monthSheet)) return summaryText([], query.farm, "今日收支");
     const rows = await readMonthRows(sheetId, now.monthSheet);
 
     const todayRows = rows.filter(r => {
@@ -1191,8 +1196,9 @@ async function querySummary(sheetId, query) {
   }
 
   if (query.mode === "本月") {
-    await ensureMonthSheet(sheetId, now.monthSheet);
-    await normalizeMonthAmountSigns(sheetId, now.monthSheet);
+    const sheets = await getSheets();
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: "sheets.properties.title" });
+    if (!(meta.data.sheets || []).some(x => x.properties.title === now.monthSheet)) return summaryText([], query.farm, `${Number(now.month)}月收支`);
     const rows = await readMonthRows(sheetId, now.monthSheet);
     return summaryText(rows, query.farm, `${Number(now.month)}月收支`);
   }
@@ -1212,7 +1218,6 @@ async function querySummary(sheetId, query) {
   let rows = [];
 
   for (const monthSheet of monthSheets) {
-    await normalizeMonthAmountSigns(sheetId, monthSheet);
     rows = rows.concat(await readMonthRows(sheetId, monthSheet));
   }
 
@@ -1614,6 +1619,9 @@ async function handleTextMessage(event) {
   }
 
   if (expense) {
+    if (expense.payerFarm && expense.payerFarm !== expense.farm) {
+      return "⚠️ 測試版暫停跨場代付：目前尚未完成付款場與歸屬場雙帳本同步，避免只記入其中一本。一般支出與收入可正常測試。";
+    }
     const userName = await getProfileName(event);
 
     await ensureMonthSheet(targetSheetId, dated.dateInfo.monthSheet);
@@ -1674,7 +1682,9 @@ async function handleEvent(event) {
         replyToken: event.replyToken,
         messages: [{
           type: "text",
-          text: "❌ 系統發生錯誤，請稍後再試。",
+          text: /^月份 \d{6}月 欄位檢查未通過：/.test(err.message)
+            ? `❌ ${err.message}`.slice(0, 4800)
+            : "❌ 系統發生錯誤，請稍後再試。",
         }],
       });
     } catch (_) {}
@@ -1687,9 +1697,29 @@ app.get("/", (req, res) => {
   res.send("Chicken Farm Accounting Bot - Simplified Income Expense + Keyword Master Version is running.");
 });
 
+// Single-instance, in-memory webhook deduplication. For multi-instance deployments,
+// use a persistent idempotency store before enabling real accounting.
+const processedWebhookEvents = new Map();
+let webhookSerialQueue = Promise.resolve();
+async function processWebhookEvents(events) {
+  for (const event of events || []) {
+    const id = event.webhookEventId || event.message?.id;
+    if (id && processedWebhookEvents.has(id)) continue;
+    const result = await handleEvent(event);
+    if (id && result === "OK") {
+      processedWebhookEvents.set(id, Date.now());
+      if (processedWebhookEvents.size > 2000) {
+        const oldest = processedWebhookEvents.keys().next().value;
+        processedWebhookEvents.delete(oldest);
+      }
+    }
+  }
+}
 app.post("/webhook", line.middleware(config), async (req, res) => {
+  const task = webhookSerialQueue.then(() => processWebhookEvents(req.body.events));
+  webhookSerialQueue = task.catch(err => console.error("Webhook queue error:", err));
   try {
-    await Promise.all(req.body.events.map(handleEvent));
+    await task;
     res.status(200).end();
   } catch (err) {
     console.error("Webhook Error:", err);

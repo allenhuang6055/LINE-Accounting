@@ -16,77 +16,12 @@ const client = new line.messagingApi.MessagingApiClient({
   channelAccessToken: config.channelAccessToken,
 });
 
-// ===== MAIN 候選版的 TESTING 專用隔離層 =====
-// 啟動前先檢查環境；不依賴正式 MASTER_SHEET_ID 或正式科目主檔。
-if (process.env.APP_ENV !== "TESTING") {
-  throw new Error("安全停止：本檔只能在 APP_ENV=TESTING 啟動，不得部署 MAIN");
-}
-const TEST_MASTER_SHEET_ID = String(process.env.TEST_USER_MASTER_SHEET_ID || "").trim();
-const TEST_ALLOWED_SHEET_IDS = new Set(String(process.env.TEST_ALLOWED_SHEET_IDS || "")
-  .split(",").map(s => s.trim()).filter(Boolean));
-const PRODUCTION_MASTER_ID = String(process.env.MASTER_SHEET_ID || "").trim();
-const PRODUCTION_ACCOUNT_ID = String(process.env.ACCOUNT_MASTER_SHEET_ID || "").trim();
-if (!TEST_MASTER_SHEET_ID || !TEST_ALLOWED_SHEET_IDS.size) {
-  throw new Error("安全停止：缺少 TEST_USER_MASTER_SHEET_ID 或 TEST_ALLOWED_SHEET_IDS");
-}
-const PROTECTED_IDS = [TEST_MASTER_SHEET_ID, PRODUCTION_MASTER_ID, PRODUCTION_ACCOUNT_ID].filter(Boolean);
-if ((PRODUCTION_MASTER_ID && TEST_MASTER_SHEET_ID === PRODUCTION_MASTER_ID) ||
-    (PRODUCTION_ACCOUNT_ID && TEST_MASTER_SHEET_ID === PRODUCTION_ACCOUNT_ID) ||
-    PROTECTED_IDS.some(id => TEST_ALLOWED_SHEET_IDS.has(id))) {
-  throw new Error("安全停止：測試帳本白名單與中央主控表或正式科目主檔衝突");
-}
-// 測試版不讀取正式科目主檔，改用原 MAIN 程式內建的科目對照。
-const DEFAULT_SHEET_ID = null;
-const MASTER_SHEET_ID = TEST_MASTER_SHEET_ID;
-const ACCOUNT_MASTER_SHEET_ID = null;
-
-function assertTestSheetAccess(sheetId, operation) {
-  const id = String(sheetId || "").trim();
-  const isTestMaster = id === TEST_MASTER_SHEET_ID;
-  const isTestBook = TEST_ALLOWED_SHEET_IDS.has(id);
-  if (!id || (!isTestMaster && !isTestBook)) {
-    throw new Error("TESTING 安全阻擋：禁止存取未核准的 Google Sheet ID");
-  }
-  if (operation !== "get" && isTestMaster) {
-    throw new Error("TESTING 安全阻擋：禁止寫入測試中央主控表");
-  }
-}
-
-// 在 Google Sheets API 邊界強制檢查每次讀寫的 spreadsheetId，
-// 不只依賴中央查帳路由，連原 MAIN 的記帳/刪除指令也受隔離限制。
-function guardTestSheetsApi(api) {
-  // 不對 googleapis Resource$Sheets 建立 Proxy：spreadsheets 是不可配置的唯讀屬性，
-  // Proxy 攔截回傳替代物件會觸發 JS invariant TypeError。
-  // 改回傳獨立 facade，僅開放明確列出的 Sheets API 方法。
-  const resource = api.spreadsheets;
-  const values = resource.values;
-  function wrap(target, method, operation) {
-    if (typeof target[method] !== "function") {
-      throw new Error(`TESTING 安全停止：Google Sheets API 缺少 ${method}`);
-    }
-    return (args, ...rest) => {
-      assertTestSheetAccess(args?.spreadsheetId, operation);
-      return target[method].call(target, args, ...rest);
-    };
-  }
-  const guardedValues = Object.freeze({
-    get: wrap(values, "get", "get"),
-    batchGet: wrap(values, "batchGet", "get"),
-    append: wrap(values, "append", "write"),
-    update: wrap(values, "update", "write"),
-    batchUpdate: wrap(values, "batchUpdate", "write"),
-    clear: wrap(values, "clear", "write"),
-    batchClear: wrap(values, "batchClear", "write"),
-  });
-  const guardedSpreadsheets = Object.freeze({
-    values: guardedValues,
-    get: wrap(resource, "get", "get"),
-    getByDataFilter: wrap(resource, "getByDataFilter", "get"),
-    batchUpdate: wrap(resource, "batchUpdate", "write"),
-    // create 不使用 spreadsheetId，不能以 ID 白名單安全驗證，故不開放。
-  });
-  return Object.freeze({ spreadsheets: guardedSpreadsheets });
-}
+const DEFAULT_SHEET_ID = process.env.GOOGLE_SHEET_ID;
+const MASTER_SHEET_ID = process.env.TEST_USER_MASTER_SHEET_ID; // TESTING 專用，不讀正式 MASTER_SHEET_ID
+const ACCOUNT_MASTER_SHEET_ID = process.env.ACCOUNT_MASTER_SHEET_ID;
+const CENTRAL_SHEET_ID = process.env.CENTRAL_SHEET_ID;
+// TESTING 安全開關：只有明確設為 true 才會同步。
+const CENTRAL_SYNC_ENABLED = process.env.CENTRAL_SYNC_ENABLED === "true";
 
 // ===== 場別 =====
 const FARM_ALIASES = {
@@ -232,7 +167,7 @@ function getGoogleAuth() {
 }
 
 async function getSheets() {
-  return guardTestSheetsApi(google.sheets({ version: "v4", auth: getGoogleAuth() }));
+  return google.sheets({ version: "v4", auth: getGoogleAuth() });
 }
 
 function taipeiNow() {
@@ -475,17 +410,9 @@ async function getMasterSheetTitle() {
 async function resolveUserSheet(event) {
   const userId = event.source?.userId || "";
 
-  // 如果尚未設定主檔，暫時沿用原本單人版 Sheet。
+  // TESTING 安全規則：未設定測試主檔時，禁止退回預設帳本。
   if (!MASTER_SHEET_ID) {
-    if (!DEFAULT_SHEET_ID) {
-      throw new Error("缺少 MASTER_SHEET_ID 與 GOOGLE_SHEET_ID");
-    }
-
-    return {
-      sheetId: DEFAULT_SHEET_ID,
-      name: await getProfileName(event),
-      source: "default",
-    };
+    throw new Error("TESTING 缺少 TEST_USER_MASTER_SHEET_ID，已停止記帳以避免誤寫正式帳本");
   }
 
   if (!userId) {
@@ -530,9 +457,6 @@ async function resolveUserSheet(event) {
     return {
       error: `❌ ${name} 尚未設定 Google Sheet ID。`,
     };
-  }
-  if (!TEST_ALLOWED_SHEET_IDS.has(sheetId)) {
-    return { error: "❌ TESTING 安全阻擋：此帳號未綁定核准的測試帳本。" };
   }
 
   return {
@@ -844,9 +768,97 @@ async function parseExpenseCommand(text) {
   };
 }
 
+// ===== TESTING：中央流水帳同步（只同步新寫入交易） =====
+const CENTRAL_TAB = "中央流水帳";
+const CENTRAL_HEADERS = ["交易ID", "日期", "帳務歸屬", "付款場別", "收支類型", "付款來源", "科目代號", "科目分類", "品項", "用途說明", "廠商名稱", "數量", "單價", "金額", "發票或憑證", "代墊對象", "填表人", "來源記帳本ID", "來源月份", "同步時間", "同步狀態", "是否代付", "代付交易ID"];
+
+async function centralSheets() {
+  if (!CENTRAL_SYNC_ENABLED) return null;
+  if (!CENTRAL_SHEET_ID) throw new Error("TESTING 缺少 CENTRAL_SHEET_ID");
+  return getSheets();
+}
+
+async function centralRows(sheets) {
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: CENTRAL_SHEET_ID, range: `'${CENTRAL_TAB}'!A1:W`,
+    valueRenderOption: "FORMATTED_VALUE"
+  });
+  const values = result.data.values || [];
+  if (CENTRAL_HEADERS.some((name, i) => String(values[0]?.[i] || "").trim() !== name)) {
+    throw new Error("中央流水帳 A:W 標題不符合預期，為避免寫錯欄位已停止同步");
+  }
+  return values;
+}
+
+async function syncCentralCreate({ txId, dateText, expense, userName, sourceSheetId, monthSheet }) {
+  const sheets = await centralSheets();
+  if (!sheets) return "disabled";
+  const values = await centralRows(sheets);
+  const existing = values.slice(1).filter(r => String(r[0] || "") === txId);
+  if (existing.length > 1) throw new Error(`中央交易 ID 重複：${txId}`);
+  if (existing.length === 1) return "exists";
+  const payer = expense.payerFarm || expense.farm;
+  const isAdvance = payer !== expense.farm && expense.txType === "支出";
+  const row = [txId, dateText, expense.farm, payer, expense.txType || "支出",
+    expense.paymentSource || "", expense.code || "", expense.className || "",
+    expense.accountItem || "", expense.description || "", expense.vendor || "",
+    expense.qty, expense.unitPrice, Math.abs(expense.amount), "",
+    isAdvance ? expense.farm : "", userName || "", sourceSheetId, monthSheet,
+    new Date().toISOString(), "有效", isAdvance ? "是" : "否", isAdvance ? txId : ""];
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: CENTRAL_SHEET_ID, range: `'${CENTRAL_TAB}'!A:W`,
+    valueInputOption: "USER_ENTERED", insertDataOption: "INSERT_ROWS",
+    requestBody: { values: [row] }
+  });
+  return "created";
+}
+
+async function syncCentralDeleted(txId) {
+  const sheets = await centralSheets();
+  if (!sheets) return "disabled";
+  const values = await centralRows(sheets);
+  const matches = [];
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][0] || "") === txId) matches.push(i + 1);
+  }
+  if (matches.length > 1) throw new Error(`中央交易 ID 重複：${txId}`);
+  if (!matches.length) return "missing"; // 不創造沒有原交易的刪除列
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: CENTRAL_SHEET_ID,
+    range: `'${CENTRAL_TAB}'!U${matches[0]}`,
+    valueInputOption: "RAW", requestBody: { values: [["已刪除"]] }
+  });
+  return "deleted";
+}
+
+// 代付：付款場別幫帳務歸屬場別支付，費用仍只算歸屬場別一次。
+async function parseCrossFarmCommand(text) {
+  const clean = String(text || "").trim().replace(/\s+/g, " ");
+  const match = clean.match(/^(\S+?)幫(\S+)\s+([\d,]+(?:\.\d+)?)\s+(.+)$/);
+  if (!match) return null;
+  const payerFarm = farmFromToken(match[1]);
+  const ownerFarm = farmFromToken(match[2]);
+  if (!payerFarm || !ownerFarm || payerFarm === "全部" || ownerFarm === "全部")
+    return { error: "代付場別不正確，例：草湖幫埤北 56000 租金" };
+  if (payerFarm === ownerFarm) return { error: "同一場別請用一般支出指令" };
+  const amount = parseAmount(match[3]);
+  if (!Number.isFinite(amount) || amount <= 0) return { error: "代付金額不正確" };
+  let description = match[4].trim();
+  let vendor = "";
+  const vendorMatch = description.match(/^(.+?)\s*[\/｜|]\s*(.+)$/);
+  if (vendorMatch) { description = vendorMatch[1].trim(); vendor = vendorMatch[2].trim(); }
+  const selected = await autoChooseItem(description);
+  if (!selected) return { error: "找不到會計科目" };
+  return { farm: ownerFarm, payerFarm, txType: "支出", paymentSource: "雞場帳戶",
+    qty: 1, unitPrice: amount, amount, accountItem: selected.item,
+    code: selected.code, className: selected.className, description, vendor,
+    advanceTarget: ownerFarm };
+}
+
 async function writeExpense(sheetId, monthSheet, expense, dateText, userName, userId) {
   const sheets = await getSheets();
 
+  const txId = `TX-${randomUUID()}`;
   const appendResult = await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
     range: `'${monthSheet}'!A:O`,
@@ -882,7 +894,7 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName, us
     const rowNumber = rowMatch ? Number(rowMatch[1]) : null;
     if (!rowNumber) throw new Error("Google Sheets 未回傳寫入列號");
     await appendAccountingLog(sheetId, {
-      id: `TX-${randomUUID()}`, userId: userId || "",
+      id: txId, userId: userId || "",
       timestamp: new Date().toISOString(), monthSheet, rowNumber,
       farm: expense.farm, txType: expense.txType || "支出",
       item: expense.accountItem, amount: expense.amount, recorder: userName || "",
@@ -949,7 +961,18 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName, us
   } catch (formatErr) {
     console.warn("套用列顏色失敗，不影響記帳：", formatErr.message);
   }
-  return { auditWarning };
+  let centralWarning = false;
+  if (!auditWarning) {
+    try {
+      await syncCentralCreate({ txId, dateText, expense, userName, sourceSheetId: sheetId, monthSheet });
+    } catch (err) {
+      centralWarning = true;
+      console.error("個人帳本已寫入，但中央同步失敗（請勿重複記帳）：", txId, err.message);
+    }
+  } else if (CENTRAL_SYNC_ENABLED) {
+    centralWarning = true;
+  }
+  return { auditWarning, centralWarning, txId };
 }
 
 function headerIndex(headers, names) {
@@ -1279,6 +1302,9 @@ function helpText() {
     "草湖 支出 500 電風扇 / 三豐",
     "草湖 零 支出 500 電風扇 / 三豐",
     "",
+    "【跨場代付】",
+    "草湖幫埤北 56000 租金",
+    "",
     "【收入】",
     "仁愛 收入 5000 雞蛋銷售 / 客戶",
     "",
@@ -1468,7 +1494,15 @@ async function confirmDeleteLast(sheetId, userId) {
     }
   }
   await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody: { requests } });
-  return `✅ 已永久刪除本人記帳\n\n${formatDeletionEntry(entry)}\n\n月份分頁已移除該列，系統日誌保留刪除狀態供日後中央同步。`;
+  let centralDeleteWarning = false;
+  try {
+    const result = await syncCentralDeleted(entry.id);
+    if (result === "missing") centralDeleteWarning = true;
+  } catch (err) {
+    centralDeleteWarning = true;
+    console.error("本地刪除成功，但中央刪除同步失敗：", entry.id, err.message);
+  }
+  return `✅ 已永久刪除本人記帳\n\n${formatDeletionEntry(entry)}\n\n月份分頁已移除該列，系統日誌保留刪除狀態供日後中央同步。${centralDeleteWarning ? "\n⚠️ 中央同步未完成，請通知管理者，勿重複刪除。" : ""}`;
 }
 
 async function recentTenText(sheetId, userId) {
@@ -1578,142 +1612,6 @@ async function recentTenText(sheetId, userId) {
   return lines.join("\n");
 }
 
-
-// ===== 中央查帳正式候選版：唯讀，預設關閉 =====
-// 不提供「中央 同步」，不修改任何來源帳本或主控表。
-const CENTRAL_READONLY_ENABLED = true; // TESTING 專用：中央唯讀查帳開啟
-const CENTRAL_ALLOWED_SHEET_IDS = TEST_ALLOWED_SHEET_IDS; // 沿用既有測試白名單
-
-function centralRequireConfig() {
-  if (!CENTRAL_READONLY_ENABLED) return false;
-  if (!MASTER_SHEET_ID || CENTRAL_ALLOWED_SHEET_IDS.size === 0) {
-    throw new Error("中央查帳未設定正式主控表或核准帳本清單");
-  }
-  if (CENTRAL_ALLOWED_SHEET_IDS.has(MASTER_SHEET_ID) ||
-      (ACCOUNT_MASTER_SHEET_ID && CENTRAL_ALLOWED_SHEET_IDS.has(ACCOUNT_MASTER_SHEET_ID))) {
-    throw new Error("中央查帳白名單不得包含主控表或科目主檔");
-  }
-  return true;
-}
-
-async function centralReadTab(range) {
-  const sheets = await getSheets();
-  const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: MASTER_SHEET_ID, range, valueRenderOption: "FORMATTED_VALUE"
-  });
-  return result.data.values || [];
-}
-
-async function centralIsAdmin(userId) {
-  if (!userId) return false;
-  const rows = await centralReadTab("'權限設定'!A2:D");
-  const matches = rows.filter(r => String(r[0] || "").trim() === userId);
-  if (matches.length !== 1) return false; // 權限重複時拒絕
-  const r = matches[0];
-  return String(r[1] || "").trim().toUpperCase() === "ADMIN" &&
-    String(r[2] || "").trim().toUpperCase() === "ALL" &&
-    ["Y", "YES", "TRUE", "1", "啟用"].includes(String(r[3] || "").trim().toUpperCase());
-}
-
-function centralParseCommand(text) {
-  if (text === "中央 本月" || text === "中央 場別統計" || text === "中央 今日明細") {
-    return { month: taipeiNow().monthSheet, mode: text };
-  }
-  const match = text.match(/^中央\s+(\d{4})(\d{2})$/);
-  if (match && Number(match[2]) >= 1 && Number(match[2]) <= 12) {
-    return { month: `${match[1]}${match[2]}月`, mode: "中央 指定月份" };
-  }
-  return null;
-}
-
-function centralTotals(rows) {
-  const valid = rows.filter(r => ["收入", "支出"].includes(r.txType || "支出"));
-  const expense = valid.filter(r => (r.txType || "支出") === "支出")
-    .reduce((sum, r) => sum + Math.abs(r.amount), 0);
-  const income = valid.filter(r => r.txType === "收入")
-    .reduce((sum, r) => sum + Math.abs(r.amount), 0);
-  return { expense, income, net: expense - income, count: valid.length };
-}
-
-async function centralReadOnlyQuery(text, userId) {
-  if (!centralRequireConfig()) return "❌ 中央查帳尚未開放。";
-  if (!(await centralIsAdmin(userId))) return "❌ 僅授權管理員可使用中央查帳。";
-  const cmd = centralParseCommand(text);
-  if (!cmd) return "中央唯讀指令：中央 本月／中央 202609／中央 今日明細／中央 場別統計（不支援中央 同步）";
-
-  const users = (await centralReadTab("'使用者名單'!A2:F")).map(r => ({
-    name: String(r[0] || "").trim() || "未命名帳本",
-    sheetId: String(r[3] || "").trim(),
-    enabled: ["Y", "YES", "TRUE", "1", "啟用"].includes(String(r[4] || "").trim().toUpperCase())
-  })).filter(u => u.enabled && u.sheetId);
-
-  const unique = new Map();
-  for (const u of users) {
-    if (CENTRAL_ALLOWED_SHEET_IDS.has(u.sheetId) && !unique.has(u.sheetId)) {
-      unique.set(u.sheetId, u.name);
-    }
-  }
-  if (!unique.size) return "❌ 尚無核准的正式帳本，中央查帳已停止。";
-
-  const sheets = await getSheets();
-  const rows = [], failures = [];
-  for (const [sheetId, owner] of unique) {
-    try {
-      const meta = await sheets.spreadsheets.get({
-        spreadsheetId: sheetId, fields: "sheets.properties.title"
-      });
-      const exists = (meta.data.sheets || []).some(s => s.properties.title === cmd.month);
-      if (!exists) {
-        failures.push(`${owner}（缺少 ${cmd.month} 分頁）`);
-        continue;
-      }
-      // 僅讀取；不可使用 querySummary()，其內含 normalizeMonthAmountSigns() 寫入流程。
-      // readMonthRows() 為原 MAIN 的純讀取解析器，沿用原有欄位邏輯。
-      const items = await readMonthRows(sheetId, cmd.month);
-      for (const r of items) rows.push({ ...r, owner });
-    } catch (e) {
-      console.warn("中央查帳讀取帳本失敗", { owner, code: e.code || "unknown" });
-      failures.push(owner);
-    }
-  }
-  // 有任何讀取失敗時，拒絕回報不完整總額。
-  if (failures.length) return `❌ 中央查帳未完成：${failures.length} 份帳本讀取失敗（${failures.slice(0, 5).join("、")}）。已停止統計，請檢查帳本權限。`;
-
-  const now = taipeiNow();
-  const selected = cmd.mode === "中央 今日明細"
-    ? rows.filter(r => r.date.replace(/-/g, "/") === now.dateText) : rows;
-  const t = centralTotals(selected);
-  const fmt = n => Number(n).toLocaleString("zh-TW");
-  const out = [
-    `📊 中央唯讀查帳｜${cmd.mode === "中央 今日明細" ? now.dateText : cmd.month}`,
-    `帳本：${unique.size} 份（啟用使用者 ${users.length} 位；重複帳本只計一次）`,
-    `支出：${fmt(t.expense)} 元`, `收入：${fmt(t.income)} 元`,
-    `淨支出：${fmt(t.net)} 元`, `筆數：${t.count}`
-  ];
-  if (cmd.mode === "中央 場別統計") {
-    const groups = new Map();
-    for (const r of selected) {
-      const farm = r.farm || "未指定";
-      if (!groups.has(farm)) groups.set(farm, []);
-      groups.get(farm).push(r);
-    }
-    out.push("", "【場別統計】");
-    for (const [farm, entries] of [...groups].sort((a,b) => a[0].localeCompare(b[0], "zh-TW"))) {
-      const g = centralTotals(entries);
-      out.push(`${farm}：支出 ${fmt(g.expense)}／收入 ${fmt(g.income)} 元`);
-    }
-  } else if (cmd.mode === "中央 今日明細") {
-    out.push("", "【今日明細（最多20筆）】");
-    for (const r of selected.slice(0, 20)) {
-      out.push(`${r.owner}｜${r.farm}｜${r.txType}｜${r.item}｜${fmt(Math.abs(r.amount))}`);
-    }
-    if (selected.length > 20) out.push(`另有 ${selected.length - 20} 筆未顯示。`);
-  }
-  // LINE 單則文字訊息有長度限制，避免回覆失敗。
-  const result = out.join("\n");
-  return result.length <= 4500 ? result : result.slice(0, 4450) + "\n…內容過長，請縮小查詢範圍。";
-}
-
 async function handleTextMessage(event) {
   const text = String(event.message.text || "").trim();
 
@@ -1741,11 +1639,6 @@ async function handleTextMessage(event) {
   const userSheet = await resolveUserSheet(event);
   if (userSheet.error) {
     return userSheet.error;
-  }
-
-  // 中央指令先檢查管理員權限；不得落入一般記帳流程。
-  if (text === "中央" || text.startsWith("中央 ")) {
-    return await centralReadOnlyQuery(text, event.source?.userId || "");
   }
 
   const targetSheetId = userSheet.sheetId;
@@ -1778,7 +1671,7 @@ async function handleTextMessage(event) {
     return `❌ ${dated.error}`;
   }
 
-  const expense = await parseExpenseCommand(dated.body);
+  const expense = await parseCrossFarmCommand(dated.body) || await parseExpenseCommand(dated.body);
 
   if (expense?.error) {
     return `❌ ${expense.error}`;
@@ -1802,6 +1695,7 @@ async function handleTextMessage(event) {
       "",
       dated.isCustomDate ? "🗓️ 補登日期" : null,
       `場別：${expense.farm}`,
+      expense.payerFarm ? `付款場別：${expense.payerFarm}` : null,
       `日期：${dated.dateInfo.dateText}`,
       `品項：${expense.accountItem}`,
       `用途：${expense.description}`,
@@ -1817,6 +1711,7 @@ async function handleTextMessage(event) {
       `帳本：${userSheet.name}`,
       `寫入：${dated.dateInfo.monthSheet}`,
       writeResult?.auditWarning ? "⚠️ 記帳成功，但排序紀錄未完成，請勿重複送出。" : null,
+      writeResult?.centralWarning ? `⚠️ 個人帳本已記錄，但中央同步未完成。請勿重複送出，通知管理者並提供 ${writeResult.txId}` : null,
     ].filter(Boolean).join("\n");
   }
 

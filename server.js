@@ -23,6 +23,26 @@ const CENTRAL_SHEET_ID = process.env.CENTRAL_SHEET_ID;
 // TESTING 安全開關：只有明確設為 true 才會同步。
 const CENTRAL_SYNC_ENABLED = process.env.CENTRAL_SYNC_ENABLED === "true";
 
+// V2.1 TESTING guard: fail closed before the server starts.
+if (process.env.APP_ENV !== "TESTING") throw new Error("V2.1 僅允許 APP_ENV=TESTING");
+const TEST_ALLOWED_IDS = new Set((process.env.TEST_ALLOWED_SHEET_IDS || "").split(",").map(x => x.trim()).filter(Boolean));
+if (!TEST_ALLOWED_IDS.size || !DEFAULT_SHEET_ID || !TEST_ALLOWED_IDS.has(DEFAULT_SHEET_ID)) {
+  throw new Error("V2.1 必須設定測試帳本白名單，且 GOOGLE_SHEET_ID 必須在白名單內");
+}
+if (!MASTER_SHEET_ID || !ACCOUNT_MASTER_SHEET_ID || !CENTRAL_SHEET_ID || !CENTRAL_SYNC_ENABLED) {
+  throw new Error("V2.1 必須設定測試使用者、科目、中央主檔及啟用中央同步");
+}
+if ([MASTER_SHEET_ID, ACCOUNT_MASTER_SHEET_ID, CENTRAL_SHEET_ID].some(id => TEST_ALLOWED_IDS.has(id))) {
+  throw new Error("V2.1 主檔不得被列為個人記帳白名單");
+}
+if (new Set([MASTER_SHEET_ID, ACCOUNT_MASTER_SHEET_ID, CENTRAL_SHEET_ID]).size !== 3) {
+  throw new Error("V2.1 三份主檔必須分離");
+}
+function assertTestBook(sheetId) {
+  if (!TEST_ALLOWED_IDS.has(String(sheetId || "").trim())) throw new Error("拒絕操作非 TESTING 白名單帳本");
+}
+
+
 // ===== 場別 =====
 const FARM_ALIASES = {
   "東平": "東平場",
@@ -1674,6 +1694,7 @@ async function handleTextMessage(event) {
   }
 
   const targetSheetId = userSheet.sheetId;
+  assertTestBook(targetSheetId);
 
   await ensureBaseStructure(targetSheetId);
 
@@ -1707,6 +1728,10 @@ async function handleTextMessage(event) {
 
   if (expense?.error) {
     return `❌ ${expense.error}`;
+  }
+
+  if (expense?.payerFarm && expense.payerFarm !== expense.farm) {
+    return "⚠️ V2.1 安全測試版暫停跨場代付：雙帳本配對與權限檢查尚未完成，未寫入任何資料。";
   }
 
   if (expense) {
@@ -1783,9 +1808,25 @@ app.get("/", (req, res) => {
   res.send("Chicken Farm Accounting Bot - Simplified Income Expense + Keyword Master Version is running.");
 });
 
+// In-process duplicate protection only; restart/multiple Render instances need durable event ledger.
+const seenEvents = new Map();
+let webhookQueue = Promise.resolve();
+async function processWebhookEvents(events) {
+  for (const event of events) {
+    const key = event.webhookEventId || event.message?.id;
+    if (key && seenEvents.has(key)) continue;
+    if (key) seenEvents.set(key, Date.now());
+    try { await handleEvent(event); }
+    catch (e) { if (key) seenEvents.delete(key); throw e; }
+  }
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  for (const [key, time] of seenEvents) if (time < cutoff) seenEvents.delete(key);
+}
 app.post("/webhook", line.middleware(config), async (req, res) => {
   try {
-    await Promise.all(req.body.events.map(handleEvent));
+    const job = webhookQueue.then(() => processWebhookEvents(req.body.events));
+    webhookQueue = job.catch(err => console.error("Webhook queue error", err));
+    await job;
     res.status(200).end();
   } catch (err) {
     console.error("Webhook Error:", err);

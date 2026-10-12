@@ -1509,9 +1509,15 @@ function sessionKey(event) { return event.source?.userId || ""; }
 function menuHome() {
   return "📝 新增記帳\n請輸入：\n1 快速記帳\n2 引導式記帳\n3 常用支出\n\n或直接輸入：草湖 支出 500 電風扇 / 三豐\n輸入「取消記帳」可結束操作。";
 }
-function chooseFarmText() { return "請輸入場別，例如：草湖、東平、埤北、仁愛（輸入「取消記帳」離開）"; }
+const FARM_MENU_PAGES = [
+  ["草湖", "東平", "仁愛", "東勢", "埤北", "賜福", "永興", "秉夆", "後寮", "鎮平", "東陽", "潭墘"],
+  ["龍潭", "泰順"]
+];
+function chooseFarmText(page = 1) {
+  return `🏠 請選擇記帳場別（第 ${page}/2 頁）\n也可以直接輸入場別名稱。\n輸入「取消記帳」可離開。`;
+}
 function sessionReply(session) {
-  if (session.step === "farm") return chooseFarmText();
+  if (session.step === "farm") return chooseFarmText(session.farmPage || 1);
   if (session.step === "source") return "付款來源請輸入：1 雞場帳戶 / 2 零用金";
   if (session.step === "amount") return "請輸入支出金額，例如：2500";
   if (session.step === "detail") return "請輸入用途及廠商，例如：馬達維修 / 三豐";
@@ -1529,7 +1535,7 @@ async function expenseMenuHandler(text, event) {
   if (text === "使用說明") return helpText();
   if (["1 快速記帳", "快速記帳"].includes(text)) { expenseSessions.delete(key); return "⚡ 直接輸入：草湖 支出 500 電風扇 / 三豐\n零用金：草湖 零 支出 500 電風扇 / 三豐\n補登：10/12 草湖 支出 500 電風扇"; }
   if (["2 引導式記帳", "引導式記帳"].includes(text)) {
-    expenseSessions.set(key, {mode:"guided",step:"farm",expires:Date.now()+SESSION_TTL}); return chooseFarmText();
+    expenseSessions.set(key, {mode:"guided",step:"farm",farmPage:1,expires:Date.now()+SESSION_TTL}); return chooseFarmText(1);
   }
   if (["3 常用支出", "常用支出"].includes(text)) {
     expenseSessions.set(key,{mode:"common",step:"category",expires:Date.now()+SESSION_TTL});
@@ -1545,12 +1551,15 @@ async function expenseMenuHandler(text, event) {
   sess.expires=Date.now()+SESSION_TTL;
   if(sess.step==="category") {
     if(!COMMON_EXPENSES[text]) return "請輸入：油資、電費、飼料、修繕、伙食、其他";
-    sess.category=text; sess.step="farm"; return chooseFarmText();
+    sess.category=text; sess.step="farm"; sess.farmPage=1; return chooseFarmText(1);
   }
   if(sess.step==="farm") {
+    if (text === "下一頁") { sess.farmPage=2; return chooseFarmText(2); }
+    if (text === "上一頁") { sess.farmPage=1; return chooseFarmText(1); }
     const farm=farmFromToken(text);
-    if(!farm || farm==="全部" || farm==="共用") return chooseFarmText();
-    sess.farm=text; sess.step="source"; return sessionReply(sess);
+    const allowed = FARM_MENU_PAGES.flat();
+    if(!farm || !allowed.some(name => farmFromToken(name) === farm)) return chooseFarmText(sess.farmPage || 1);
+    sess.farm=farm; sess.step="source"; return sessionReply(sess);
   }
   if(sess.step==="source") {
     if(!["1","2","雞場帳戶","零用金"].includes(text)) return sessionReply(sess);
@@ -1706,7 +1715,12 @@ function expenseQuickReply(text, event) {
   let choices = [];
   if (text === menuHome()) choices = ["快速記帳", "引導式記帳", "常用支出"];
   else if (sess?.step === "category") choices = ["油資", "電費", "飼料", "修繕", "伙食", "其他", "取消記帳"];
-  else if (sess?.step === "farm") choices = ["草湖", "東平", "仁愛", "埤北", "後寮", "取消記帳"];
+  else if (sess?.step === "farm") {
+    const page = sess.farmPage === 2 ? 2 : 1;
+    choices = page === 1
+      ? [...FARM_MENU_PAGES[0], "下一頁"]
+      : [...FARM_MENU_PAGES[1], "上一頁", "取消記帳"];
+  }
   else if (sess?.step === "source") choices = ["雞場帳戶", "零用金", "取消記帳"];
   else if (sess?.step === "confirm") choices = ["確認記帳", "取消記帳"];
   if (!choices.length) return null;

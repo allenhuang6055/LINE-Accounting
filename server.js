@@ -1500,6 +1500,85 @@ async function recentTenText(sheetId, userId) {
   return lines.join("\n");
 }
 
+
+// ===== Rich Menu V1: conversational expense entry (new entries only) =====
+const expenseSessions = new Map();
+const SESSION_TTL = 15 * 60 * 1000;
+const COMMON_EXPENSES = {"油資":"加油", "電費":"電費", "飼料":"飼料", "修繕":"設備維修", "伙食":"伙食", "其他":"雜項費用"};
+function sessionKey(event) { return event.source?.userId || ""; }
+function menuHome() {
+  return "📝 新增記帳\n請輸入：\n1 快速記帳\n2 引導式記帳\n3 常用支出\n\n或直接輸入：草湖 支出 500 電風扇 / 三豐\n輸入「取消記帳」可結束操作。";
+}
+function chooseFarmText() { return "請輸入場別，例如：草湖、東平、埤北、仁愛（輸入「取消記帳」離開）"; }
+function sessionReply(session) {
+  if (session.step === "farm") return chooseFarmText();
+  if (session.step === "source") return "付款來源請輸入：1 雞場帳戶 / 2 零用金";
+  if (session.step === "amount") return "請輸入支出金額，例如：2500";
+  if (session.step === "detail") return "請輸入用途及廠商，例如：馬達維修 / 三豐";
+  return "請輸入「確認記帳」或「取消記帳」。";
+}
+async function expenseMenuHandler(text, event) {
+  const key = sessionKey(event);
+  if (!key) return null;
+  if (text === "新增記帳") { expenseSessions.delete(key); return menuHome(); }
+  if (text === "取消記帳") { expenseSessions.delete(key); return "已取消本次新增記帳（沒有寫入資料）。"; }
+  if (text === "記帳說明") return menuHome();
+  if (text === "代付說明" || text === "跨場代付") return "跨場代付目前尚未開放，請勿用一般支出代替跨場代付，以免帳務歸屬錯誤。";
+  if (text === "應收應付") return "應收應付專用查詢尚未開放；目前可使用「本月」查看收支，請勿將收支合計當作未結清應收應付。";
+  if (text === "區間查詢") return "目前支援：本月、今年、9月、2026/10、草湖 本月。自訂起訖日查詢尚未開放。";
+  if (text === "使用說明") return helpText();
+  if (["1 快速記帳", "快速記帳"].includes(text)) { expenseSessions.delete(key); return "⚡ 直接輸入：草湖 支出 500 電風扇 / 三豐\n零用金：草湖 零 支出 500 電風扇 / 三豐\n補登：10/12 草湖 支出 500 電風扇"; }
+  if (["2 引導式記帳", "引導式記帳"].includes(text)) {
+    expenseSessions.set(key, {mode:"guided",step:"farm",expires:Date.now()+SESSION_TTL}); return chooseFarmText();
+  }
+  if (["3 常用支出", "常用支出"].includes(text)) {
+    expenseSessions.set(key,{mode:"common",step:"category",expires:Date.now()+SESSION_TTL});
+    return "⭐ 請選擇常用支出：油資、電費、飼料、修繕、伙食、其他";
+  }
+  let sess=expenseSessions.get(key);
+  if (!sess) return null;
+  if (Date.now()>sess.expires) { expenseSessions.delete(key); return "記帳操作已逾時，請重新點選新增記帳。"; }
+  // Normal full commands must still work while a menu is open.
+  if (/^(?:\d{1,4}[\/-]\d{1,2}(?:[\/-]\d{1,2})?\s+)?\S+\s+(?:零\s+)?(?:支出|收入)\s+/.test(text)) {
+    expenseSessions.delete(key); return null;
+  }
+  sess.expires=Date.now()+SESSION_TTL;
+  if(sess.step==="category") {
+    if(!COMMON_EXPENSES[text]) return "請輸入：油資、電費、飼料、修繕、伙食、其他";
+    sess.category=text; sess.step="farm"; return chooseFarmText();
+  }
+  if(sess.step==="farm") {
+    const farm=farmFromToken(text);
+    if(!farm || farm==="全部" || farm==="共用") return chooseFarmText();
+    sess.farm=text; sess.step="source"; return sessionReply(sess);
+  }
+  if(sess.step==="source") {
+    if(!["1","2","雞場帳戶","零用金"].includes(text)) return sessionReply(sess);
+    sess.source=["2","零用金"].includes(text)?"零":""; sess.step="amount"; return sessionReply(sess);
+  }
+  if(sess.step==="amount") {
+    const amt=Number(text.replace(/,/g,""));
+    if(!/^\d[\d,]*(?:\.\d+)?$/.test(text) || !Number.isFinite(amt) || amt<=0) return "請輸入正確的正數金額，例如：2500";
+    sess.amount=amt; sess.step="detail"; return sessionReply(sess);
+  }
+  if(sess.step==="detail") {
+    if(!text || text.length>300) return "請輸入 1～300 字的用途，例如：馬達維修 / 三豐";
+    sess.detail=(sess.category ? COMMON_EXPENSES[sess.category]+" " : "")+text;
+    const command=`${sess.farm} ${sess.source ? "零 " : ""}支出 ${sess.amount} ${sess.detail}`;
+    const parsed=await parseExpenseCommand(command);
+    if(!parsed || parsed.error) return `無法辨識記帳：${parsed?.error||"請重新輸入用途"}`;
+    sess.command=command; sess.step="confirm";
+    return `🧾 請確認支出\n場別：${parsed.farm}\n付款來源：${parsed.paymentSource}\n金額：${parsed.amount.toLocaleString("zh-TW")} 元\n科目：${parsed.accountItem}\n用途：${parsed.description}\n廠商：${parsed.vendor||"未填"}\n\n輸入「確認記帳」正式寫入；輸入「取消記帳」不寫入。`;
+  }
+  if(sess.step==="confirm") {
+    if(text!=="確認記帳") return "請輸入「確認記帳」或「取消記帳」。";
+    // Remove before asynchronous writing so a second confirmation cannot write twice.
+    expenseSessions.delete(key);
+    return {commitCommand:sess.command};
+  }
+  return null;
+}
+
 async function handleTextMessage(event) {
   const text = String(event.message.text || "").trim();
 
@@ -1531,6 +1610,13 @@ async function handleTextMessage(event) {
 
   const targetSheetId = userSheet.sheetId;
 
+  // Menu commands and active guided sessions are resolved only for bound users.
+  const menuResult = await expenseMenuHandler(text, event);
+  if (menuResult && typeof menuResult === "object" && menuResult.commitCommand) {
+    // Reuse the original validated expense parser, monthly sheet writer and central sync.
+    return await handleTextMessage({...event, message:{...event.message, text:menuResult.commitCommand}});
+  }
+  if (typeof menuResult === "string") return menuResult;
 
   await ensureBaseStructure(targetSheetId);
 

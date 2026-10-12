@@ -1560,7 +1560,7 @@ async function handleTextMessage(event) {
     return `❌ ${dated.error}`;
   }
 
-  const expense = await parseCrossFarmCommand(dated.body) || await parseExpenseCommand(dated.body);
+  const expense = await parseExpenseCommand(dated.body);
 
   if (expense?.error) {
     return `❌ ${expense.error}`;

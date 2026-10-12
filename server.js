@@ -778,6 +778,14 @@ const PERSONAL_HEADERS = [
 
 async function ensurePersonalFarmColumns(sheetId, monthSheet) {
   const sheets = await getSheets();
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: sheetId,
+    fields: "sheets.properties(title,index)"
+  });
+  const tabs = (meta.data.sheets || []).map(s => s.properties.title);
+  if (!tabs.includes(monthSheet)) {
+    throw new Error(`找不到月份分頁「${monthSheet}」，請確認測試帳本及月份名稱。`);
+  }
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: sheetId, range: `'${monthSheet}'!A1:R1`,
     valueRenderOption: "FORMATTED_VALUE"
@@ -789,7 +797,10 @@ async function ensurePersonalFarmColumns(sheetId, monthSheet) {
   })).filter(x => normalizeHeader(x.expected) !== normalizeHeader(x.actual));
   if (mismatches.length) {
     const detail = mismatches.map(x => `${x.column}欄應為「${x.expected}」，目前為「${x.actual || "空白"}」`).join("；");
-    throw new Error(`月份 ${monthSheet} 欄位檢查未通過：${detail}。已停止寫入，請勿自行插欄或重複送出。`);
+    const actualPreview = headers.slice(0, 16).map((v, i) => `${columnLetter(i + 1)}=${JSON.stringify(String(v))}`).join(" | ");
+    const idHint = `${String(sheetId).slice(0, 6)}…${String(sheetId).slice(-5)}`;
+    console.error(`[欄位診斷] 帳本ID=${idHint} 月份=${monthSheet} 實際標題：${actualPreview}`);
+    throw new Error(`月份 ${monthSheet} 欄位檢查未通過：${detail}。已停止寫入，請勿自行插欄或重複送出。請將 Render Logs 中的「[欄位診斷]」訊息提供給維護者。`);
   }
 }
 
@@ -1682,7 +1693,7 @@ async function handleEvent(event) {
         replyToken: event.replyToken,
         messages: [{
           type: "text",
-          text: /^月份 \d{6}月 欄位檢查未通過：/.test(err.message)
+          text: /^(月份 \d{6}月 欄位檢查未通過：|找不到月份分頁)/.test(err.message)
             ? `❌ ${err.message}`.slice(0, 4800)
             : "❌ 系統發生錯誤，請稍後再試。",
         }],

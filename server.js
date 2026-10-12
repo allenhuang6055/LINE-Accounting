@@ -1505,7 +1505,13 @@ async function recentTenText(sheetId, userId) {
 const expenseSessions = new Map();
 const helpSessions = new Map();
 const SESSION_TTL = 15 * 60 * 1000;
-const COMMON_EXPENSES = {"油資":"加油", "電費":"電費", "飼料":"飼料", "修繕":"設備維修", "伙食":"伙食", "其他":"雜項費用"};
+const COMMON_EXPENSES = {
+  "汽油": { detail: "汽油", items: ["交通費-油資(車號)"] },
+  "柴油": { detail: "柴油", items: ["交通費-油資(車號)"] },
+  "電費": { detail: "電費", items: ["電費-雞場", "電費－雞場"] },
+  "飼料": { detail: "飼料", items: ["飼料費"] }
+};
+// 常用支出按鈕直接帶入用途與科目；僅在金額輸入後進行確認。
 function sessionKey(event) { return event.source?.userId || ""; }
 function menuHome() {
   return "📝 新增記帳\n請輸入：\n1 快速記帳\n2 引導式記帳\n3 常用支出\n\n或直接輸入：草湖 支出 500 電風扇 / 三豐\n輸入「取消記帳」可結束操作。";
@@ -1602,7 +1608,7 @@ async function expenseMenuHandler(text, event) {
   }
   if (["3 常用支出", "常用支出"].includes(text)) {
     expenseSessions.set(key,{mode:"common",step:"category",expires:Date.now()+SESSION_TTL});
-    return "⭐ 請選擇常用支出：油資、電費、飼料、修繕、伙食、其他";
+    return "⭐ 請選擇常用支出：汽油、柴油、電費、飼料";
   }
   let sess=expenseSessions.get(key);
   if (!sess) return null;
@@ -1617,8 +1623,8 @@ async function expenseMenuHandler(text, event) {
     sess.txType=text; sess.step="farm"; sess.farmPage=1; return chooseFarmText(1);
   }
   if(sess.step==="category") {
-    if(!COMMON_EXPENSES[text]) return "請輸入：油資、電費、飼料、修繕、伙食、其他";
-    sess.category=text; sess.txType="支出"; sess.step="farm"; sess.farmPage=1; return chooseFarmText(1);
+    if(!COMMON_EXPENSES[text]) return "請輸入：汽油、柴油、電費、飼料";
+    sess.category=text; sess.detail=COMMON_EXPENSES[text].detail; sess.txType="支出"; sess.step="farm"; sess.farmPage=1; return chooseFarmText(1);
   }
   if(sess.step==="farm") {
     if (text === "下一頁") { sess.farmPage=2; return chooseFarmText(2); }
@@ -1635,11 +1641,25 @@ async function expenseMenuHandler(text, event) {
   if(sess.step==="amount") {
     const amt=Number(text.replace(/,/g,""));
     if(!/^\d[\d,]*(?:\.\d+)?$/.test(text) || !Number.isFinite(amt) || amt<=0) return "請輸入正確的正數金額，例如：2500";
-    sess.amount=amt; sess.step="detail"; return sessionReply(sess);
+    sess.amount=amt;
+    if (sess.mode === "common" && sess.category) {
+      const rows = await getAccountMasterRows();
+      const spec = COMMON_EXPENSES[sess.category];
+      const normalizeItem = v => String(v || "").replace(/[－–—]/g, "-").replace(/\s+/g, "").toLowerCase();
+      const selected = rows.find(r => spec.items.some(name => normalizeItem(r.item) === normalizeItem(name)));
+      if (!selected) {
+        // 不猜測科目，也不寫入帳本；管理者可在中央科目主檔修正名稱。
+        sess.step = "account";
+        sess.accountCandidates = [];
+        return `⚠️ 中央科目主檔找不到「${sess.category}」對應的科目。\n請輸入科目名稱或代號，或點「使用雜項費用」。`;
+      }
+      return await setGuidedAccount(sess, selected);
+    }
+    sess.step="detail"; return sessionReply(sess);
   }
   if(sess.step==="detail") {
     if(!text || text.length>300) return "請輸入 1～300 字的用途，例如：馬達維修 / 三豐";
-    sess.detail=(sess.category ? COMMON_EXPENSES[sess.category]+" " : "")+text;
+    sess.detail=text;
     const {rows,candidates}=await suggestGuidedAccounts(sess.detail);
     sess.accountCandidates=candidates;
     sess.step="account";
@@ -1823,7 +1843,7 @@ function expenseQuickReply(text, event) {
   let choices = [];
   if (text === menuHome()) choices = ["快速記帳", "引導式記帳", "常用支出"];
   else if (sess?.step === "type") choices = ["支出", "收入", "取消記帳"];
-  else if (sess?.step === "category") choices = ["油資", "電費", "飼料", "修繕", "伙食", "其他", "取消記帳"];
+  else if (sess?.step === "category") choices = ["汽油", "柴油", "電費", "飼料", "取消記帳"];
   else if (sess?.step === "farm") {
     const page = sess.farmPage === 2 ? 2 : 1;
     choices = page === 1

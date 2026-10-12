@@ -1503,6 +1503,7 @@ async function recentTenText(sheetId, userId) {
 
 // ===== Rich Menu V1: conversational expense entry (new entries only) =====
 const expenseSessions = new Map();
+const helpSessions = new Map();
 const SESSION_TTL = 15 * 60 * 1000;
 const COMMON_EXPENSES = {"油資":"加油", "電費":"電費", "飼料":"飼料", "修繕":"設備維修", "伙食":"伙食", "其他":"雜項費用"};
 function sessionKey(event) { return event.source?.userId || ""; }
@@ -1517,25 +1518,62 @@ function chooseFarmText(page = 1) {
   return `🏠 請選擇記帳場別（第 ${page}/2 頁）\n也可以直接輸入場別名稱。\n輸入「取消記帳」可離開。`;
 }
 function sessionReply(session) {
+  if (session.step === "type") return "請選擇記帳類型：支出或收入";
   if (session.step === "farm") return chooseFarmText(session.farmPage || 1);
-  if (session.step === "source") return "付款來源請輸入：1 雞場帳戶 / 2 零用金";
-  if (session.step === "amount") return "請輸入支出金額，例如：2500";
+  if (session.step === "source") return session.txType === "收入" ? "收款來源請選擇：雞場帳戶或零用金" : "付款來源請輸入：1 雞場帳戶 / 2 零用金";
+  if (session.step === "amount") return `請輸入${session.txType || "支出"}金額，例如：2500`;
   if (session.step === "detail") return "請輸入用途及廠商，例如：馬達維修 / 三豐";
   return "請輸入「確認記帳」或「取消記帳」。";
+}
+async function accountListText(page, session) {
+  const rows=await getAccountMasterRows();
+  const total=Math.max(1,Math.ceil(rows.length/10));
+  const current=Math.max(1,Math.min(total,page));
+  session.page=current; session.totalPages=total;
+  const lines=rows.slice((current-1)*10,current*10).map((r,i)=>`${(current-1)*10+i+1}. ${r.item}｜${r.code}｜${r.className}`);
+  return [`📚 全部會計科目（${current}/${total}頁，共${rows.length}項）`,...lines,"","可點下一頁科目／上一頁科目，或返回操作說明。"].join("\n");
+}
+async function accountSearchText(query) {
+  const q=String(query||"").trim().toLowerCase();
+  if (!q) return "請輸入科目名稱或代號。";
+  const rows=await getAccountMasterRows();
+  const found=rows.filter(r=>[r.item,r.code,r.className,...(r.keywords||[])].some(v=>String(v||"").toLowerCase().includes(q)));
+  if (!found.length) return `🔎「${q}」查無相符科目。\n可換個關鍵字，或點「返回操作說明」。`;
+  return [`🔎 科目查詢：${q}（共${found.length}項）`,...found.slice(0,15).map(r=>`${r.item}｜${r.code}｜${r.className}`),...(found.length>15?["只顯示前15項，請縮小關鍵字。"]:[]),"","可繼續輸入關鍵字查詢。"].join("\n");
 }
 async function expenseMenuHandler(text, event) {
   const key = sessionKey(event);
   if (!key) return null;
-  if (text === "新增記帳") { expenseSessions.delete(key); return menuHome(); }
-  if (text === "取消記帳") { expenseSessions.delete(key); return "已取消本次新增記帳（沒有寫入資料）。"; }
+  if (text === "新增記帳") { expenseSessions.delete(key); helpSessions.delete(key); return menuHome(); }
+  if (text === "取消記帳") { expenseSessions.delete(key); helpSessions.delete(key); return "已取消本次新增記帳（沒有寫入資料）。"; }
   if (text === "記帳說明") return menuHome();
   if (text === "代付說明" || text === "跨場代付") return "跨場代付目前尚未開放，請勿用一般支出代替跨場代付，以免帳務歸屬錯誤。";
   if (text === "應收應付") return "應收應付專用查詢尚未開放；目前可使用「本月」查看收支，請勿將收支合計當作未結清應收應付。";
   if (text === "區間查詢") return "目前支援：本月、今年、9月、2026/10、草湖 本月。自訂起訖日查詢尚未開放。";
-  if (text === "使用說明") return helpText();
+  if (["使用說明", "操作說明"].includes(text)) {
+    expenseSessions.delete(key);
+    helpSessions.set(key, {step:"home",expires:Date.now()+SESSION_TTL});
+    return "📖 操作說明\n請選擇：全部會計科目、關鍵字查詢、記帳操作教學";
+  }
+  const help = helpSessions.get(key);
+  if (help && Date.now() > help.expires) helpSessions.delete(key);
+  else if (help) {
+    help.expires = Date.now()+SESSION_TTL;
+    if (text === "返回操作說明") { help.step="home"; return "📖 操作說明\n請選擇：全部會計科目、關鍵字查詢、記帳操作教學"; }
+    if (text === "記帳操作教學") { helpSessions.delete(key); return helpText(); }
+    if (text === "全部會計科目") { help.step="list"; help.page=1; return await accountListText(1,help); }
+    if (text === "關鍵字查詢") { help.step="search"; return "🔎 請輸入科目名稱、關鍵字或科目代號，例如：電費、飼料、611901。\n輸入「返回操作說明」離開。"; }
+    if (help.step === "list" && ["下一頁科目","上一頁科目"].includes(text)) {
+      const rows=await getAccountMasterRows();
+      const max=Math.max(1,Math.ceil(rows.length/10));
+      help.page=Math.max(1,Math.min(max,(help.page||1)+(text==="下一頁科目"?1:-1)));
+      return await accountListText(help.page,help);
+    }
+    if (help.step === "search" && !["新增記帳","取消記帳"].includes(text) && !/^(?:\S+\s+(?:零\s+)?(?:支出|收入)\s+|本月$|今天$|今年$)/.test(text)) return await accountSearchText(text);
+  }
   if (["1 快速記帳", "快速記帳"].includes(text)) { expenseSessions.delete(key); return "⚡ 直接輸入：草湖 支出 500 電風扇 / 三豐\n零用金：草湖 零 支出 500 電風扇 / 三豐\n補登：10/12 草湖 支出 500 電風扇"; }
   if (["2 引導式記帳", "引導式記帳"].includes(text)) {
-    expenseSessions.set(key, {mode:"guided",step:"farm",farmPage:1,expires:Date.now()+SESSION_TTL}); return chooseFarmText(1);
+    expenseSessions.set(key, {mode:"guided",step:"type",txType:"支出",farmPage:1,expires:Date.now()+SESSION_TTL}); return "請選擇記帳類型：支出或收入";
   }
   if (["3 常用支出", "常用支出"].includes(text)) {
     expenseSessions.set(key,{mode:"common",step:"category",expires:Date.now()+SESSION_TTL});
@@ -1549,9 +1587,13 @@ async function expenseMenuHandler(text, event) {
     expenseSessions.delete(key); return null;
   }
   sess.expires=Date.now()+SESSION_TTL;
+  if(sess.step==="type") {
+    if(!["支出","收入"].includes(text)) return sessionReply(sess);
+    sess.txType=text; sess.step="farm"; sess.farmPage=1; return chooseFarmText(1);
+  }
   if(sess.step==="category") {
     if(!COMMON_EXPENSES[text]) return "請輸入：油資、電費、飼料、修繕、伙食、其他";
-    sess.category=text; sess.step="farm"; sess.farmPage=1; return chooseFarmText(1);
+    sess.category=text; sess.txType="支出"; sess.step="farm"; sess.farmPage=1; return chooseFarmText(1);
   }
   if(sess.step==="farm") {
     if (text === "下一頁") { sess.farmPage=2; return chooseFarmText(2); }
@@ -1573,11 +1615,11 @@ async function expenseMenuHandler(text, event) {
   if(sess.step==="detail") {
     if(!text || text.length>300) return "請輸入 1～300 字的用途，例如：馬達維修 / 三豐";
     sess.detail=(sess.category ? COMMON_EXPENSES[sess.category]+" " : "")+text;
-    const command=`${sess.farm} ${sess.source ? "零 " : ""}支出 ${sess.amount} ${sess.detail}`;
+    const command=`${sess.farm} ${sess.source ? "零 " : ""}${sess.txType || "支出"} ${sess.amount} ${sess.detail}`;
     const parsed=await parseExpenseCommand(command);
     if(!parsed || parsed.error) return `無法辨識記帳：${parsed?.error||"請重新輸入用途"}`;
     sess.command=command; sess.step="confirm";
-    return `🧾 請確認支出\n場別：${parsed.farm}\n付款來源：${parsed.paymentSource}\n金額：${parsed.amount.toLocaleString("zh-TW")} 元\n科目：${parsed.accountItem}\n用途：${parsed.description}\n廠商：${parsed.vendor||"未填"}\n\n輸入「確認記帳」正式寫入；輸入「取消記帳」不寫入。`;
+    return `🧾 請確認${sess.txType || "支出"}\n場別：${parsed.farm}\n付款來源：${parsed.paymentSource}\n金額：${parsed.amount.toLocaleString("zh-TW")} 元\n科目：${parsed.accountItem}\n用途：${parsed.description}\n廠商：${parsed.vendor||"未填"}\n\n輸入「確認記帳」正式寫入；輸入「取消記帳」不寫入。`;
   }
   if(sess.step==="confirm") {
     if(text!=="確認記帳") return "請輸入「確認記帳」或「取消記帳」。";
@@ -1714,6 +1756,7 @@ function expenseQuickReply(text, event) {
   const sess = key ? expenseSessions.get(key) : null;
   let choices = [];
   if (text === menuHome()) choices = ["快速記帳", "引導式記帳", "常用支出"];
+  else if (sess?.step === "type") choices = ["支出", "收入", "取消記帳"];
   else if (sess?.step === "category") choices = ["油資", "電費", "飼料", "修繕", "伙食", "其他", "取消記帳"];
   else if (sess?.step === "farm") {
     const page = sess.farmPage === 2 ? 2 : 1;
@@ -1723,6 +1766,12 @@ function expenseQuickReply(text, event) {
   }
   else if (sess?.step === "source") choices = ["雞場帳戶", "零用金", "取消記帳"];
   else if (sess?.step === "confirm") choices = ["確認記帳", "取消記帳"];
+  const help = key ? helpSessions.get(key) : null;
+  if (text.startsWith("📖 操作說明")) choices=["全部會計科目","關鍵字查詢","記帳操作教學"];
+  else if (help?.step === "list") {
+    const p=help.page||1;
+    choices=[...(p>1?["上一頁科目"]:[]),...(p < (help.totalPages||1)?["下一頁科目"]:[]),"返回操作說明"];
+  } else if (help?.step === "search") choices=["返回操作說明"];
   if (!choices.length) return null;
   return { items: choices.map(label => ({
     type: "action",

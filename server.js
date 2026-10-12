@@ -1541,6 +1541,24 @@ async function accountSearchText(query) {
   if (!found.length) return `🔎「${q}」查無相符科目。\n可換個關鍵字，或點「返回操作說明」。`;
   return [`🔎 科目查詢：${q}（共${found.length}項）`,...found.slice(0,15).map(r=>`${r.item}｜${r.code}｜${r.className}`),...(found.length>15?["只顯示前15項，請縮小關鍵字。"]:[]),"","可繼續輸入關鍵字查詢。"].join("\n");
 }
+// Guided entry: suggest from the central account master, without silently guessing.
+async function suggestGuidedAccounts(detail) {
+  const rows = await getAccountMasterRows();
+  const normalized = normalizeMatchText(detail.split(/[\/｜|]/)[0]);
+  const matches = rows.map(r => {
+    const item = normalizeMatchText(r.item);
+    const keys = (r.keywords || []).map(normalizeMatchText).filter(Boolean);
+    let score = 0;
+    if (item === normalized) score = 1000;
+    else if (item && normalized.includes(item)) score = 400 + item.length;
+    for (const k of keys) if (normalized.includes(k)) score = Math.max(score, 200 + k.length);
+    return {row:r,score};
+  }).filter(x=>x.score>0).sort((a,b)=>b.score-a.score);
+  return {rows, candidates:matches.slice(0,5).map(x=>x.row)};
+}
+function guidedPreview(sess, parsed) {
+  return `🧾 請確認${sess.txType || "支出"}\n場別：${parsed.farm}\n付款／收款來源：${parsed.paymentSource}\n金額：${parsed.amount.toLocaleString("zh-TW")} 元\n科目：${parsed.accountItem}（${parsed.code}）\n用途：${parsed.description}\n廠商：${parsed.vendor||"未填"}\n\n點「確認記帳」正式寫入，或「取消記帳」不寫入。`;
+}
 async function expenseMenuHandler(text, event) {
   const key = sessionKey(event);
   if (!key) return null;
@@ -1615,11 +1633,34 @@ async function expenseMenuHandler(text, event) {
   if(sess.step==="detail") {
     if(!text || text.length>300) return "請輸入 1～300 字的用途，例如：馬達維修 / 三豐";
     sess.detail=(sess.category ? COMMON_EXPENSES[sess.category]+" " : "")+text;
-    const command=`${sess.farm} ${sess.source ? "零 " : ""}${sess.txType || "支出"} ${sess.amount} ${sess.detail}`;
+    const {rows,candidates}=await suggestGuidedAccounts(sess.detail);
+    sess.accountCandidates=candidates;
+    sess.step="account";
+    if (!candidates.length) return "🔎 找不到明確的科目建議。請輸入科目名稱或代號搜尋，或輸入「重新輸入用途」。不會自動歸類雜項費用。";
+    return `🔎 依用途推薦以下會計科目：\n${candidates.map((r,i)=>`${i+1}. ${r.item}｜${r.code}`).join("\n")}\n\n請點選科目，或輸入科目名稱／代號重新搜尋。`;
+  }
+  if(sess.step==="account") {
+    if(text==="重新輸入用途") { sess.step="detail"; return sessionReply(sess); }
+    const rows=await getAccountMasterRows();
+    const options=sess.accountCandidates||[];
+    let selected=options.find(r=>r.item===text);
+    if(!selected && /^\d+$/.test(text)) selected=options[Number(text)-1];
+    if(!selected) {
+      const q=normalizeMatchText(text);
+      const matches=rows.filter(r=>normalizeMatchText(r.item).includes(q) || String(r.code)===text || (r.keywords||[]).some(k=>normalizeMatchText(k).includes(q)));
+      if(matches.length===1) selected=matches[0];
+      else {
+        sess.accountCandidates=matches.slice(0,5);
+        return matches.length
+          ? `🔎 找到 ${matches.length} 項，請選擇：\n${sess.accountCandidates.map((r,i)=>`${i+1}. ${r.item}｜${r.code}`).join("\n")}\n可輸入其他關鍵字或「重新輸入用途」。`
+          : "查無相符科目，請換個關鍵字或輸入「重新輸入用途」。";
+      }
+    }
+    const command=`${sess.farm} ${sess.source ? "零 " : ""}${sess.txType || "支出"} ${sess.amount} ${selected.item} ${sess.detail}`;
     const parsed=await parseExpenseCommand(command);
-    if(!parsed || parsed.error) return `無法辨識記帳：${parsed?.error||"請重新輸入用途"}`;
+    if(!parsed || parsed.error || parsed.accountItem!==selected.item) return `科目核對失敗，請重新選擇：${parsed?.error||"科目不一致"}`;
     sess.command=command; sess.step="confirm";
-    return `🧾 請確認${sess.txType || "支出"}\n場別：${parsed.farm}\n付款來源：${parsed.paymentSource}\n金額：${parsed.amount.toLocaleString("zh-TW")} 元\n科目：${parsed.accountItem}\n用途：${parsed.description}\n廠商：${parsed.vendor||"未填"}\n\n輸入「確認記帳」正式寫入；輸入「取消記帳」不寫入。`;
+    return guidedPreview(sess,parsed);
   }
   if(sess.step==="confirm") {
     if(text!=="確認記帳") return "請輸入「確認記帳」或「取消記帳」。";
@@ -1765,6 +1806,9 @@ function expenseQuickReply(text, event) {
       : [...FARM_MENU_PAGES[1], "上一頁", "取消記帳"];
   }
   else if (sess?.step === "source") choices = ["雞場帳戶", "零用金", "取消記帳"];
+  else if (sess?.step === "account") {
+    choices = [...(sess.accountCandidates||[]).slice(0,5).map(r=>r.item).filter(x=>x.length<=20), "重新輸入用途", "取消記帳"];
+  }
   else if (sess?.step === "confirm") choices = ["確認記帳", "取消記帳"];
   const help = key ? helpSessions.get(key) : null;
   if (text.startsWith("📖 操作說明")) choices=["全部會計科目","關鍵字查詢","記帳操作教學"];

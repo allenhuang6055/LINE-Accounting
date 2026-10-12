@@ -1699,15 +1699,37 @@ async function handleTextMessage(event) {
   return helpText();
 }
 
+// LINE Quick Reply buttons for the existing conversational expense flow.
+function expenseQuickReply(text, event) {
+  const key = sessionKey(event);
+  const sess = key ? expenseSessions.get(key) : null;
+  let choices = [];
+  if (text === menuHome()) choices = ["快速記帳", "引導式記帳", "常用支出"];
+  else if (sess?.step === "category") choices = ["油資", "電費", "飼料", "修繕", "伙食", "其他", "取消記帳"];
+  else if (sess?.step === "farm") choices = ["草湖", "東平", "仁愛", "埤北", "後寮", "取消記帳"];
+  else if (sess?.step === "source") choices = ["雞場帳戶", "零用金", "取消記帳"];
+  else if (sess?.step === "confirm") choices = ["確認記帳", "取消記帳"];
+  if (!choices.length) return null;
+  return { items: choices.map(label => ({
+    type: "action",
+    action: label === "其他場別"
+      ? {type: "message", label, text: "其他場別"}
+      : {type: "message", label, text: label}
+  })) };
+}
+
 async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return null;
 
   try {
     const replyText = await handleTextMessage(event);
 
+    const msg = { type: "text", text: replyText };
+    const quickReply = expenseQuickReply(replyText, event);
+    if (quickReply) msg.quickReply = quickReply;
     await client.replyMessage({
       replyToken: event.replyToken,
-      messages: [{ type: "text", text: replyText }],
+      messages: [msg],
     });
 
     return "OK";

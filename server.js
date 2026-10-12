@@ -1559,6 +1559,13 @@ async function suggestGuidedAccounts(detail) {
 function guidedPreview(sess, parsed) {
   return `🧾 請確認${sess.txType || "支出"}\n場別：${parsed.farm}\n付款／收款來源：${parsed.paymentSource}\n金額：${parsed.amount.toLocaleString("zh-TW")} 元\n科目：${parsed.accountItem}（${parsed.code}）\n用途：${parsed.description}\n廠商：${parsed.vendor||"未填"}\n\n點「確認記帳」正式寫入，或「取消記帳」不寫入。`;
 }
+async function setGuidedAccount(sess,selected) {
+  const command=`${sess.farm} ${sess.source ? "零 " : ""}${sess.txType || "支出"} ${sess.amount} ${selected.item} ${sess.detail}`;
+  const parsed=await parseExpenseCommand(command);
+  if(!parsed || parsed.error || parsed.accountItem!==selected.item) return `科目核對失敗，請重新選擇：${parsed?.error||"科目不一致"}`;
+  sess.command=command; sess.step="confirm";
+  return guidedPreview(sess,parsed);
+}
 async function expenseMenuHandler(text, event) {
   const key = sessionKey(event);
   if (!key) return null;
@@ -1636,10 +1643,26 @@ async function expenseMenuHandler(text, event) {
     const {rows,candidates}=await suggestGuidedAccounts(sess.detail);
     sess.accountCandidates=candidates;
     sess.step="account";
-    if (!candidates.length) return "🔎 找不到明確的科目建議。請輸入科目名稱或代號搜尋，或輸入「重新輸入用途」。不會自動歸類雜項費用。";
+    if (!candidates.length) {
+      // 無明確科目時先使用中央主檔的雜項費用，仍須人工確認才寫入。
+      const fallback=rows.find(r=>r.item==="雜項費用");
+      if (!fallback) return "中央科目主檔沒有「雜項費用」，請管理者先確認科目設定；尚未寫入。";
+      sess.accountCandidates=[fallback];
+      const result=await setGuidedAccount(sess,fallback);
+      if (typeof result !== "string" || !result.startsWith("🧾")) return result;
+      sess.autoMisc=true;
+      return "⚠️ 找不到明確科目，暫列「雜項費用」；請確認或點「更換科目」。\n\n"+result;
+    }
     return `🔎 依用途推薦以下會計科目：\n${candidates.map((r,i)=>`${i+1}. ${r.item}｜${r.code}`).join("\n")}\n\n請點選科目，或輸入科目名稱／代號重新搜尋。`;
   }
   if(sess.step==="account") {
+    if(text==="使用雜項費用") {
+      const rows=await getAccountMasterRows();
+      const misc=rows.find(r=>r.item==="雜項費用");
+      if(!misc) return "中央科目主檔沒有「雜項費用」，尚未寫入。";
+      sess.autoMisc=true;
+      return "⚠️ 暫列雜項費用，請確認。\n\n"+await setGuidedAccount(sess,misc);
+    }
     if(text==="重新輸入用途") { sess.step="detail"; return sessionReply(sess); }
     const rows=await getAccountMasterRows();
     const options=sess.accountCandidates||[];
@@ -1653,16 +1676,18 @@ async function expenseMenuHandler(text, event) {
         sess.accountCandidates=matches.slice(0,5);
         return matches.length
           ? `🔎 找到 ${matches.length} 項，請選擇：\n${sess.accountCandidates.map((r,i)=>`${i+1}. ${r.item}｜${r.code}`).join("\n")}\n可輸入其他關鍵字或「重新輸入用途」。`
-          : "查無相符科目，請換個關鍵字或輸入「重新輸入用途」。";
+          : "查無相符科目。可點「使用雜項費用」繼續記帳，或重新輸入用途。";
       }
     }
-    const command=`${sess.farm} ${sess.source ? "零 " : ""}${sess.txType || "支出"} ${sess.amount} ${selected.item} ${sess.detail}`;
-    const parsed=await parseExpenseCommand(command);
-    if(!parsed || parsed.error || parsed.accountItem!==selected.item) return `科目核對失敗，請重新選擇：${parsed?.error||"科目不一致"}`;
-    sess.command=command; sess.step="confirm";
-    return guidedPreview(sess,parsed);
+    sess.autoMisc=false;
+    return await setGuidedAccount(sess,selected);
   }
   if(sess.step==="confirm") {
+    if(text==="更換科目") {
+      sess.step="account";
+      sess.accountCandidates=[];
+      return "🔎 請輸入想搜尋的科目名稱或代號，例如：雜項、611701。\n也可點「使用雜項費用」或「重新輸入用途」。";
+    }
     if(text!=="確認記帳") return "請輸入「確認記帳」或「取消記帳」。";
     // Remove before asynchronous writing so a second confirmation cannot write twice.
     expenseSessions.delete(key);
@@ -1807,9 +1832,9 @@ function expenseQuickReply(text, event) {
   }
   else if (sess?.step === "source") choices = ["雞場帳戶", "零用金", "取消記帳"];
   else if (sess?.step === "account") {
-    choices = [...(sess.accountCandidates||[]).slice(0,5).map(r=>r.item).filter(x=>x.length<=20), "重新輸入用途", "取消記帳"];
+    choices = [...(sess.accountCandidates||[]).slice(0,5).map(r=>r.item).filter(x=>x.length<=20), "使用雜項費用", "重新輸入用途", "取消記帳"];
   }
-  else if (sess?.step === "confirm") choices = ["確認記帳", "取消記帳"];
+  else if (sess?.step === "confirm") choices = ["確認記帳", "更換科目", "取消記帳"];
   const help = key ? helpSessions.get(key) : null;
   if (text.startsWith("📖 操作說明")) choices=["全部會計科目","關鍵字查詢","記帳操作教學"];
   else if (help?.step === "list") {

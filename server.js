@@ -1549,7 +1549,7 @@ const COMMON_EXPENSES = {
   "電費": { detail: "電費", items: ["電費-雞場", "電費－雞場"] },
   "飼料": { detail: "飼料", items: ["飼料費"] }
 };
-// 常用支出先選科目，輸入金額後再詢問廠商，確認後才寫入。
+// 常用支出按鈕直接帶入用途與科目；僅在金額輸入後進行確認。
 function sessionKey(event) { return event.source?.userId || ""; }
 function menuHome() {
   return "📝 新增記帳\n請輸入：\n1 快速記帳\n2 引導式記帳\n3 常用支出\n\n或直接輸入：草湖 支出 500 電風扇 / 三豐\n輸入「取消記帳」可結束操作。";
@@ -1567,7 +1567,6 @@ function sessionReply(session) {
   if (session.step === "source") return session.txType === "收入" ? "收款來源請選擇：雞場帳戶或零用金" : "付款來源請輸入：1 雞場帳戶 / 2 零用金";
   if (session.step === "amount") return `請輸入${session.txType || "支出"}金額，例如：2500`;
   if (session.step === "detail") return "請輸入用途及廠商，例如：馬達維修 / 三豐";
-  if (session.step === "vendor") return "🏪 請輸入廠商名稱（例如：台塑加油站），或點「略過廠商」。";
   return "請輸入「確認記帳」或「取消記帳」。";
 }
 async function accountListText(page, session) {
@@ -1692,21 +1691,9 @@ async function expenseMenuHandler(text, event) {
         sess.accountCandidates = [];
         return `⚠️ 中央科目主檔找不到「${sess.category}」對應的科目。\n請輸入科目名稱或代號，或點「使用雜項費用」。`;
       }
-      sess.commonAccount = selected.item;
-      sess.step = "vendor";
-      return sessionReply(sess);
+      return await setGuidedAccount(sess, selected);
     }
     sess.step="detail"; return sessionReply(sess);
-  }
-  if(sess.step==="vendor" && sess.mode==="common") {
-    if (!text || text.length > 100) return "請輸入 1～100 字廠商名稱，或點「略過廠商」。";
-    const vendor = text === "略過廠商" ? "" : text.trim();
-    // 沿用既有「用途 / 廠商」解析器，避免改動個人帳本及中央寫入邏輯。
-    sess.detail = sess.category + (vendor ? " / " + vendor : "");
-    const rows = await getAccountMasterRows();
-    const selected = rows.find(r => r.item === sess.commonAccount);
-    if (!selected) return "⚠️ 科目主檔已變更，請取消記帳後重新操作。";
-    return await setGuidedAccount(sess, selected);
   }
   if(sess.step==="detail") {
     if(!text || text.length>300) return "請輸入 1～300 字的用途，例如：馬達維修 / 三豐";
@@ -1902,17 +1889,7 @@ function expenseQuickReply(text, event) {
   else if (sess?.step === "account") {
     choices = [...(sess.accountCandidates||[]).slice(0,5).map(r=>r.item).filter(x=>x.length<=20), "使用雜項費用", "重新輸入用途", "取消記帳"];
   }
-  else if (sess?.step === "vendor") choices = ["略過廠商", "取消記帳"];
   else if (sess?.step === "confirm") choices = ["確認記帳", "更換科目", "取消記帳"];
-  // 刪除按鈕只是送出既有文字指令；仍經過本人ID檢查及二次確認。
-  if (text.includes("請於5分鐘內輸入「確認刪除」")) {
-    choices = ["確認刪除", "取消"];
-  } else if (text.includes("可刪除：刪除第") && key) {
-    const snapshot = [...recentSnapshots.entries()].find(([k]) => k.endsWith(":" + key));
-    if (snapshot && Date.now() <= snapshot[1].expiresAt) {
-      choices = (snapshot[1].ids || []).slice(0,10).map((id,i) => id ? `刪除第${i+1}筆` : null).filter(Boolean);
-    }
-  }
   const help = key ? helpSessions.get(key) : null;
   if (text.startsWith("📖 操作說明")) choices=["全部會計科目","關鍵字查詢","記帳操作教學"];
   else if (help?.step === "list") {
@@ -1928,7 +1905,7 @@ function expenseQuickReply(text, event) {
   })) };
 }
 
-// 中央對帳：只對「有永久交易ID、且能唯一對應個人資料」的記帳自動處理。
+// 中央安全對帳：只校正唯一匹配交易的列號；不依內容差異自動刪中央。
 // 絕不依舊列號單獨判定刪除；有重複內容、欄位缺漏或資料異常時略過。
 let reconciliationRunning = false;
 function reconcileFingerprint(farm, type, item, amount, recorder) {
@@ -1990,23 +1967,20 @@ async function reconcileOneBook(sheetId) {
       range:{sheetId:logTab.sheetId,startRowIndex:e.logRow-1,endRowIndex:e.logRow,
         startColumnIndex:2,endColumnIndex:3},
       rows:[{values:[sheetCell(row)]}],fields:"userEnteredValue"}});
-    for (const e of missing) requests.push({updateCells:{
-      range:{sheetId:logTab.sheetId,startRowIndex:e.logRow-1,endRowIndex:e.logRow,
-        startColumnIndex:10,endColumnIndex:12},
-      rows:[{values:[sheetCell("已刪除"),sheetCell(new Date().toISOString())]}],
-      fields:"userEnteredValue"}});
+    // 安全修正：指紋找不到不能證明該列已刪除，可能只是人工修改金額／品項。
+    // 因此只更新仍可唯一辨識的列號，不自動標記刪除，也不刪除中央資料。
+    // 手動刪除整列須待日後以永久交易 ID 建立可靠的列級關聯後才能自動同步。
+    if (missing.length) {
+      console.warn(`[中央對帳安全略過] 帳本=${String(sheetId).slice(0,6)} 月份=${month} 無法辨識=${missing.length}筆；保留中央資料，請人工核對`);
+    }
     if (requests.length) await sheets.spreadsheets.batchUpdate({
       spreadsheetId:sheetId,requestBody:{requests}});
-    for (const e of missing) {
-      try { await syncCentralDeleted(e.id); }
-      catch (err) { console.error("中央手動刪列同步失敗，稍後重試", e.id, err.message); }
-    }
+
   }
-  // 已刪除的日誌即使先前中央失敗，也再次嘗試清理中央。
-  for (const e of entries.filter(e => TX_ID_PATTERN.test(e.id) && e.status === "已刪除")) {
-    try { await syncCentralDeleted(e.id); }
-    catch (err) { console.error("中央刪除重試失敗", e.id, err.message); }
-  }
+  // 不再對所有「已刪除」日誌無條件重試中央刪除：
+  // 舊版對帳可能將人工修改誤標為已刪除，重試會持續誤刪。
+  // LINE 明確確認刪除時，仍由 confirmDeleteLast() 立即同步中央。
+
 }
 async function reconcileAllBooks() {
   if (reconciliationRunning) return;

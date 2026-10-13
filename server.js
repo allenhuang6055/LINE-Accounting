@@ -2087,6 +2087,24 @@ async function handleTextMessage(event) {
 
   const targetSheetId = userSheet.sheetId;
 
+  // V2.5 三頁圖文選單：尚未開發的功能只提供說明，不寫入帳本。
+  const v25MenuMessages = {
+    "指定月份": "📅 指定月份查詢\\n請直接輸入：2026/09 或 9月\\n也可輸入：草湖 2026/09",
+    "日期區間": "📅 日期區間查詢尚未開放。\\n目前可輸入：本月、今年、2026/09。",
+    "支出明細": "🧾 支出明細專用篩選尚未開放。\\n目前可使用「本月」或「最近10筆」查詢。",
+    "收支統計": "📊 請輸入「本月」、「今年」或「2026/09」，系統會顯示收支彙總。",
+    "場別查詢": "🏠 場別查詢\\n請輸入：草湖 本月\\n或：東平 2026/09",
+    "廠商查詢": "🏪 依廠商查詢功能尚未開放，不會修改記帳資料。",
+    "廠商管理": "🏪 廠商管理介面尚未開放。\\n原有記帳流程的廠商推薦仍可使用。",
+    "補登記帳": "📅 補登記帳\\n目前請直接輸入完整指令：\\n2026/09/15 草湖 支出 2500 柴油 / 中油\\nV2.5 日期快捷流程尚未開放。",
+    "同步狀態": "🔄 同步狀態查詢介面尚未開放。\\n若記帳回覆中央同步警告，請勿重複記帳。",
+    "記帳紀錄": "📒 請點選「最近10筆」查看近期紀錄。",
+    "系統設定": "⚙️ 系統設定介面尚未開放。\\n現有記帳與查詢功能不受影響。"
+  };
+  if (Object.prototype.hasOwnProperty.call(v25MenuMessages, text)) {
+    return v25MenuMessages[text];
+  }
+
   // Menu commands and active guided sessions are resolved only for bound users.
   const menuResult = await expenseMenuHandler(text, event, targetSheetId);
   if (menuResult && typeof menuResult === "object" && menuResult.commitCommand) {

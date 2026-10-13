@@ -899,6 +899,7 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName, us
     if (!rowNumber) throw new Error("Google Sheets 未回傳寫入列號");
     await appendAccountingLog(sheetId, {
       id: txId, userId: userId || "",
+      v2Marker: isHistorical ? "" : "V2-ID",
       timestamp: new Date().toISOString(), monthSheet, rowNumber,
       farm: expense.farm, txType: expense.txType || "支出",
       item: expense.accountItem, amount: expense.amount, recorder: userName || "",
@@ -1295,6 +1296,21 @@ const RECENT_LOG_HEADERS = ["寫入時間UTC", "月份分頁", "列號", "場別
 async function appendAccountingLog(sheetId, record) {
   await ensureSheet(sheetId, RECENT_LOG_TAB, RECENT_LOG_HEADERS);
   const sheets = await getSheets();
+  // M 欄只供 V2 新交易辨識；舊日誌不回填、不改寫 A:L。
+  if (record.v2Marker === "V2-ID") {
+    const markerHeader = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId, range: `'${RECENT_LOG_TAB}'!M1`,
+      valueRenderOption: "FORMATTED_VALUE"
+    });
+    const existing = String(markerHeader.data.values?.[0]?.[0] || "").trim();
+    if (existing && existing !== "V2標記") {
+      throw new Error("系統記帳順序 M1 已有其他資料，停止新增 V2 日誌以免覆寫");
+    }
+    if (!existing) await sheets.spreadsheets.values.update({
+      spreadsheetId: sheetId, range: `'${RECENT_LOG_TAB}'!M1`,
+      valueInputOption: "RAW", requestBody: {values: [["V2標記"]]}
+    });
+  }
   await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
     range: `'${RECENT_LOG_TAB}'!A:M`,
@@ -2119,10 +2135,12 @@ async function reconcileAllBooks() {
     const ids = [...new Set((response.data.values || [])
       .filter(r => ["Y","YES","TRUE","1","啟用"].includes(String(r[4]||"").trim().toUpperCase()))
       .map(r => String(r[3]||"").trim()).filter(Boolean))];
+    console.info(`[V2 對帳] 開始檢查，帳本數=${ids.length}`);
     for (const id of ids) {
       try { await reconcileOneBook(id); }
       catch (err) { console.error("單一帳本對帳失敗", id.slice(0,6), err.message); }
     }
+    console.info("[V2 對帳] 本輪完成");
   } catch (err) { console.error("中央對帳失敗（不影響個人記帳）", err.message); }
   finally { reconciliationRunning = false; }
 }

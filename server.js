@@ -722,11 +722,18 @@ async function syncCentralDeleted(txId) {
     if (String(values[i][0] || "") === txId) matches.push(i + 1);
   }
   if (matches.length > 1) throw new Error(`中央交易 ID 重複：${txId}`);
-  if (!matches.length) return "missing"; // 不創造沒有原交易的刪除列
-  await sheets.spreadsheets.values.update({
+  if (!matches.length) return "missing";
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: CENTRAL_SHEET_ID, fields: "sheets.properties(sheetId,title)"
+  });
+  const tab = (meta.data.sheets || []).find(x => x.properties.title === CENTRAL_TAB);
+  if (!tab) throw new Error("找不到中央流水帳分頁");
+  await sheets.spreadsheets.batchUpdate({
     spreadsheetId: CENTRAL_SHEET_ID,
-    range: `'${CENTRAL_TAB}'!U${matches[0]}`,
-    valueInputOption: "RAW", requestBody: { values: [["已刪除"]] }
+    requestBody: { requests: [{ deleteDimension: { range: {
+      sheetId: tab.properties.sheetId, dimension: "ROWS",
+      startIndex: matches[0] - 1, endIndex: matches[0]
+    } } }] }
   });
   return "deleted";
 }
@@ -827,7 +834,7 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName, us
   let layout = null;
   if (isHistorical) layout = await getAppendLayout(sheetId, monthSheet);
   else await ensurePersonalFarmColumns(sheetId, monthSheet);
-  await centralRows(await centralSheets()); // 中央欄位不正確時，不得先寫個人帳本。
+  // 中央尚在建置：中央故障不得阻止個人帳本記帳。
   const valuesForWrite = [expense.farm, expense.payerFarm || expense.farm,
     expense.txType || "支出", expense.paymentSource || "", expense.code,
     expense.className, dateText, expense.accountItem, expense.description,
@@ -1897,6 +1904,108 @@ function expenseQuickReply(text, event) {
       : {type: "message", label, text: label}
   })) };
 }
+
+// 中央對帳：只對「有永久交易ID、且能唯一對應個人資料」的記帳自動處理。
+// 絕不依舊列號單獨判定刪除；有重複內容、欄位缺漏或資料異常時略過。
+let reconciliationRunning = false;
+function reconcileFingerprint(farm, type, item, amount, recorder) {
+  return [String(farm).trim(), String(type || "支出").trim(), String(item).trim(),
+    Math.abs(Number(String(amount).replace(/,/g, ""))), String(recorder).trim()].join("\u001f");
+}
+async function reconcileOneBook(sheetId) {
+  const sheets = await getSheets();
+  const entries = await readAccountingLog(sheetId);
+  const groups = new Map();
+  for (const e of entries) {
+    if (!TX_ID_PATTERN.test(e.id) || !/^\d{6}月$/.test(e.month)) continue;
+    if (!groups.has(e.month)) groups.set(e.month, []);
+    groups.get(e.month).push(e);
+  }
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId,
+    fields: "sheets.properties(sheetId,title)" });
+  const tabs = new Map((meta.data.sheets || []).map(t => [t.properties.title, t.properties]));
+  const logTab = tabs.get(RECENT_LOG_TAB);
+  if (!logTab) return;
+  for (const [month, logs] of groups) {
+    if (!tabs.has(month)) continue; // 分頁被移除不等於可安全確認每筆交易
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId,
+      range: `'${month}'!A1:AZ`, valueRenderOption: "FORMATTED_VALUE" });
+    const rows = response.data.values || [];
+    const headers = rows[0] || [];
+    const col = names => headerIndex(headers, names);
+    const ix = [col(["帳務歸屬", "場別"]), col(["收支類型"]), col(["品項"]),
+      col(["金額"]), col(["填表人"])];
+    if (ix.some(x => x < 0)) continue;
+    const actual = new Map();
+    rows.slice(1).forEach((r, i) => {
+      if (!r.length) return;
+      const fp = reconcileFingerprint(...ix.map(x => r[x] || ""));
+      if (!actual.has(fp)) actual.set(fp, []);
+      actual.get(fp).push(i + 2);
+    });
+    const logByFingerprint = new Map();
+    for (const e of logs) {
+      const fp = reconcileFingerprint(e.farm, e.txType, e.item, e.amount, e.recorder);
+      if (!logByFingerprint.has(fp)) logByFingerprint.set(fp, []);
+      logByFingerprint.get(fp).push(e);
+    }
+    const updates = [];
+    const missing = [];
+    for (const [fp, matchingLogs] of logByFingerprint) {
+      // 內容相同的多筆資料無法可靠辨識是哪筆被手動刪除，全部跳過。
+      if (matchingLogs.length !== 1) continue;
+      const e = matchingLogs[0];
+      if (e.status === "已刪除") continue;
+      const matches = actual.get(fp) || [];
+      if (matches.length > 1) continue;
+      if (matches.length === 0) missing.push(e);
+      else if (matches[0] !== e.row) updates.push({e, row: matches[0]});
+    }
+    // 先更新個人日誌；中央刪除失敗下次會重試。
+    const requests = [];
+    for (const {e,row} of updates) requests.push({updateCells:{
+      range:{sheetId:logTab.sheetId,startRowIndex:e.logRow-1,endRowIndex:e.logRow,
+        startColumnIndex:2,endColumnIndex:3},
+      rows:[{values:[sheetCell(row)]}],fields:"userEnteredValue"}});
+    for (const e of missing) requests.push({updateCells:{
+      range:{sheetId:logTab.sheetId,startRowIndex:e.logRow-1,endRowIndex:e.logRow,
+        startColumnIndex:10,endColumnIndex:12},
+      rows:[{values:[sheetCell("已刪除"),sheetCell(new Date().toISOString())]}],
+      fields:"userEnteredValue"}});
+    if (requests.length) await sheets.spreadsheets.batchUpdate({
+      spreadsheetId:sheetId,requestBody:{requests}});
+    for (const e of missing) {
+      try { await syncCentralDeleted(e.id); }
+      catch (err) { console.error("中央手動刪列同步失敗，稍後重試", e.id, err.message); }
+    }
+  }
+  // 已刪除的日誌即使先前中央失敗，也再次嘗試清理中央。
+  for (const e of entries.filter(e => TX_ID_PATTERN.test(e.id) && e.status === "已刪除")) {
+    try { await syncCentralDeleted(e.id); }
+    catch (err) { console.error("中央刪除重試失敗", e.id, err.message); }
+  }
+}
+async function reconcileAllBooks() {
+  if (reconciliationRunning) return;
+  reconciliationRunning = true;
+  try {
+    const sheets = await getSheets();
+    const title = await getMasterSheetTitle();
+    if (!title) return;
+    const response = await sheets.spreadsheets.values.get({spreadsheetId:MASTER_SHEET_ID,
+      range:`'${title}'!A2:F`,valueRenderOption:"FORMATTED_VALUE"});
+    const ids = [...new Set((response.data.values || [])
+      .filter(r => ["Y","YES","TRUE","1","啟用"].includes(String(r[4]||"").trim().toUpperCase()))
+      .map(r => String(r[3]||"").trim()).filter(Boolean))];
+    for (const id of ids) {
+      try { await reconcileOneBook(id); }
+      catch (err) { console.error("單一帳本對帳失敗", id.slice(0,6), err.message); }
+    }
+  } catch (err) { console.error("中央對帳失敗（不影響個人記帳）", err.message); }
+  finally { reconciliationRunning = false; }
+}
+// 每10分鐘背景檢查一次；中央失敗不阻止 LINE 記帳。
+setInterval(() => { reconcileAllBooks().catch(err => console.error(err)); }, 10 * 60 * 1000);
 
 async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return null;

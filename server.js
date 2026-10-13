@@ -791,37 +791,68 @@ async function ensurePersonalFarmColumns(sheetId, monthSheet) {
   }
 }
 
+// 歷史月份安全補登：依現有標題對應欄位，只追加新列，絕不修改舊標題或資料。
+async function getAppendLayout(sheetId, monthSheet) {
+  const sheets = await getSheets();
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId, range: `'${monthSheet}'!A1:AZ1`, valueRenderOption: "FORMATTED_VALUE"
+  });
+  const headers = result.data.values?.[0] || [];
+  const normalized = headers.map(h => String(h || "").replace(/^\uFEFF/, "").replace(/[\s\u200B-\u200D\u2060]/g, "").trim());
+  const indexOf = (...names) => normalized.findIndex(h => names.includes(h));
+  const positions = {
+    farm: indexOf("帳務歸屬", "場別"), payerFarm: indexOf("付款場別"),
+    txType: indexOf("收支類型"), paymentSource: indexOf("付款來源"),
+    code: indexOf("科目代號"), className: indexOf("科目分類"),
+    date: indexOf("日期"), accountItem: indexOf("品項"),
+    description: indexOf("用途說明"), vendor: indexOf("廠商名稱"),
+    qty: indexOf("數量"), unitPrice: indexOf("單價"), amount: indexOf("金額"),
+    advanceTarget: indexOf("代墊對象"), userName: indexOf("填表人")
+  };
+  const required = ["farm", "txType", "date", "accountItem", "amount"];
+  const missing = required.filter(k => positions[k] < 0);
+  if (missing.length || !headers.length) {
+    throw new Error(`歷史月份 ${monthSheet} 欄位無法安全辨識（${missing.join(", ")}），未寫入任何資料。請先提供該月份第一列標題供確認。`);
+  }
+  if (new Set(Object.values(positions).filter(i => i >= 0)).size !== Object.values(positions).filter(i => i >= 0).length) {
+    throw new Error(`歷史月份 ${monthSheet} 欄位對應重複，已停止寫入。`);
+  }
+  // 歷史帳本沒有「付款場別」時，只允許一般收支，禁止代付。
+  return { positions, width: headers.length };
+}
+
 async function writeExpense(sheetId, monthSheet, expense, dateText, userName, userId) {
   const sheets = await getSheets();
-  await ensurePersonalFarmColumns(sheetId, monthSheet);
+  const isHistorical = monthSheet < "202610月";
+  let layout = null;
+  if (isHistorical) layout = await getAppendLayout(sheetId, monthSheet);
+  else await ensurePersonalFarmColumns(sheetId, monthSheet);
   await centralRows(await centralSheets()); // 中央欄位不正確時，不得先寫個人帳本。
+  const valuesForWrite = [expense.farm, expense.payerFarm || expense.farm,
+    expense.txType || "支出", expense.paymentSource || "", expense.code,
+    expense.className, dateText, expense.accountItem, expense.description,
+    expense.vendor, expense.qty, expense.unitPrice,
+    expense.txType === "收入" ? -Math.abs(expense.amount) : Math.abs(expense.amount),
+    "", expense.advanceTarget || "", userName || ""];
+  let appendValues = valuesForWrite;
+  if (layout) {
+    appendValues = Array(layout.width).fill("");
+    const fields = ["farm", "payerFarm", "txType", "paymentSource", "code",
+      "className", "date", "accountItem", "description", "vendor", "qty",
+      "unitPrice", "amount", null, "advanceTarget", "userName"];
+    fields.forEach((field, i) => {
+      if (field && layout.positions[field] >= 0) appendValues[layout.positions[field]] = valuesForWrite[i];
+    });
+  }
 
   const txId = `TX-${randomUUID()}`;
   const appendResult = await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
-    range: `'${monthSheet}'!A:P`,
+    range: `'${monthSheet}'!A:${columnLetter(appendValues.length)}`,
     valueInputOption: "USER_ENTERED",
     insertDataOption: "INSERT_ROWS",
-    requestBody: {
-      values: [[
-        expense.farm,                                  // A 帳務歸屬
-        expense.payerFarm || expense.farm,             // B 付款場別
-        expense.txType || "支出",                      // C 收支類型
-        expense.paymentSource || "",                  // D 付款來源
-        expense.code,                                 // E 科目代號
-        expense.className,                            // F 科目分類
-        dateText,                                     // G 日期
-        expense.accountItem,                          // H 品項
-        expense.description,                          // I 用途說明
-        expense.vendor,                               // J 廠商名稱
-        expense.qty,                                  // K 數量
-        expense.unitPrice,                            // L 單價
-        expense.txType === "收入" ? -Math.abs(expense.amount) : Math.abs(expense.amount), // M 金額
-        "",                                           // N 發票或憑證
-        expense.advanceTarget || "",                  // O 代墊對象
-        userName || "",                               // P 填表人
-      ]],
-    },
+    requestBody: { values: [appendValues] },
+
   });
 
   // 記錄實際寫入時間，跨月份查詢依此排序；記帳成功後才寫日誌。
@@ -883,7 +914,7 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName, us
                   startRowIndex: rowNumber - 1,
                   endRowIndex: rowNumber,
                   startColumnIndex: 0,
-                  endColumnIndex: 16,
+                  endColumnIndex: isHistorical ? layout.width : 16,
                 },
                 cell: {
                   userEnteredFormat: {
@@ -1795,9 +1826,6 @@ async function handleTextMessage(event) {
     }
     const userName = await getProfileName(event);
 
-    if (dated.dateInfo.year < 2026 || (dated.dateInfo.year === 2026 && dated.dateInfo.month < 10)) {
-      return "⚠️ 2026年9月以前的歷史帳本僅供查詢，不接受補登或修改。";
-    }
     await ensureMonthSheet(targetSheetId, dated.dateInfo.monthSheet);
     const writeResult = await writeExpense(
       targetSheetId,

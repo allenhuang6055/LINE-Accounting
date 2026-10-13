@@ -1655,8 +1655,10 @@ const VENDOR_PREFERENCE_TAB = "個人常用廠商";
 const VENDOR_PREFERENCE_HEADERS = ["LINE User ID", "最近使用廠商JSON", "更新時間"];
 
 // 每位同事獨立保存最近使用的四家廠商；讀取失敗不影響記帳。
-async function getPersonalVendors(userId) {
+async function getPersonalVendors(userId, sheetId = null) {
   if (!userId) return [];
+  let vendors = [];
+  // 優先讀取個人偏好；若第一次使用尚無偏好，從該同事自己的帳本歷史廠商建立初始選項。
   try {
     await ensureSheet(MASTER_SHEET_ID, VENDOR_PREFERENCE_TAB, VENDOR_PREFERENCE_HEADERS);
     const sheets = await getSheets();
@@ -1666,14 +1668,34 @@ async function getPersonalVendors(userId) {
       valueRenderOption: "FORMATTED_VALUE",
     });
     const row = (res.data.values || []).find(r => String(r[0] || "").trim() === userId);
-    let vendors = [];
     try { vendors = JSON.parse(String(row?.[1] || "[]")); } catch (_) { vendors = []; }
     if (!Array.isArray(vendors)) vendors = [];
-    return vendors.map(v => String(v || "").trim()).filter((v, i, a) => v && v.length <= 80 && a.indexOf(v) === i).slice(0, 4);
   } catch (err) {
-    console.error("讀取個人常用廠商失敗：", err.message);
-    return [];
+    console.error("讀取個人常用廠商偏好失敗：", err.message);
   }
+  vendors = vendors.map(v => String(v || "").trim()).filter((v, i, a) => v && v.length <= 80 && a.indexOf(v) === i);
+
+  if (vendors.length < 4 && sheetId) {
+    try {
+      const sheets = await getSheets();
+      const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: "sheets.properties(title)" });
+      const months = (meta.data.sheets || []).map(x => x.properties?.title || "")
+        .filter(t => /^\d{6}月$/.test(t)).sort().reverse().slice(0, 12);
+      for (const month of months) {
+        const rows = await readMonthRows(sheetId, month);
+        rows.sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
+        for (const row of rows) {
+          const name = String(row.vendor || "").trim();
+          if (name && name.length <= 80 && !vendors.includes(name)) vendors.push(name);
+          if (vendors.length >= 4) break;
+        }
+        if (vendors.length >= 4) break;
+      }
+    } catch (err) {
+      console.error("讀取帳本歷史廠商失敗：", err.message);
+    }
+  }
+  return vendors.slice(0, 4);
 }
 
 async function recordPersonalVendor(userId, vendor) {
@@ -1710,8 +1732,8 @@ async function recordPersonalVendor(userId, vendor) {
   }
 }
 
-async function vendorPrompt(userId) {
-  const vendors = await getPersonalVendors(userId);
+async function vendorPrompt(userId, sheetId = null) {
+  const vendors = await getPersonalVendors(userId, sheetId);
   return vendors.length
     ? `🏪 請選擇最近使用的廠商，或自行輸入廠商名稱：\n${vendors.map((v, i) => `${i + 1}. ${v}`).join("\n")}\n也可以輸入「自行輸入」或「略過」。`
     : "🏪 請輸入廠商名稱，或輸入「略過」不填廠商。";
@@ -1836,10 +1858,24 @@ async function setGuidedAccount(sess,selected) {
   sess.command=command; sess.step="confirm";
   return guidedPreview(sess,parsed);
 }
-async function expenseMenuHandler(text, event) {
+async function expenseMenuHandler(text, event, sheetId = null) {
   const key = sessionKey(event);
   if (!key) return null;
-  if (text === "新增記帳") { expenseSessions.delete(key); helpSessions.delete(key); return menuHome(); }
+  if (["新增記帳", "支出記帳"].includes(text)) {
+    if (text === "支出記帳") {
+      const sess = {mode:"guided",step:"farm",txType:"支出",farmPage:1,expires:Date.now()+SESSION_TTL};
+      sess.farmOptions = await getPersonalFarmOptions(event.source?.userId || "");
+      expenseSessions.set(key, sess);
+      return chooseFarmText(1, sess.farmOptions);
+    }
+    expenseSessions.delete(key); helpSessions.delete(key); return menuHome();
+  }
+  if (text === "收入記帳") {
+    const sess = {mode:"guided",step:"farm",txType:"收入",farmPage:1,expires:Date.now()+SESSION_TTL};
+    sess.farmOptions = await getPersonalFarmOptions(event.source?.userId || "");
+    expenseSessions.set(key, sess);
+    return chooseFarmText(1, sess.farmOptions);
+  }
   if (text === "刪除記帳") {
     expenseSessions.delete(key);
     helpSessions.delete(key);
@@ -1931,8 +1967,8 @@ async function expenseMenuHandler(text, event) {
       }
       sess.step = "vendor";
       sess.detail = sess.category;
-      sess.vendorOptions = await getPersonalVendors(event.source?.userId || "");
-      return await vendorPrompt(event.source?.userId || "");
+      sess.vendorOptions = await getPersonalVendors(event.source?.userId || "", sheetId);
+      return await vendorPrompt(event.source?.userId || "", sheetId);
     }
     sess.step="detail"; return sessionReply(sess);
   }
@@ -1940,17 +1976,17 @@ async function expenseMenuHandler(text, event) {
     if(!text || text.length>300) return "請輸入 1～300 字的用途說明，例如：馬達維修";
     sess.detail=text;
     sess.step="vendor";
-    sess.vendorOptions = await getPersonalVendors(event.source?.userId || "");
-    return await vendorPrompt(event.source?.userId || "");
+    sess.vendorOptions = await getPersonalVendors(event.source?.userId || "", sheetId);
+    return await vendorPrompt(event.source?.userId || "", sheetId);
   }
   if(sess.step==="vendor") {
-    const vendors = sess.vendorOptions || await getPersonalVendors(event.source?.userId || "");
+    const vendors = sess.vendorOptions || await getPersonalVendors(event.source?.userId || "", sheetId);
     if (text === "自行輸入") return "請直接輸入廠商名稱；若不填請輸入「略過」。";
     if (text === "略過") sess.vendor = "";
     else {
       const index = /^\d+$/.test(text) ? Number(text) - 1 : -1;
       sess.vendor = index >= 0 && index < vendors.length ? vendors[index] : text.trim();
-      if (!sess.vendor || sess.vendor.length > 80) return await vendorPrompt(event.source?.userId || "");
+      if (!sess.vendor || sess.vendor.length > 80) return await vendorPrompt(event.source?.userId || "", sheetId);
     }
     if (sess.mode === "common" && sess.category) {
       const rows = await getAccountMasterRows();
@@ -2052,7 +2088,7 @@ async function handleTextMessage(event) {
   const targetSheetId = userSheet.sheetId;
 
   // Menu commands and active guided sessions are resolved only for bound users.
-  const menuResult = await expenseMenuHandler(text, event);
+  const menuResult = await expenseMenuHandler(text, event, targetSheetId);
   if (menuResult && typeof menuResult === "object" && menuResult.commitCommand) {
     // Reuse the original validated expense parser, monthly sheet writer and central sync.
     return await handleTextMessage({...event, message:{...event.message, text:menuResult.commitCommand}});

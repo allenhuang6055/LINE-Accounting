@@ -1643,7 +1643,7 @@ const COMMON_EXPENSES = {
 // 常用支出按鈕直接帶入用途與科目；僅在金額輸入後進行確認。
 function sessionKey(event) { return event.source?.userId || ""; }
 function menuHome() {
-  return "📝 新增記帳\n請輸入：\n1 快速記帳\n2 引導式記帳\n3 常用支出\n\n或直接輸入：草湖 支出 500 電風扇 / 三豐\n輸入「取消記帳」可結束操作。";
+  return "📝 新增記帳\n請選擇功能：快速記帳、引導式記帳、常用支出或刪除記帳。\n\n也可直接輸入：草湖 支出 500 電風扇 / 三豐\n輸入「取消記帳」可結束操作。";
 }
 const FARM_MENU_ALL = [
   "草湖", "東平", "仁愛", "東勢", "埤北", "賜福", "永興", "秉夆",
@@ -1840,6 +1840,11 @@ async function expenseMenuHandler(text, event) {
   const key = sessionKey(event);
   if (!key) return null;
   if (text === "新增記帳") { expenseSessions.delete(key); helpSessions.delete(key); return menuHome(); }
+  if (text === "刪除記帳") {
+    expenseSessions.delete(key);
+    helpSessions.delete(key);
+    return "🗑️ 刪除記帳\n請選擇：刪除上一筆（僅限本人）或查看最近10筆，再選擇要刪除的本人紀錄。刪除前仍會要求確認。";
+  }
   if (text === "取消記帳") { expenseSessions.delete(key); helpSessions.delete(key); return "已取消本次新增記帳（沒有寫入資料）。"; }
   if (text === "記帳說明") return menuHome();
   if (text === "代付說明" || text === "跨場代付") return "跨場代付目前尚未開放，請勿用一般支出代替跨場代付，以免帳務歸屬錯誤。";
@@ -2139,7 +2144,8 @@ function expenseQuickReply(text, event) {
   const key = sessionKey(event);
   const sess = key ? expenseSessions.get(key) : null;
   let choices = [];
-  if (text === menuHome()) choices = ["快速記帳", "引導式記帳", "常用支出"];
+  if (text === menuHome()) choices = ["快速記帳", "引導式記帳", "常用支出", "刪除記帳"];
+  else if (text.startsWith("🗑️ 刪除記帳")) choices = ["刪除上一筆", "最近10筆", "取消"];
   else if (sess?.step === "type") choices = ["支出", "收入", "取消記帳"];
   else if (sess?.step === "category") choices = ["汽油", "柴油", "電費", "飼料", "取消記帳"];
   else if (sess?.step === "farm") {
@@ -2162,6 +2168,8 @@ function expenseQuickReply(text, event) {
     choices=[...(p>1?["上一頁科目"]:[]),...(p < (help.totalPages||1)?["下一頁科目"]:[]),"返回操作說明"];
   } else if (help?.step === "search") choices=["返回操作說明"];
   if (!choices.length) return null;
+  // LINE Quick Reply 最多只能有 13 個項目；超出時保留前 12 個及最後一個（通常是取消/返回）。
+  if (choices.length > 13) choices = [...choices.slice(0, 12), choices[choices.length - 1]];
   return { items: choices.map(label => ({
     type: "action",
     action: label === "其他場別"

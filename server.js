@@ -1360,7 +1360,7 @@ async function confirmDeleteLast(sheetId, userId) {
   const entries = await readAccountingLog(sheetId);
   const entry = entries.find(e => e.id === pending.id && e.userId === userId && e.status !== "已刪除");
   if (!entry) return "❌ 找不到本人待刪除的有效記帳，已取消。";
-  if (!/^\d{6}月$/.test(entry.month) || entry.month < "202610月") return "⚠️ 歷史月份受保護，禁止刪除。";
+  if (!/^\d{6}月$/.test(entry.month)) return "❌ 月份分頁格式不正確，已停止刪除。";
   if (pending.mode === "own-last") {
     const newest = await lastOwnEntry(sheetId, userId);
     if (!newest || newest.id !== entry.id) return "⚠️ 期間又有新記帳，請重新輸入「刪除上一筆」。";

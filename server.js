@@ -1357,6 +1357,34 @@ function sheetCell(value) {
   return { userEnteredValue: typeof value === "number" ? { numberValue: value } : { stringValue: String(value) } };
 }
 
+// 列號安全恢復：僅在月份分頁有唯一完全吻合資料、且日誌沒有同特徵競爭交易時允許。
+// 不能保證辨識內容完全相同的兩筆交易；這種情況必須人工處理。
+function sameDeletionFingerprint(row, headers, entry) {
+  const val = (...names) => { const i = headerIndex(headers, names); return i >= 0 ? String(row[i] || "").trim() : ""; };
+  const amount = Number(val("金額").replace(/,/g, ""));
+  return row.length > 0 && val("帳務歸屬", "場別") === entry.farm &&
+    (val("收支類型") || "支出") === entry.txType &&
+    val("品項") === entry.item && Number.isFinite(amount) &&
+    Math.abs(amount) === Math.abs(entry.amount) && val("填表人") === entry.recorder;
+}
+
+async function resolveDeletionRow(sheets, sheetId, entry, entries, headers) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId, range: `'${entry.month}'!A2:R`,
+    valueRenderOption: "FORMATTED_VALUE"
+  });
+  const rows = res.data.values || [];
+  const candidateRows = rows.map((row, i) => ({ row, rowNumber: i + 2 }))
+    .filter(x => sameDeletionFingerprint(x.row, headers, entry));
+  if (candidateRows.length !== 1) return null;
+  const competitors = entries.filter(e => e.id !== entry.id && e.month === entry.month &&
+    e.status !== "已刪除" && e.farm === entry.farm && e.txType === entry.txType &&
+    e.item === entry.item && Math.abs(e.amount) === Math.abs(entry.amount) &&
+    e.recorder === entry.recorder);
+  if (competitors.length) return null;
+  return candidateRows[0].rowNumber;
+}
+
 async function confirmDeleteLast(sheetId, userId) {
   const key = `${sheetId}:${userId}`;
   const pending = pendingDeletions.get(key);
@@ -1380,28 +1408,29 @@ async function confirmDeleteLast(sheetId, userId) {
   const monthTab = tabs.find(t => t.title === entry.month);
   const logTab = tabs.find(t => t.title === RECENT_LOG_TAB);
   if (!monthTab || !logTab) return "❌ 分頁不存在，未執行刪除。";
-  const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: sheetId, range: `'${entry.month}'!A${entry.row}:R${entry.row}`,
-    valueRenderOption: "FORMATTED_VALUE"
-  });
-  const row = result.data.values?.[0] || [];
   const headResult = await sheets.spreadsheets.values.get({
     spreadsheetId: sheetId, range: `'${entry.month}'!A1:R1`,
     valueRenderOption: "FORMATTED_VALUE"
   });
   const headers = headResult.data.values?.[0] || [];
-  const value = (name) => { const i = headerIndex(headers, [name]); return i >= 0 ? String(row[i] || "").trim() : ""; };
-  const rowAmount = Number(value("金額").replace(/,/g, ""));
-  if (!row.length || (value("帳務歸屬") || value("場別")) !== entry.farm ||
-      (value("收支類型") || "支出") !== entry.txType || value("品項") !== entry.item ||
-      Math.abs(rowAmount) !== Math.abs(entry.amount) || value("填表人") !== entry.recorder) {
-    return "❌ 月份分頁資料與記帳紀錄不一致，為避免刪錯帳已停止。請人工檢查。";
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId, range: `'${entry.month}'!A${entry.row}:R${entry.row}`,
+    valueRenderOption: "FORMATTED_VALUE"
+  });
+  const row = result.data.values?.[0] || [];
+  let actualRow = entry.row;
+  if (!sameDeletionFingerprint(row, headers, entry)) {
+    actualRow = await resolveDeletionRow(sheets, sheetId, entry, entries, headers);
+    if (!actualRow) {
+      return "❌ 月份資料與記帳日誌不一致，且無法唯一辨識交易。已停止刪除，請人工檢查。";
+    }
+    console.warn(`[列號安全恢復] ${entry.id} ${entry.month}: ${entry.row} -> ${actualRow}`);
   }
 
   // 一個 batchUpdate 同時刪除月份列、標記日誌刪除、調整後續列號。
   // 記帳ID不變；列號僅作定位，不能當作中央同步主鍵。
   const requests = [{ deleteDimension: {
-    range: { sheetId: monthTab.sheetId, dimension: "ROWS", startIndex: entry.row - 1, endIndex: entry.row }
+    range: { sheetId: monthTab.sheetId, dimension: "ROWS", startIndex: actualRow - 1, endIndex: actualRow }
   }}];
   for (const e of entries) {
     if (e.id === entry.id) {
@@ -1411,7 +1440,7 @@ async function confirmDeleteLast(sheetId, userId) {
         rows: [{ values: [sheetCell("已刪除"), sheetCell(new Date().toISOString())] }],
         fields: "userEnteredValue"
       }});
-    } else if (e.month === entry.month && e.row > entry.row && e.status !== "已刪除") {
+    } else if (e.month === entry.month && e.row > actualRow && e.status !== "已刪除") {
       requests.push({ updateCells: {
         range: { sheetId: logTab.sheetId, startRowIndex: e.logRow - 1,
           endRowIndex: e.logRow, startColumnIndex: 2, endColumnIndex: 3 },

@@ -1549,7 +1549,7 @@ const COMMON_EXPENSES = {
   "電費": { detail: "電費", items: ["電費-雞場", "電費－雞場"] },
   "飼料": { detail: "飼料", items: ["飼料費"] }
 };
-// 常用支出按鈕直接帶入用途與科目；僅在金額輸入後進行確認。
+// 常用支出先選科目，輸入金額後再詢問廠商，確認後才寫入。
 function sessionKey(event) { return event.source?.userId || ""; }
 function menuHome() {
   return "📝 新增記帳\n請輸入：\n1 快速記帳\n2 引導式記帳\n3 常用支出\n\n或直接輸入：草湖 支出 500 電風扇 / 三豐\n輸入「取消記帳」可結束操作。";
@@ -1567,6 +1567,7 @@ function sessionReply(session) {
   if (session.step === "source") return session.txType === "收入" ? "收款來源請選擇：雞場帳戶或零用金" : "付款來源請輸入：1 雞場帳戶 / 2 零用金";
   if (session.step === "amount") return `請輸入${session.txType || "支出"}金額，例如：2500`;
   if (session.step === "detail") return "請輸入用途及廠商，例如：馬達維修 / 三豐";
+  if (session.step === "vendor") return "🏪 請輸入廠商名稱（例如：台塑加油站），或點「略過廠商」。";
   return "請輸入「確認記帳」或「取消記帳」。";
 }
 async function accountListText(page, session) {
@@ -1691,9 +1692,21 @@ async function expenseMenuHandler(text, event) {
         sess.accountCandidates = [];
         return `⚠️ 中央科目主檔找不到「${sess.category}」對應的科目。\n請輸入科目名稱或代號，或點「使用雜項費用」。`;
       }
-      return await setGuidedAccount(sess, selected);
+      sess.commonAccount = selected.item;
+      sess.step = "vendor";
+      return sessionReply(sess);
     }
     sess.step="detail"; return sessionReply(sess);
+  }
+  if(sess.step==="vendor" && sess.mode==="common") {
+    if (!text || text.length > 100) return "請輸入 1～100 字廠商名稱，或點「略過廠商」。";
+    const vendor = text === "略過廠商" ? "" : text.trim();
+    // 沿用既有「用途 / 廠商」解析器，避免改動個人帳本及中央寫入邏輯。
+    sess.detail = sess.category + (vendor ? " / " + vendor : "");
+    const rows = await getAccountMasterRows();
+    const selected = rows.find(r => r.item === sess.commonAccount);
+    if (!selected) return "⚠️ 科目主檔已變更，請取消記帳後重新操作。";
+    return await setGuidedAccount(sess, selected);
   }
   if(sess.step==="detail") {
     if(!text || text.length>300) return "請輸入 1～300 字的用途，例如：馬達維修 / 三豐";
@@ -1889,7 +1902,17 @@ function expenseQuickReply(text, event) {
   else if (sess?.step === "account") {
     choices = [...(sess.accountCandidates||[]).slice(0,5).map(r=>r.item).filter(x=>x.length<=20), "使用雜項費用", "重新輸入用途", "取消記帳"];
   }
+  else if (sess?.step === "vendor") choices = ["略過廠商", "取消記帳"];
   else if (sess?.step === "confirm") choices = ["確認記帳", "更換科目", "取消記帳"];
+  // 刪除按鈕只是送出既有文字指令；仍經過本人ID檢查及二次確認。
+  if (text.includes("請於5分鐘內輸入「確認刪除」")) {
+    choices = ["確認刪除", "取消"];
+  } else if (text.includes("可刪除：刪除第") && key) {
+    const snapshot = [...recentSnapshots.entries()].find(([k]) => k.endsWith(":" + key));
+    if (snapshot && Date.now() <= snapshot[1].expiresAt) {
+      choices = (snapshot[1].ids || []).slice(0,10).map((id,i) => id ? `刪除第${i+1}筆` : null).filter(Boolean);
+    }
+  }
   const help = key ? helpSessions.get(key) : null;
   if (text.startsWith("📖 操作說明")) choices=["全部會計科目","關鍵字查詢","記帳操作教學"];
   else if (help?.step === "list") {

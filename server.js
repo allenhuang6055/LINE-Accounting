@@ -7,12 +7,12 @@ const { randomUUID } = require("node:crypto");
 
 const app = express();
 
-// MAIN V2.3：正式環境啟動保護。
+// MAIN V2.3.1：正式環境啟動保護＋個人場別智慧排序。
 if (process.env.APP_ENV !== "MAIN") {
-  throw new Error("MAIN V2.3 需要 APP_ENV=MAIN；未啟動正式記帳");
+  throw new Error("MAIN V2.3.1 需要 APP_ENV=MAIN；未啟動正式記帳");
 }
 if (process.env.CENTRAL_SYNC_ENABLED !== "true" || !process.env.CENTRAL_SHEET_ID || !process.env.MASTER_SHEET_ID) {
-  throw new Error("MAIN V2.3 必須設定 MASTER_SHEET_ID、CENTRAL_SHEET_ID 及 CENTRAL_SYNC_ENABLED=true");
+  throw new Error("MAIN V2.3.1 必須設定 MASTER_SHEET_ID、CENTRAL_SHEET_ID 及 CENTRAL_SYNC_ENABLED=true");
 }
 
 
@@ -1645,19 +1645,152 @@ function sessionKey(event) { return event.source?.userId || ""; }
 function menuHome() {
   return "📝 新增記帳\n請輸入：\n1 快速記帳\n2 引導式記帳\n3 常用支出\n\n或直接輸入：草湖 支出 500 電風扇 / 三豐\n輸入「取消記帳」可結束操作。";
 }
-const FARM_MENU_PAGES = [
-  ["草湖", "東平", "仁愛", "東勢", "埤北", "賜福", "永興", "秉夆", "後寮", "鎮平", "東陽", "潭墘"],
-  ["龍潭", "泰順"]
+const FARM_MENU_ALL = [
+  "草湖", "東平", "仁愛", "東勢", "埤北", "賜福", "永興", "秉夆",
+  "後寮", "鎮平", "東陽", "潭墘", "龍潭", "泰順"
 ];
-function chooseFarmText(page = 1) {
-  return `🏠 請選擇記帳場別（第 ${page}/2 頁）\n也可以直接輸入場別名稱。\n輸入「取消記帳」可離開。`;
+const FARM_PREFERENCE_TAB = "個人場別排序";
+const FARM_PREFERENCE_HEADERS = ["LINE User ID", "最近使用場別JSON", "更新時間"]
+const VENDOR_PREFERENCE_TAB = "個人常用廠商";
+const VENDOR_PREFERENCE_HEADERS = ["LINE User ID", "最近使用廠商JSON", "更新時間"];
+
+// 每位同事獨立保存最近使用的四家廠商；讀取失敗不影響記帳。
+async function getPersonalVendors(userId) {
+  if (!userId) return [];
+  try {
+    await ensureSheet(MASTER_SHEET_ID, VENDOR_PREFERENCE_TAB, VENDOR_PREFERENCE_HEADERS);
+    const sheets = await getSheets();
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: MASTER_SHEET_ID,
+      range: `'${VENDOR_PREFERENCE_TAB}'!A2:C`,
+      valueRenderOption: "FORMATTED_VALUE",
+    });
+    const row = (res.data.values || []).find(r => String(r[0] || "").trim() === userId);
+    let vendors = [];
+    try { vendors = JSON.parse(String(row?.[1] || "[]")); } catch (_) { vendors = []; }
+    if (!Array.isArray(vendors)) vendors = [];
+    return vendors.map(v => String(v || "").trim()).filter((v, i, a) => v && v.length <= 80 && a.indexOf(v) === i).slice(0, 4);
+  } catch (err) {
+    console.error("讀取個人常用廠商失敗：", err.message);
+    return [];
+  }
+}
+
+async function recordPersonalVendor(userId, vendor) {
+  const name = String(vendor || "").trim();
+  if (!userId || !name || name.length > 80) return;
+  try {
+    await ensureSheet(MASTER_SHEET_ID, VENDOR_PREFERENCE_TAB, VENDOR_PREFERENCE_HEADERS);
+    const sheets = await getSheets();
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: MASTER_SHEET_ID,
+      range: `'${VENDOR_PREFERENCE_TAB}'!A2:C`,
+      valueRenderOption: "FORMATTED_VALUE",
+    });
+    const values = res.data.values || [];
+    const idx = values.findIndex(r => String(r[0] || "").trim() === userId);
+    let previous = [];
+    if (idx >= 0) { try { previous = JSON.parse(String(values[idx][1] || "[]")); } catch (_) {} }
+    if (!Array.isArray(previous)) previous = [];
+    const vendors = [name, ...previous.map(v => String(v || "").trim()).filter(v => v && v !== name)].slice(0, 4);
+    const row = [userId, JSON.stringify(vendors), new Date().toISOString()];
+    if (idx >= 0) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: MASTER_SHEET_ID, range: `'${VENDOR_PREFERENCE_TAB}'!A${idx + 2}:C${idx + 2}`,
+        valueInputOption: "RAW", requestBody: { values: [row] },
+      });
+    } else {
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: MASTER_SHEET_ID, range: `'${VENDOR_PREFERENCE_TAB}'!A:C`,
+        valueInputOption: "RAW", insertDataOption: "INSERT_ROWS", requestBody: { values: [row] },
+      });
+    }
+  } catch (err) {
+    console.error("儲存個人常用廠商失敗：", err.message);
+  }
+}
+
+async function vendorPrompt(userId) {
+  const vendors = await getPersonalVendors(userId);
+  return vendors.length
+    ? `🏪 請選擇最近使用的廠商，或自行輸入廠商名稱：\n${vendors.map((v, i) => `${i + 1}. ${v}`).join("\n")}\n也可以輸入「自行輸入」或「略過」。`
+    : "🏪 請輸入廠商名稱，或輸入「略過」不填廠商。";
+}
+
+// 讀取每位同事自己的最近場別排序；偏好存在中央主檔，Render 重啟後仍保留。
+async function getPersonalFarmOptions(userId) {
+  if (!userId) return [...FARM_MENU_ALL];
+  try {
+    await ensureSheet(MASTER_SHEET_ID, FARM_PREFERENCE_TAB, FARM_PREFERENCE_HEADERS);
+    const sheets = await getSheets();
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: MASTER_SHEET_ID,
+      range: `'${FARM_PREFERENCE_TAB}'!A2:C`,
+      valueRenderOption: "FORMATTED_VALUE",
+    });
+    const row = (res.data.values || []).find(r => String(r[0] || "").trim() === userId);
+    let recent = [];
+    try { recent = JSON.parse(String(row?.[1] || "[]")); } catch (_) { recent = []; }
+    if (!Array.isArray(recent)) recent = [];
+    recent = recent.filter((f, i) => FARM_MENU_ALL.includes(f) && recent.indexOf(f) === i);
+    return [...recent, ...FARM_MENU_ALL.filter(f => !recent.includes(f))];
+  } catch (err) {
+    console.error("讀取個人場別排序失敗，改用預設順序：", err.message);
+    return [...FARM_MENU_ALL];
+  }
+}
+
+async function recordPersonalFarm(userId, farm) {
+  if (!userId || !FARM_MENU_ALL.includes(String(farm || "").replace(/場$/, ""))) return;
+  const shortFarm = String(farm).replace(/場$/, "");
+  try {
+    await ensureSheet(MASTER_SHEET_ID, FARM_PREFERENCE_TAB, FARM_PREFERENCE_HEADERS);
+    const sheets = await getSheets();
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: MASTER_SHEET_ID,
+      range: `'${FARM_PREFERENCE_TAB}'!A2:C`,
+      valueRenderOption: "FORMATTED_VALUE",
+    });
+    const values = res.data.values || [];
+    const idx = values.findIndex(r => String(r[0] || "").trim() === userId);
+    let recent = [];
+    if (idx >= 0) { try { recent = JSON.parse(String(values[idx][1] || "[]")); } catch (_) {} }
+    if (!Array.isArray(recent)) recent = [];
+    recent = [shortFarm, ...recent.filter(f => f !== shortFarm && FARM_MENU_ALL.includes(f))].slice(0, FARM_MENU_ALL.length);
+    const row = [userId, JSON.stringify(recent), new Date().toISOString()];
+    if (idx >= 0) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: MASTER_SHEET_ID, range: `'${FARM_PREFERENCE_TAB}'!A${idx + 2}:C${idx + 2}`,
+        valueInputOption: "RAW", requestBody: { values: [row] },
+      });
+    } else {
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: MASTER_SHEET_ID, range: `'${FARM_PREFERENCE_TAB}'!A:C`,
+        valueInputOption: "RAW", insertDataOption: "INSERT_ROWS", requestBody: { values: [row] },
+      });
+    }
+  } catch (err) {
+    // 場別偏好失敗不能讓已完成的正式記帳失敗。
+    console.error("儲存個人場別排序失敗：", err.message);
+  }
+}
+
+function farmPages(options) {
+  const list = Array.isArray(options) && options.length ? options : FARM_MENU_ALL;
+  return [list.slice(0, 12), list.slice(12)];
+}
+function chooseFarmText(page = 1, options = FARM_MENU_ALL) {
+  const pages = farmPages(options);
+  const total = pages.length;
+  return `🏠 請選擇記帳場別（第 ${page}/${total} 頁）\n已依你最近使用的場別排序。\n也可以直接輸入場別名稱。\n輸入「取消記帳」可離開。`;
 }
 function sessionReply(session) {
   if (session.step === "type") return "請選擇記帳類型：支出或收入";
   if (session.step === "farm") return chooseFarmText(session.farmPage || 1);
   if (session.step === "source") return session.txType === "收入" ? "收款來源請選擇：雞場帳戶或零用金" : "付款來源請輸入：1 雞場帳戶 / 2 零用金";
   if (session.step === "amount") return `請輸入${session.txType || "支出"}金額，例如：2500`;
-  if (session.step === "detail") return "請輸入用途及廠商，例如：馬達維修 / 三豐";
+  if (session.step === "detail") return "請輸入用途說明，例如：馬達維修";
+  if (session.step === "vendor") return "請選擇最近使用的廠商、自行輸入，或輸入「略過」。";
   return "請輸入「確認記帳」或「取消記帳」。";
 }
 async function accountListText(page, session) {
@@ -1695,7 +1828,9 @@ function guidedPreview(sess, parsed) {
   return `🧾 請確認${sess.txType || "支出"}\n場別：${parsed.farm}\n付款／收款來源：${parsed.paymentSource}\n金額：${parsed.amount.toLocaleString("zh-TW")} 元\n科目：${parsed.accountItem}（${parsed.code}）\n用途：${parsed.description}\n廠商：${parsed.vendor||"未填"}\n\n點「確認記帳」正式寫入，或「取消記帳」不寫入。`;
 }
 async function setGuidedAccount(sess,selected) {
-  const command=`${sess.farm} ${sess.source ? "零 " : ""}${sess.txType || "支出"} ${sess.amount} ${selected.item} ${sess.detail}`;
+  const detail = String(sess.detail || sess.category || "").trim();
+  const vendor = String(sess.vendor || "").trim();
+  const command=`${sess.farm} ${sess.source ? "零 " : ""}${sess.txType || "支出"} ${sess.amount} ${selected.item} ${detail}${vendor ? ` / ${vendor}` : ""}`;
   const parsed=await parseExpenseCommand(command);
   if(!parsed || parsed.error || parsed.accountItem!==selected.item) return `科目核對失敗，請重新選擇：${parsed?.error||"科目不一致"}`;
   sess.command=command; sess.step="confirm";
@@ -1749,18 +1884,25 @@ async function expenseMenuHandler(text, event) {
   sess.expires=Date.now()+SESSION_TTL;
   if(sess.step==="type") {
     if(!["支出","收入"].includes(text)) return sessionReply(sess);
-    sess.txType=text; sess.step="farm"; sess.farmPage=1; return chooseFarmText(1);
+    sess.txType=text; sess.step="farm"; sess.farmPage=1;
+    sess.farmOptions=await getPersonalFarmOptions(event.source?.userId || "");
+    return chooseFarmText(1, sess.farmOptions);
   }
   if(sess.step==="category") {
     if(!COMMON_EXPENSES[text]) return "請輸入：汽油、柴油、電費、飼料";
-    sess.category=text; sess.detail=COMMON_EXPENSES[text].detail; sess.txType="支出"; sess.step="farm"; sess.farmPage=1; return chooseFarmText(1);
+    sess.category=text; sess.detail=COMMON_EXPENSES[text].detail; sess.txType="支出"; sess.step="farm"; sess.farmPage=1;
+    sess.farmOptions=await getPersonalFarmOptions(event.source?.userId || "");
+    return chooseFarmText(1, sess.farmOptions);
   }
   if(sess.step==="farm") {
-    if (text === "下一頁") { sess.farmPage=2; return chooseFarmText(2); }
-    if (text === "上一頁") { sess.farmPage=1; return chooseFarmText(1); }
+    const pages = farmPages(sess.farmOptions || FARM_MENU_ALL);
+    if (text === "下一頁") { sess.farmPage=2; return chooseFarmText(2, sess.farmOptions); }
+    if (text === "上一頁") { sess.farmPage=1; return chooseFarmText(1, sess.farmOptions); }
     const farm=farmFromToken(text);
-    const allowed = FARM_MENU_PAGES.flat();
-    if(!farm || !allowed.some(name => farmFromToken(name) === farm)) return chooseFarmText(sess.farmPage || 1);
+    const allowed = FARM_MENU_ALL;
+    if(!farm || !allowed.some(name => farmFromToken(name) === farm)) return chooseFarmText(sess.farmPage || 1, sess.farmOptions);
+    // 場別接受完整別名；快速選單順序僅使用標準短名。
+    sess.farmShort = String(text).replace(/場$/, "");
     sess.farm=farm; sess.step="source"; return sessionReply(sess);
   }
   if(sess.step==="source") {
@@ -1782,13 +1924,41 @@ async function expenseMenuHandler(text, event) {
         sess.accountCandidates = [];
         return `⚠️ 中央科目主檔找不到「${sess.category}」對應的科目。\n請輸入科目名稱或代號，或點「使用雜項費用」。`;
       }
-      return await setGuidedAccount(sess, selected);
+      sess.step = "vendor";
+      sess.detail = sess.category;
+      sess.vendorOptions = await getPersonalVendors(event.source?.userId || "");
+      return await vendorPrompt(event.source?.userId || "");
     }
     sess.step="detail"; return sessionReply(sess);
   }
   if(sess.step==="detail") {
-    if(!text || text.length>300) return "請輸入 1～300 字的用途，例如：馬達維修 / 三豐";
+    if(!text || text.length>300) return "請輸入 1～300 字的用途說明，例如：馬達維修";
     sess.detail=text;
+    sess.step="vendor";
+    sess.vendorOptions = await getPersonalVendors(event.source?.userId || "");
+    return await vendorPrompt(event.source?.userId || "");
+  }
+  if(sess.step==="vendor") {
+    const vendors = sess.vendorOptions || await getPersonalVendors(event.source?.userId || "");
+    if (text === "自行輸入") return "請直接輸入廠商名稱；若不填請輸入「略過」。";
+    if (text === "略過") sess.vendor = "";
+    else {
+      const index = /^\d+$/.test(text) ? Number(text) - 1 : -1;
+      sess.vendor = index >= 0 && index < vendors.length ? vendors[index] : text.trim();
+      if (!sess.vendor || sess.vendor.length > 80) return await vendorPrompt(event.source?.userId || "");
+    }
+    if (sess.mode === "common" && sess.category) {
+      const rows = await getAccountMasterRows();
+      const spec = COMMON_EXPENSES[sess.category];
+      const normalizeItem = v => String(v || "").replace(/[－–—]/g, "-").replace(/\s+/g, "").toLowerCase();
+      const selected = rows.find(r => spec.items.some(name => normalizeItem(r.item) === normalizeItem(name)));
+      if (!selected) {
+        sess.step = "account";
+        sess.accountCandidates = [];
+        return `⚠️ 中央科目主檔找不到「${sess.category}」對應的科目。\n請輸入科目名稱或代號，或點「使用雜項費用」。`;
+      }
+      return await setGuidedAccount(sess, selected);
+    }
     const {rows,candidates}=await suggestGuidedAccounts(sess.detail);
     sess.accountCandidates=candidates;
     sess.step="account";
@@ -1933,6 +2103,8 @@ async function handleTextMessage(event) {
       userName,
       event.source?.userId || ""
     );
+    await recordPersonalFarm(event.source?.userId || "", expense.farm);
+    await recordPersonalVendor(event.source?.userId || "", expense.vendor);
 
     return [
       `✅ ${expense.txType}記錄完成`,
@@ -1971,12 +2143,14 @@ function expenseQuickReply(text, event) {
   else if (sess?.step === "type") choices = ["支出", "收入", "取消記帳"];
   else if (sess?.step === "category") choices = ["汽油", "柴油", "電費", "飼料", "取消記帳"];
   else if (sess?.step === "farm") {
+    const pages = farmPages(sess.farmOptions || FARM_MENU_ALL);
     const page = sess.farmPage === 2 ? 2 : 1;
     choices = page === 1
-      ? [...FARM_MENU_PAGES[0], "下一頁"]
-      : [...FARM_MENU_PAGES[1], "上一頁", "取消記帳"];
+      ? [...pages[0], ...(pages[1].length ? ["下一頁"] : []), "取消記帳"]
+      : [...pages[1], "上一頁", "取消記帳"];
   }
   else if (sess?.step === "source") choices = ["雞場帳戶", "零用金", "取消記帳"];
+  else if (sess?.step === "vendor") choices = [...(sess.vendorOptions || []).slice(0,4), "自行輸入", "略過", "取消記帳"];
   else if (sess?.step === "account") {
     choices = [...(sess.accountCandidates||[]).slice(0,5).map(r=>r.item).filter(x=>x.length<=20), "使用雜項費用", "重新輸入用途", "取消記帳"];
   }

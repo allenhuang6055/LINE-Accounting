@@ -2240,6 +2240,45 @@ function expenseQuickReply(text, event) {
   })) };
 }
 
+// V2.5.2：個人帳本同步快照。只用於 2026/10 起有 S 欄永久交易 ID 的月份。
+// Google Sheets 定時輪詢無法單憑「ID 消失」判定刪除；必須另有分頁總列數減少的證據。
+const SYNC_SNAPSHOT_TAB = "系統同步快照";
+const SYNC_SNAPSHOT_HEADERS = ["月份", "上次分頁總列數", "上次交易ID清單JSON", "快照時間UTC"];
+async function readSyncSnapshots(sheetId, sheets) {
+  await ensureSheet(sheetId, SYNC_SNAPSHOT_TAB, SYNC_SNAPSHOT_HEADERS);
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId, range: `'${SYNC_SNAPSHOT_TAB}'!A2:D`, valueRenderOption: "FORMATTED_VALUE"
+  });
+  const out = new Map();
+  (result.data.values || []).forEach((r, i) => {
+    if (!r[0]) return;
+    try {
+      const ids = JSON.parse(String(r[2] || "[]"));
+      if (!Array.isArray(ids) || ids.some(id => !TX_ID_PATTERN.test(id)) || new Set(ids).size !== ids.length) throw Error("invalid IDs");
+      const gridRows = Number(r[1]);
+      if (!Number.isSafeInteger(gridRows) || gridRows < 1) throw Error("invalid gridRows");
+      out.set(String(r[0]), { sheetRow: i + 2, gridRows, ids });
+    } catch (err) { throw new Error(`同步快照 ${r[0]} 損壞，已停止該帳本對帳：${err.message}`); }
+  });
+  return out;
+}
+async function saveSyncSnapshot(sheetId, sheets, snapshots, month, gridRows, ids) {
+  const json = JSON.stringify([...ids].sort());
+  if (json.length > 45000) throw new Error(`月份 ${month} 快照過大，請人工處理`);
+  const values = [[month, gridRows, json, new Date().toISOString()]];
+  const old = snapshots.get(month);
+  if (old) {
+    await sheets.spreadsheets.values.update({ spreadsheetId: sheetId,
+      range: `'${SYNC_SNAPSHOT_TAB}'!A${old.sheetRow}:D${old.sheetRow}`,
+      valueInputOption: "RAW", requestBody: { values } });
+  } else {
+    await sheets.spreadsheets.values.append({ spreadsheetId: sheetId,
+      range: `'${SYNC_SNAPSHOT_TAB}'!A:D`, valueInputOption: "RAW",
+      insertDataOption: "INSERT_ROWS", requestBody: { values } });
+  }
+  snapshots.set(month, {sheetRow: old?.sheetRow || 0, gridRows, ids: [...ids]});
+}
+
 // 中央安全對帳：只校正唯一匹配交易的列號；不依內容差異自動刪中央。
 // 絕不依舊列號單獨判定刪除；有重複內容、欄位缺漏或資料異常時略過。
 let reconciliationRunning = false;
@@ -2250,6 +2289,7 @@ function reconcileFingerprint(farm, type, item, amount, recorder) {
 async function reconcileOneBook(sheetId) {
   const sheets = await getSheets();
   const entries = await readAccountingLog(sheetId);
+  const snapshots = await readSyncSnapshots(sheetId, sheets);
   const groups = new Map();
   for (const e of entries) {
     if (!TX_ID_PATTERN.test(e.id) || !/^\d{6}月$/.test(e.month)) continue;
@@ -2257,7 +2297,7 @@ async function reconcileOneBook(sheetId) {
     groups.get(e.month).push(e);
   }
   const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId,
-    fields: "sheets.properties(sheetId,title)" });
+    fields: "sheets.properties(sheetId,title,gridProperties.rowCount)" });
   const tabs = new Map((meta.data.sheets || []).map(t => [t.properties.title, t.properties]));
   const logTab = tabs.get(RECENT_LOG_TAB);
   if (!logTab) return;
@@ -2268,7 +2308,7 @@ async function reconcileOneBook(sheetId) {
     const rows = response.data.values || [];
     const headers = rows[0] || [];
     // V2: 只處理 S 欄有永久交易ID的記錄。沒有ID的舊帳絕不自動刪。
-    if (headers[PERSONAL_TX_COL] === PERSONAL_TX_HEADER) {
+    if (month >= "202610月" && headers[PERSONAL_TX_COL] === PERSONAL_TX_HEADER) {
       const byId=new Map();
       for(let i=1;i<rows.length;i++) {
         const id=String(rows[i]?.[PERSONAL_TX_COL]||"").trim();
@@ -2276,37 +2316,62 @@ async function reconcileOneBook(sheetId) {
         if(!byId.has(id)) byId.set(id,[]);
         byId.get(id).push(i+1);
       }
-      const changes=[];
-      const missing=[];
-      for(const e of logs) {
-        if(e.status==="已刪除" || !TX_ID_PATTERN.test(e.id)) continue;
-        const hits=byId.get(e.id)||[];
-        if(hits.length>1) {console.warn("[V2 對帳] 重複交易ID，跳過",e.id);continue;}
-        if(hits.length===1) {
-          if(hits[0]!==e.row) changes.push({updateCells:{range:{sheetId:logTab.sheetId,startRowIndex:e.logRow-1,endRowIndex:e.logRow,startColumnIndex:2,endColumnIndex:3},rows:[{values:[sheetCell(hits[0])]}],fields:"userEnteredValue"}});
-        } else {
-          // 只認定已在 V2 登記表中成功寫入ID的交易；不能因舊帳缺ID而誤刪。
-          if (e.v2Marker === "V2-ID") {
-            // 有人僅清空 S 欄或改動 ID 時，不能當成刪除整列。
-            const stillPresent=rows.slice(1).some(r => {
-              const farm=headerIndex(headers,["帳務歸屬","場別"]);
-              const typ=headerIndex(headers,["收支類型"]);
-              const item=headerIndex(headers,["品項"]);
-              const amt=headerIndex(headers,["金額"]);
-              const who=headerIndex(headers,["填表人"]);
-              return [farm,typ,item,amt,who].every(x=>x>=0) &&
-                reconcileFingerprint(r[farm],r[typ],r[item],r[amt],r[who])===
-                reconcileFingerprint(e.farm,e.txType,e.item,e.amount,e.recorder);
-            });
-            if(!stillPresent) {
-              // 缺少 ID 並不能區分整列刪除、人工修改或清空 ID；先保留中央。
-              console.warn(`[V2 對帳待核對] ${month} ${e.id}：找不到永久ID，未自動刪除中央`);
-            }
+      const currentIds = new Set(byId.keys());
+      const snapshot = snapshots.get(month);
+      const gridRows = Number(tabs.get(month).gridProperties?.rowCount || 0);
+      const changes = [];
+      const missing = [];
+      let unsafe = false;
+      for (const e of logs) {
+        if (e.status === "已刪除" || e.v2Marker !== "V2-ID") continue;
+        const hits = byId.get(e.id) || [];
+        if (hits.length > 1) { unsafe = true; console.warn("[V2.5.2] 重複交易ID", e.id); continue; }
+        if (hits.length === 1) {
+          if (hits[0] !== e.row) changes.push({updateCells:{range:{sheetId:logTab.sheetId,
+            startRowIndex:e.logRow-1,endRowIndex:e.logRow,startColumnIndex:2,endColumnIndex:3},
+            rows:[{values:[sheetCell(hits[0])]}],fields:"userEnteredValue"}});
+        } else missing.push(e);
+      }
+      // 只有「先前快照確實存在該 ID」且「Google 分頁總列數減少」才有刪除證據。
+      // 缺 ID 但列數未減少，視為人工清空 ID 或其他異常，不刪中央。
+      const removedRows = snapshot && gridRows > 0 ? snapshot.gridRows - gridRows : 0;
+      const previouslyKnown = new Set(snapshot?.ids || []);
+      // 升級前就已缺失的交易不在快照中，僅列警告；不阻止新交易日後的刪除辨識。
+      const newlyMissing = missing.filter(e => previouslyKnown.has(e.id));
+      const oldMissing = missing.filter(e => !previouslyKnown.has(e.id));
+      const safelyMissing = newlyMissing.length > 0 && snapshot && removedRows > 0 &&
+        newlyMissing.length <= removedRows;
+      // 避免新交易 ID 重複、未知交易 ID 或整個分頁異常造成誤刪。
+      if ([...byId.values()].some(hits => hits.length !== 1)) unsafe = true;
+      if ([...currentIds].some(id => !TX_ID_PATTERN.test(id))) unsafe = true;
+      if (!gridRows || rows.length > gridRows) unsafe = true;
+      if (oldMissing.length) console.warn(`[V2.5.2 升級前待核對] ${month} ${oldMissing.length}筆；中央保留`);
+      if (newlyMissing.length && (!safelyMissing || unsafe)) {
+        console.warn(`[V2.5.2 待核對] ${month} 新缺少=${newlyMissing.length}筆，總列數減少=${removedRows}；中央保留`);
+      }
+      if (changes.length) await sheets.spreadsheets.batchUpdate({
+        spreadsheetId:sheetId,requestBody:{requests:changes}});
+      if (safelyMissing && !unsafe) {
+        // 先刪中央，成功後才將個人日誌標記為已刪除；下次對帳可安全重試。
+        for (const e of newlyMissing) {
+          try {
+            const result = await syncCentralDeleted(e.id);
+            if (result !== "deleted" && result !== "missing") throw Error(`中央刪除回傳 ${result}`);
+            await sheets.spreadsheets.values.update({spreadsheetId:sheetId,
+              range:`'${RECENT_LOG_TAB}'!K${e.logRow}:L${e.logRow}`,
+              valueInputOption:"RAW",requestBody:{values:[["已刪除",new Date().toISOString()]]}});
+            console.info(`[V2.5.2 手動刪除已同步] ${month} ${e.id}`);
+          } catch(err) {
+            unsafe = true;
+            console.error(`[V2.5.2 中央刪除失敗，保留快照待重試] ${e.id}`,err.message);
+            break;
           }
         }
       }
-      if(changes.length) await sheets.spreadsheets.batchUpdate({spreadsheetId:sheetId,requestBody:{requests:changes}});
-      // 刪除整列須由明確的 LINE 確認刪除處理；對帳不憑「ID 不見」刪除中央。
+      // 有不確定的缺失時保留原快照，不讓不明原因的缺 ID 被默默視為正常。
+      if (!unsafe && (newlyMissing.length === 0 || safelyMissing)) {
+        await saveSyncSnapshot(sheetId, sheets, snapshots, month, gridRows, currentIds);
+      }
       continue;
     }
     const col = names => headerIndex(headers, names);

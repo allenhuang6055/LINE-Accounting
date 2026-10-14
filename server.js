@@ -1452,12 +1452,12 @@ async function confirmDeleteLast(sheetId, userId) {
   const logTab = tabs.find(t => t.title === RECENT_LOG_TAB);
   if (!monthTab || !logTab) return "❌ 分頁不存在，未執行刪除。";
   const headResult = await sheets.spreadsheets.values.get({
-    spreadsheetId: sheetId, range: `'${entry.month}'!A1:R1`,
+    spreadsheetId: sheetId, range: `'${entry.month}'!A1:S1`,
     valueRenderOption: "FORMATTED_VALUE"
   });
   const headers = headResult.data.values?.[0] || [];
   const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: sheetId, range: `'${entry.month}'!A${entry.row}:R${entry.row}`,
+    spreadsheetId: sheetId, range: `'${entry.month}'!A${entry.row}:S${entry.row}`, 
     valueRenderOption: "FORMATTED_VALUE"
   });
   const row = result.data.values?.[0] || [];
@@ -1479,7 +1479,15 @@ async function confirmDeleteLast(sheetId, userId) {
       return "❌ 原列已有其他交易ID，且找不到本筆交易，已停止刪除。";
     }
   }
-  if (!hasTxColumn || !(await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${entry.month}'!S${actualRow}`,valueRenderOption:"FORMATTED_VALUE"})).data.values?.[0]?.[0]) {
+  // V2-ID 交易必須用 S 欄永久 ID 定位；絕不可退回指紋比對刪除。
+  if (entry.v2Marker === "V2-ID") {
+    if (!hasTxColumn) return "❌ 找不到系統交易ID欄，已停止刪除；請通知管理者。";
+    const confirmedId = await sheets.spreadsheets.values.get({spreadsheetId:sheetId,
+      range:`'${entry.month}'!S${actualRow}`,valueRenderOption:"FORMATTED_VALUE"});
+    if (String(confirmedId.data.values?.[0]?.[0] || "").trim() !== entry.id)
+      return "❌ 無法以永久交易ID唯一確認資料列，已停止刪除；請通知管理者。";
+  }
+  if (entry.v2Marker !== "V2-ID" && (!hasTxColumn || !(await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${entry.month}'!S${actualRow}`,valueRenderOption:"FORMATTED_VALUE"})).data.values?.[0]?.[0])) {
     if (!sameDeletionFingerprint(row, headers, entry)) {
     actualRow = await resolveDeletionRow(sheets, sheetId, entry, entries, headers);
     if (!actualRow) {
@@ -2290,23 +2298,15 @@ async function reconcileOneBook(sheetId) {
                 reconcileFingerprint(r[farm],r[typ],r[item],r[amt],r[who])===
                 reconcileFingerprint(e.farm,e.txType,e.item,e.amount,e.recorder);
             });
-            if(!stillPresent) missing.push(e);
+            if(!stillPresent) {
+              // 缺少 ID 並不能區分整列刪除、人工修改或清空 ID；先保留中央。
+              console.warn(`[V2 對帳待核對] ${month} ${e.id}：找不到永久ID，未自動刪除中央`);
+            }
           }
         }
       }
       if(changes.length) await sheets.spreadsheets.batchUpdate({spreadsheetId:sheetId,requestBody:{requests:changes}});
-      for(const e of missing) {
-        // 先核對中央唯一 ID；中央刪除失敗則不更動日誌，下次可重試。
-        try {
-          const central=await centralRows(sheets);
-          const matches=central.slice(1).filter(r=>String(r[0]||"")===e.id && String(r[17]||"")===sheetId && String(r[18]||"")===month);
-          if(matches.length!==1) {console.warn("[V2 對帳] 中央來源不唯一，跳過",e.id);continue;}
-          await syncCentralDeleted(e.id);
-          await sheets.spreadsheets.values.batchUpdate({spreadsheetId:sheetId,valueInputOption:"RAW",requestBody:{data:[
-            {range:`'${RECENT_LOG_TAB}'!K${e.logRow}:L${e.logRow}`,values:[["已刪除",new Date().toISOString()]]}
-          ]}});
-        } catch(err) {console.error("[V2 對帳] 刪除同步失敗",e.id,err.message);}
-      }
+      // 刪除整列須由明確的 LINE 確認刪除處理；對帳不憑「ID 不見」刪除中央。
       continue;
     }
     const col = names => headerIndex(headers, names);

@@ -2367,6 +2367,15 @@ async function reconcileOneBook(sheetId) {
       const oldMissing = missing.filter(e => !previouslyKnown.has(e.id));
       const safelyMissing = newlyMissing.length > 0 && snapshot && removedRows > 0 &&
         newlyMissing.length <= removedRows;
+      // V2.8 階段二：唯讀診斷，不放寬刪除條件，不輸出交易ID。
+      // gridProperties.rowCount 是配置列數，不等於實際記帳筆數。
+      if (missing.length || snapshot) {
+        console.info(`[V2.8 刪除診斷] 月份=${month} 快照=${snapshot ? "有" : "無"}` +
+          ` 快照ID數=${snapshot?.ids.length ?? 0} 現有ID數=${currentIds.size}` +
+          ` 舊缺失=${oldMissing.length} 新缺失=${newlyMissing.length}` +
+          ` 配置列差=${removedRows} 允許自動刪除=${Boolean(safelyMissing && !unsafe)}`);
+      }
+
       // 避免新交易 ID 重複、未知交易 ID 或整個分頁異常造成誤刪。
       if ([...byId.values()].some(hits => hits.length !== 1)) unsafe = true;
       if ([...currentIds].some(id => !TX_ID_PATTERN.test(id))) unsafe = true;

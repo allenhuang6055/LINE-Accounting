@@ -2305,6 +2305,30 @@ async function saveSyncSnapshot(sheetId, sheets, snapshots, month, gridRows, ids
   snapshots.set(month, {sheetRow: old?.sheetRow || 0, gridRows, ids: [...ids]});
 }
 
+// V2.8 第三階段：僅在快照已包含交易，且同輪可觀察到唯一的整列上移證據時，
+// 才將「手動刪除整列」視為可自動同步。刪最後一列、清空 ID、同時多筆異動都不自動刪。
+// 這是保守的自動判定，不代表 Google Sheets 能提供刪除操作的直接稽核事件。
+function v28HasSingleRowShiftProof({newlyMissing, logs, byId, snapshot, currentIds}) {
+  if (!snapshot || newlyMissing.length !== 1) return false;
+  const missing = newlyMissing[0];
+  if (!snapshot.ids.includes(missing.id) || !Number.isSafeInteger(missing.row) || missing.row < 2) return false;
+  const active = logs.filter(e => e.status !== "已刪除" && e.v2Marker === "V2-ID" && currentIds.has(e.id));
+  if (snapshot.ids.some(id => id !== missing.id && !currentIds.has(id))) return false;
+  const logIds = new Set(active.map(e => e.id));
+  // 有未知 ID 或重複 ID，可能是人工搬動或讀取異常，停止刪除。
+  if ([...currentIds].some(id => !logIds.has(id))) return false;
+  let shifted = 0;
+  for (const e of active) {
+    const hits = byId.get(e.id) || [];
+    if (hits.length !== 1 || !Number.isSafeInteger(e.row)) return false;
+    const expected = e.row > missing.row ? e.row - 1 : e.row;
+    if (hits[0] !== expected) return false;
+    if (e.row > missing.row) shifted++;
+  }
+  // 至少一筆後續交易確實向上移動一列；最後一列刪除無法據此證實。
+  return shifted > 0;
+}
+
 // 中央安全對帳：只校正唯一匹配交易的列號；不依內容差異自動刪中央。
 // 絕不依舊列號單獨判定刪除；有重複內容、欄位缺漏或資料異常時略過。
 let reconciliationRunning = false;
@@ -2358,22 +2382,23 @@ async function reconcileOneBook(sheetId) {
             rows:[{values:[sheetCell(hits[0])]}],fields:"userEnteredValue"}});
         } else missing.push(e);
       }
-      // 只有「先前快照確實存在該 ID」且「Google 分頁總列數減少」才有刪除證據。
-      // 缺 ID 但列數未減少，視為人工清空 ID 或其他異常，不刪中央。
+      // 必須有快照包含該 ID，且同輪觀察到唯一的整列上移證據。
+      // 配置總列數僅用於診斷，不再作為實際刪除的證據。
       const removedRows = snapshot && gridRows > 0 ? snapshot.gridRows - gridRows : 0;
       const previouslyKnown = new Set(snapshot?.ids || []);
       // 升級前就已缺失的交易不在快照中，僅列警告；不阻止新交易日後的刪除辨識。
       const newlyMissing = missing.filter(e => previouslyKnown.has(e.id));
       const oldMissing = missing.filter(e => !previouslyKnown.has(e.id));
-      const safelyMissing = newlyMissing.length > 0 && snapshot && removedRows > 0 &&
-        newlyMissing.length <= removedRows;
+      const safelyMissing = v28HasSingleRowShiftProof({
+        newlyMissing, logs, byId, snapshot, currentIds
+      });
       // V2.8 階段二：唯讀診斷，不放寬刪除條件，不輸出交易ID。
       // gridProperties.rowCount 是配置列數，不等於實際記帳筆數。
       if (missing.length || snapshot) {
         console.info(`[V2.8 刪除診斷] 月份=${month} 快照=${snapshot ? "有" : "無"}` +
           ` 快照ID數=${snapshot?.ids.length ?? 0} 現有ID數=${currentIds.size}` +
           ` 舊缺失=${oldMissing.length} 新缺失=${newlyMissing.length}` +
-          ` 配置列差=${removedRows} 允許自動刪除=${Boolean(safelyMissing && !unsafe)}`);
+          ` 配置列差=${removedRows} 整列位移證據=${safelyMissing} 允許自動刪除=${Boolean(safelyMissing && !unsafe)}`);
       }
 
       // 避免新交易 ID 重複、未知交易 ID 或整個分頁異常造成誤刪。

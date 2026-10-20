@@ -713,6 +713,43 @@ async function syncCentralCreate({ txId, dateText, expense, userName, sourceShee
   return "created";
 }
 
+// V2.9.2: 手動刪列專用，中央刪除前核對來源帳本與月份。
+// 缺失 ID 不是刪除證據；必須由上一輪完整快照及列位移共同確認。
+async function syncCentralDeletedVerified(txId, sourceSheetId, monthSheet) {
+  const sheets = await centralSheets();
+  if (!sheets) throw new Error("中央同步未啟用");
+  const values = await centralRows(sheets);
+  const matches = values.slice(1).map((row, i) => ({row, n:i+2}))
+    .filter(x => String(x.row[0] || "").trim() === txId);
+  if (matches.length !== 1) {
+    if (!matches.length) return "missing";
+    throw new Error(`中央交易 ID 重複：${txId}`);
+  }
+  const row = matches[0].row;
+  if (String(row[17] || "").trim() !== String(sourceSheetId).trim() ||
+      String(row[18] || "").trim() !== String(monthSheet).trim()) {
+    throw new Error("中央來源帳本或月份不符，禁止刪除");
+  }
+  if (String(row[20] || "").trim() !== "有效") {
+    throw new Error("中央交易狀態不是有效，禁止刪除");
+  }
+  // 在刪除前再讀一次中央，防止來源核對與刪除之間列號已改變。
+  const fresh = await centralRows(sheets);
+  if (String(fresh[matches[0].n - 1]?.[0] || "").trim() !== txId ||
+      String(fresh[matches[0].n - 1]?.[17] || "").trim() !== String(sourceSheetId).trim() ||
+      String(fresh[matches[0].n - 1]?.[18] || "").trim() !== String(monthSheet).trim()) {
+    throw new Error("中央列號在核對期間改變，禁止刪除");
+  }
+  const meta = await sheets.spreadsheets.get({spreadsheetId:CENTRAL_SHEET_ID,
+    fields:"sheets.properties(sheetId,title)"});
+  const tab = (meta.data.sheets || []).find(x => x.properties.title === CENTRAL_TAB);
+  if (!tab) throw new Error("找不到中央流水帳分頁");
+  await sheets.spreadsheets.batchUpdate({spreadsheetId:CENTRAL_SHEET_ID,
+    requestBody:{requests:[{deleteDimension:{range:{sheetId:tab.properties.sheetId,
+      dimension:"ROWS",startIndex:matches[0].n-1,endIndex:matches[0].n}}}]}});
+  return "deleted";
+}
+
 async function syncCentralDeleted(txId) {
   const sheets = await centralSheets();
   if (!sheets) return "disabled";
@@ -2407,7 +2444,12 @@ async function reconcileOneBook(sheetId) {
       // 升級前就已缺失的交易不在快照中，僅列警告；不阻止新交易日後的刪除辨識。
       const newlyMissing = missing.filter(e => previouslyKnown.has(e.id));
       const oldMissing = missing.filter(e => !previouslyKnown.has(e.id));
-      const safelyMissing = v29HasRowDeletionProof({
+      // 快照中的消失 ID 必須全部能在本輪日誌的「新缺失」找到；
+      // 否則可能是 LINE 刪除、人工修改 S 欄或其他異常，禁止自動刪除。
+      const snapshotGone = snapshot ? snapshot.ids.filter(id => !currentIds.has(id)) : [];
+      const snapshotMissingMatches = snapshotGone.length === newlyMissing.length &&
+        snapshotGone.every(id => newlyMissing.some(e => e.id === id));
+      const safelyMissing = snapshotMissingMatches && v29HasRowDeletionProof({
         newlyMissing, snapshot, byId, currentIds
       });
       // V2.8 階段二：唯讀診斷，不放寬刪除條件，不輸出交易ID。
@@ -2435,7 +2477,7 @@ async function reconcileOneBook(sheetId) {
         // 先刪中央，成功後才將個人日誌標記為已刪除；下次對帳可安全重試。
         for (const e of newlyMissing) {
           try {
-            const result = await syncCentralDeleted(e.id);
+            const result = await syncCentralDeletedVerified(e.id, sheetId, month);
             if (result !== "deleted" && result !== "missing") throw Error(`中央刪除回傳 ${result}`);
             await sheets.spreadsheets.values.update({spreadsheetId:sheetId,
               range:`'${RECENT_LOG_TAB}'!K${e.logRow}:L${e.logRow}`,

@@ -2254,6 +2254,18 @@ function expenseQuickReply(text, event) {
   })) };
 }
 
+// V2.8 TEST: Google Sheets API 配額保護，僅影響背景對帳，不停止 LINE 服務。
+const reconcileSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+function isSheetsReadQuotaError(err) {
+  const msg = String(err?.message || "").toLowerCase();
+  const status = Number(err?.code || err?.response?.status || 0);
+  return status === 429 || (status === 403 && /quota|rate limit|read requests/.test(msg)) ||
+    /quota exceeded|read requests per minute|rate limit exceeded|resource exhausted/.test(msg);
+}
+let reconciliationRetryAfter = 0;
+const RECONCILE_QUOTA_COOLDOWN_MS = 3 * 60 * 1000;
+const RECONCILE_BOOK_GAP_MS = 1500;
+
 // V2.5.2：個人帳本同步快照。只用於 2026/10 起有 S 欄永久交易 ID 的月份。
 // Google Sheets 定時輪詢無法單憑「ID 消失」判定刪除；必須另有分頁總列數減少的證據。
 const SYNC_SNAPSHOT_TAB = "系統同步快照";
@@ -2361,7 +2373,7 @@ async function reconcileOneBook(sheetId) {
       if (!gridRows || rows.length > gridRows) unsafe = true;
       if (oldMissing.length) console.warn(`[V2.5.2 升級前待核對] ${month} ${oldMissing.length}筆；中央保留`);
       if (newlyMissing.length && (!safelyMissing || unsafe)) {
-        console.warn(`[V2.5.2 待核對] ${month} 新缺少=${newlyMissing.length}筆，總列數減少=${removedRows}；中央保留`);
+        console.warn(`[V2.8 手動刪除待核對] 帳本=${String(sheetId).slice(0,6)} 月份=${month} 新缺少=${newlyMissing.length}筆，總列數減少=${removedRows}，異常=${unsafe}；中央保留。缺少ID不能單獨證明刪除整列。`);
       }
       if (changes.length) await sheets.spreadsheets.batchUpdate({
         spreadsheetId:sheetId,requestBody:{requests:changes}});
@@ -2440,6 +2452,10 @@ async function reconcileOneBook(sheetId) {
 }
 async function reconcileAllBooks() {
   if (reconciliationRunning) return;
+  if (Date.now() < reconciliationRetryAfter) {
+    console.info("[V2.8 配額保護] 冷卻期間，略過本輪背景對帳；不更動任何帳本");
+    return;
+  }
   reconciliationRunning = true;
   try {
     const sheets = await getSheets();
@@ -2452,11 +2468,25 @@ async function reconcileAllBooks() {
       .map(r => String(r[3]||"").trim()).filter(Boolean))];
     console.info(`[V2 對帳] 開始檢查，帳本數=${ids.length}`);
     for (const id of ids) {
+      // 各帳本間錯開請求，避免 8 本帳本在同一分鐘集中讀取。
+      await reconcileSleep(RECONCILE_BOOK_GAP_MS);
       try { await reconcileOneBook(id); }
-      catch (err) { console.error("單一帳本對帳失敗", id.slice(0,6), err.message); }
+      catch (err) {
+        if (isSheetsReadQuotaError(err)) {
+          reconciliationRetryAfter = Date.now() + RECONCILE_QUOTA_COOLDOWN_MS;
+          console.warn(`[V2.8 配額保護] Google Sheets 讀取限流，停止本輪背景對帳；下輪安全重試。帳本=${id.slice(0,6)}；中央不做推定刪除`);
+          break;
+        }
+        console.error("單一帳本對帳失敗", id.slice(0,6), err.message);
+      }
     }
     console.info("[V2 對帳] 本輪完成");
-  } catch (err) { console.error("中央對帳失敗（不影響個人記帳）", err.message); }
+  } catch (err) {
+    if (isSheetsReadQuotaError(err)) {
+      reconciliationRetryAfter = Date.now() + RECONCILE_QUOTA_COOLDOWN_MS;
+      console.warn("[V2.8 配額保護] 讀取受限，停止本輪背景對帳，下輪重試；不影響個人記帳");
+    } else console.error("中央對帳失敗（不影響個人記帳）", err.message);
+  }
   finally { reconciliationRunning = false; }
 }
 // 每10分鐘背景檢查一次；中央失敗不阻止 LINE 記帳。

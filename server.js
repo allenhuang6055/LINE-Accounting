@@ -857,9 +857,6 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName, us
   let layout = null;
   if (isHistorical) layout = await getAppendLayout(sheetId, monthSheet);
   else await ensurePersonalFarmColumns(sheetId, monthSheet);
-  if (expense.payerFarm && expense.payerFarm !== expense.farm && layout && layout.positions.payerFarm < 0) {
-    throw new Error("跨場代付需要付款場別欄位，已停止寫入");
-  }
   // 中央尚在建置：中央故障不得阻止個人帳本記帳。
   const valuesForWrite = [expense.farm, expense.payerFarm || expense.farm,
     expense.txType || "支出", expense.paymentSource || "", expense.code,
@@ -1259,10 +1256,7 @@ function helpText() {
     "草湖 支出 500 電風扇 / 三豐",
     "草湖 零 支出 500 電風扇 / 三豐",
     "",
-    "【跨場代付】",
-    "草湖幫東平 5600 電費 / 台電",
-    "9/28 草湖幫東平 5600 電費 / 台電",
-    "只寫付款同事帳本，中央費用歸屬受款場別",
+    "【跨場代付】V2.3 尚未開放",
     "",
     "【收入】",
     "仁愛 收入 5000 雞蛋銷售 / 客戶",
@@ -2155,23 +2149,15 @@ async function handleTextMessage(event) {
     return `❌ ${dated.error}`;
   }
 
-  // V2.6：跨場代付採 B 方案，僅寫入發起者個人帳本；中央以帳務歸屬計費。
-  // 與一般支出共用寫入及永久交易 ID，避免雙帳本重複計費。
-  const crossExpense = await parseCrossFarmCommand(dated.body);
-  const expense = crossExpense || await parseExpenseCommand(dated.body);
+  const expense = await parseExpenseCommand(dated.body);
 
   if (expense?.error) {
     return `❌ ${expense.error}`;
   }
 
   if (expense) {
-    const isCrossFarm = Boolean(expense.payerFarm && expense.payerFarm !== expense.farm);
-    // 舊月份沒有付款場別欄位時不允許跨場補登，以免失去付款者資訊。
-    if (isCrossFarm && dated.dateInfo.monthSheet < "202610月") {
-      const layout = await getAppendLayout(targetSheetId, dated.dateInfo.monthSheet).catch(() => null);
-      if (!layout || layout.positions.payerFarm < 0) {
-        return "❌ 該歷史月份沒有付款場別欄位，為避免跨場代付記錯帳，已停止寫入。";
-      }
+    if (expense.payerFarm && expense.payerFarm !== expense.farm) {
+      return "⚠️ MAIN V2.3 暫停跨場代付，待 V2.4 完成雙帳本同步後再開放。一般支出與收入可正常記帳。";
     }
     const userName = await getProfileName(event);
 
@@ -2184,11 +2170,11 @@ async function handleTextMessage(event) {
       userName,
       event.source?.userId || ""
     );
-    await recordPersonalFarm(event.source?.userId || "", expense.payerFarm || expense.farm);
+    await recordPersonalFarm(event.source?.userId || "", expense.farm);
     await recordPersonalVendor(event.source?.userId || "", expense.vendor);
 
     return [
-      isCrossFarm ? "✅ 跨場代付記錄完成（只寫付款同事帳本）" : `✅ ${expense.txType}記錄完成`,
+      `✅ ${expense.txType}記錄完成`,
       "",
       dated.isCustomDate ? "🗓️ 補登日期" : null,
       `帳務歸屬：${expense.farm}`,
@@ -2254,18 +2240,6 @@ function expenseQuickReply(text, event) {
   })) };
 }
 
-// V2.8 TEST: Google Sheets API 配額保護，僅影響背景對帳，不停止 LINE 服務。
-const reconcileSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-function isSheetsReadQuotaError(err) {
-  const msg = String(err?.message || "").toLowerCase();
-  const status = Number(err?.code || err?.response?.status || 0);
-  return status === 429 || (status === 403 && /quota|rate limit|read requests/.test(msg)) ||
-    /quota exceeded|read requests per minute|rate limit exceeded|resource exhausted/.test(msg);
-}
-let reconciliationRetryAfter = 0;
-const RECONCILE_QUOTA_COOLDOWN_MS = 3 * 60 * 1000;
-const RECONCILE_BOOK_GAP_MS = 1500;
-
 // V2.5.2：個人帳本同步快照。只用於 2026/10 起有 S 欄永久交易 ID 的月份。
 // Google Sheets 定時輪詢無法單憑「ID 消失」判定刪除；必須另有分頁總列數減少的證據。
 const SYNC_SNAPSHOT_TAB = "系統同步快照";
@@ -2303,30 +2277,6 @@ async function saveSyncSnapshot(sheetId, sheets, snapshots, month, gridRows, ids
       insertDataOption: "INSERT_ROWS", requestBody: { values } });
   }
   snapshots.set(month, {sheetRow: old?.sheetRow || 0, gridRows, ids: [...ids]});
-}
-
-// V2.8 第三階段：僅在快照已包含交易，且同輪可觀察到唯一的整列上移證據時，
-// 才將「手動刪除整列」視為可自動同步。刪最後一列、清空 ID、同時多筆異動都不自動刪。
-// 這是保守的自動判定，不代表 Google Sheets 能提供刪除操作的直接稽核事件。
-function v28HasSingleRowShiftProof({newlyMissing, logs, byId, snapshot, currentIds}) {
-  if (!snapshot || newlyMissing.length !== 1) return false;
-  const missing = newlyMissing[0];
-  if (!snapshot.ids.includes(missing.id) || !Number.isSafeInteger(missing.row) || missing.row < 2) return false;
-  const active = logs.filter(e => e.status !== "已刪除" && e.v2Marker === "V2-ID" && currentIds.has(e.id));
-  if (snapshot.ids.some(id => id !== missing.id && !currentIds.has(id))) return false;
-  const logIds = new Set(active.map(e => e.id));
-  // 有未知 ID 或重複 ID，可能是人工搬動或讀取異常，停止刪除。
-  if ([...currentIds].some(id => !logIds.has(id))) return false;
-  let shifted = 0;
-  for (const e of active) {
-    const hits = byId.get(e.id) || [];
-    if (hits.length !== 1 || !Number.isSafeInteger(e.row)) return false;
-    const expected = e.row > missing.row ? e.row - 1 : e.row;
-    if (hits[0] !== expected) return false;
-    if (e.row > missing.row) shifted++;
-  }
-  // 至少一筆後續交易確實向上移動一列；最後一列刪除無法據此證實。
-  return shifted > 0;
 }
 
 // 中央安全對帳：只校正唯一匹配交易的列號；不依內容差異自動刪中央。
@@ -2382,32 +2332,22 @@ async function reconcileOneBook(sheetId) {
             rows:[{values:[sheetCell(hits[0])]}],fields:"userEnteredValue"}});
         } else missing.push(e);
       }
-      // 必須有快照包含該 ID，且同輪觀察到唯一的整列上移證據。
-      // 配置總列數僅用於診斷，不再作為實際刪除的證據。
+      // 只有「先前快照確實存在該 ID」且「Google 分頁總列數減少」才有刪除證據。
+      // 缺 ID 但列數未減少，視為人工清空 ID 或其他異常，不刪中央。
       const removedRows = snapshot && gridRows > 0 ? snapshot.gridRows - gridRows : 0;
       const previouslyKnown = new Set(snapshot?.ids || []);
       // 升級前就已缺失的交易不在快照中，僅列警告；不阻止新交易日後的刪除辨識。
       const newlyMissing = missing.filter(e => previouslyKnown.has(e.id));
       const oldMissing = missing.filter(e => !previouslyKnown.has(e.id));
-      const safelyMissing = v28HasSingleRowShiftProof({
-        newlyMissing, logs, byId, snapshot, currentIds
-      });
-      // V2.8 階段二：唯讀診斷，不放寬刪除條件，不輸出交易ID。
-      // gridProperties.rowCount 是配置列數，不等於實際記帳筆數。
-      if (missing.length || snapshot) {
-        console.info(`[V2.8 刪除診斷] 月份=${month} 快照=${snapshot ? "有" : "無"}` +
-          ` 快照ID數=${snapshot?.ids.length ?? 0} 現有ID數=${currentIds.size}` +
-          ` 舊缺失=${oldMissing.length} 新缺失=${newlyMissing.length}` +
-          ` 配置列差=${removedRows} 整列位移證據=${safelyMissing} 允許自動刪除=${Boolean(safelyMissing && !unsafe)}`);
-      }
-
+      const safelyMissing = newlyMissing.length > 0 && snapshot && removedRows > 0 &&
+        newlyMissing.length <= removedRows;
       // 避免新交易 ID 重複、未知交易 ID 或整個分頁異常造成誤刪。
       if ([...byId.values()].some(hits => hits.length !== 1)) unsafe = true;
       if ([...currentIds].some(id => !TX_ID_PATTERN.test(id))) unsafe = true;
       if (!gridRows || rows.length > gridRows) unsafe = true;
       if (oldMissing.length) console.warn(`[V2.5.2 升級前待核對] ${month} ${oldMissing.length}筆；中央保留`);
       if (newlyMissing.length && (!safelyMissing || unsafe)) {
-        console.warn(`[V2.8 手動刪除待核對] 帳本=${String(sheetId).slice(0,6)} 月份=${month} 新缺少=${newlyMissing.length}筆，總列數減少=${removedRows}，異常=${unsafe}；中央保留。缺少ID不能單獨證明刪除整列。`);
+        console.warn(`[V2.5.2 待核對] ${month} 新缺少=${newlyMissing.length}筆，總列數減少=${removedRows}；中央保留`);
       }
       if (changes.length) await sheets.spreadsheets.batchUpdate({
         spreadsheetId:sheetId,requestBody:{requests:changes}});
@@ -2486,10 +2426,6 @@ async function reconcileOneBook(sheetId) {
 }
 async function reconcileAllBooks() {
   if (reconciliationRunning) return;
-  if (Date.now() < reconciliationRetryAfter) {
-    console.info("[V2.8 配額保護] 冷卻期間，略過本輪背景對帳；不更動任何帳本");
-    return;
-  }
   reconciliationRunning = true;
   try {
     const sheets = await getSheets();
@@ -2502,25 +2438,11 @@ async function reconcileAllBooks() {
       .map(r => String(r[3]||"").trim()).filter(Boolean))];
     console.info(`[V2 對帳] 開始檢查，帳本數=${ids.length}`);
     for (const id of ids) {
-      // 各帳本間錯開請求，避免 8 本帳本在同一分鐘集中讀取。
-      await reconcileSleep(RECONCILE_BOOK_GAP_MS);
       try { await reconcileOneBook(id); }
-      catch (err) {
-        if (isSheetsReadQuotaError(err)) {
-          reconciliationRetryAfter = Date.now() + RECONCILE_QUOTA_COOLDOWN_MS;
-          console.warn(`[V2.8 配額保護] Google Sheets 讀取限流，停止本輪背景對帳；下輪安全重試。帳本=${id.slice(0,6)}；中央不做推定刪除`);
-          break;
-        }
-        console.error("單一帳本對帳失敗", id.slice(0,6), err.message);
-      }
+      catch (err) { console.error("單一帳本對帳失敗", id.slice(0,6), err.message); }
     }
     console.info("[V2 對帳] 本輪完成");
-  } catch (err) {
-    if (isSheetsReadQuotaError(err)) {
-      reconciliationRetryAfter = Date.now() + RECONCILE_QUOTA_COOLDOWN_MS;
-      console.warn("[V2.8 配額保護] 讀取受限，停止本輪背景對帳，下輪重試；不影響個人記帳");
-    } else console.error("中央對帳失敗（不影響個人記帳）", err.message);
-  }
+  } catch (err) { console.error("中央對帳失敗（不影響個人記帳）", err.message); }
   finally { reconciliationRunning = false; }
 }
 // 每10分鐘背景檢查一次；中央失敗不阻止 LINE 記帳。

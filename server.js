@@ -857,6 +857,9 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName, us
   let layout = null;
   if (isHistorical) layout = await getAppendLayout(sheetId, monthSheet);
   else await ensurePersonalFarmColumns(sheetId, monthSheet);
+  if (expense.payerFarm && expense.payerFarm !== expense.farm && layout && layout.positions.payerFarm < 0) {
+    throw new Error("跨場代付需要付款場別欄位，已停止寫入");
+  }
   // 中央尚在建置：中央故障不得阻止個人帳本記帳。
   const valuesForWrite = [expense.farm, expense.payerFarm || expense.farm,
     expense.txType || "支出", expense.paymentSource || "", expense.code,
@@ -1256,7 +1259,10 @@ function helpText() {
     "草湖 支出 500 電風扇 / 三豐",
     "草湖 零 支出 500 電風扇 / 三豐",
     "",
-    "【跨場代付】V2.3 尚未開放",
+    "【跨場代付】",
+    "草湖幫東平 5600 電費 / 台電",
+    "9/28 草湖幫東平 5600 電費 / 台電",
+    "只寫付款同事帳本，中央費用歸屬受款場別",
     "",
     "【收入】",
     "仁愛 收入 5000 雞蛋銷售 / 客戶",
@@ -2149,15 +2155,23 @@ async function handleTextMessage(event) {
     return `❌ ${dated.error}`;
   }
 
-  const expense = await parseExpenseCommand(dated.body);
+  // V2.6：跨場代付採 B 方案，僅寫入發起者個人帳本；中央以帳務歸屬計費。
+  // 與一般支出共用寫入及永久交易 ID，避免雙帳本重複計費。
+  const crossExpense = await parseCrossFarmCommand(dated.body);
+  const expense = crossExpense || await parseExpenseCommand(dated.body);
 
   if (expense?.error) {
     return `❌ ${expense.error}`;
   }
 
   if (expense) {
-    if (expense.payerFarm && expense.payerFarm !== expense.farm) {
-      return "⚠️ MAIN V2.3 暫停跨場代付，待 V2.4 完成雙帳本同步後再開放。一般支出與收入可正常記帳。";
+    const isCrossFarm = Boolean(expense.payerFarm && expense.payerFarm !== expense.farm);
+    // 舊月份沒有付款場別欄位時不允許跨場補登，以免失去付款者資訊。
+    if (isCrossFarm && dated.dateInfo.monthSheet < "202610月") {
+      const layout = await getAppendLayout(targetSheetId, dated.dateInfo.monthSheet).catch(() => null);
+      if (!layout || layout.positions.payerFarm < 0) {
+        return "❌ 該歷史月份沒有付款場別欄位，為避免跨場代付記錯帳，已停止寫入。";
+      }
     }
     const userName = await getProfileName(event);
 
@@ -2170,11 +2184,11 @@ async function handleTextMessage(event) {
       userName,
       event.source?.userId || ""
     );
-    await recordPersonalFarm(event.source?.userId || "", expense.farm);
+    await recordPersonalFarm(event.source?.userId || "", expense.payerFarm || expense.farm);
     await recordPersonalVendor(event.source?.userId || "", expense.vendor);
 
     return [
-      `✅ ${expense.txType}記錄完成`,
+      isCrossFarm ? "✅ 跨場代付記錄完成（只寫付款同事帳本）" : `✅ ${expense.txType}記錄完成`,
       "",
       dated.isCustomDate ? "🗓️ 補登日期" : null,
       `帳務歸屬：${expense.farm}`,

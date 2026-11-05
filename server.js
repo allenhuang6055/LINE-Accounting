@@ -3,9 +3,16 @@ require("dotenv").config();
 const express = require("express");
 const line = require("@line/bot-sdk");
 const { google } = require("googleapis");
-const { randomUUID } = require("node:crypto");
+const { randomUUID, createHash } = require("node:crypto");
+const rowIdentity = require("./sheet-identity").withDeclaredOwners(JSON.parse(process.env.SHEET_DECLARED_OWNERS_JSON || "{}"),process.env.GOOGLE_CLIENT_EMAIL);
+
+const snapshotStore = require("./snapshot-store");
 
 const app = express();
+const httpSecurity = require("./http-security");
+const lifecycle = require("./webhook-lifecycle").createLifecycle();
+const httpGuard = httpSecurity.install(app, {}, () => lifecycle.closing);
+app.locals.accountingLifecycle = lifecycle;
 
 // MAIN V2.3.1：正式環境啟動保護＋個人場別智慧排序。
 if (process.env.APP_ENV !== "MAIN") {
@@ -31,6 +38,8 @@ const ACCOUNT_MASTER_SHEET_ID = process.env.ACCOUNT_MASTER_SHEET_ID;
 const CENTRAL_SHEET_ID = process.env.CENTRAL_SHEET_ID;
 // MAIN 中央同步開關（啟動時要求為 true）。
 const CENTRAL_SYNC_ENABLED = process.env.CENTRAL_SYNC_ENABLED === "true";
+
+const writeQueue = require("./write-queue").createWriteQueue();
 
 // ===== 場別 =====
 const FARM_ALIASES = {
@@ -515,6 +524,7 @@ async function ensureSheet(sheetId, sheetName, headers) {
       });
     }
   }
+  if(["系統中央同步待辦","系統同步快照","系統同步快照V2","系統交易身分","系統記帳順序"].includes(sheetName))await rowIdentity.secureSystem(sheets,sheetId,sheetName,process.env.GOOGLE_CLIENT_EMAIL);
 }
 
 function columnLetter(n) {
@@ -679,6 +689,7 @@ async function centralSheets() {
 }
 
 async function centralRows(sheets) {
+  await rowIdentity.secureSystem(sheets,CENTRAL_SHEET_ID,CENTRAL_TAB,process.env.GOOGLE_CLIENT_EMAIL);
   const result = await sheets.spreadsheets.values.get({
     spreadsheetId: CENTRAL_SHEET_ID, range: `'${CENTRAL_TAB}'!A1:W`,
     valueRenderOption: "FORMATTED_VALUE"
@@ -693,10 +704,18 @@ async function centralRows(sheets) {
 async function syncCentralCreate({ txId, dateText, expense, userName, sourceSheetId, monthSheet }) {
   const sheets = await centralSheets();
   if (!sheets) return "disabled";
+  await rowIdentity.secureSystem(sheets,CENTRAL_SHEET_ID,CENTRAL_TAB,process.env.GOOGLE_CLIENT_EMAIL);
+  return rowIdentity.protect(sheets,CENTRAL_SHEET_ID,CENTRAL_TAB,process.env.GOOGLE_CLIENT_EMAIL,async () => {
   const values = await centralRows(sheets);
   const existing = values.slice(1).filter(r => String(r[0] || "") === txId);
   if (existing.length > 1) throw new Error(`中央交易 ID 重複：${txId}`);
-  if (existing.length === 1) return "exists";
+  if (existing.length === 1) {
+    if (String(existing[0][17] || "").trim() !== String(sourceSheetId).trim() ||
+        String(existing[0][18] || "").trim() !== String(monthSheet).trim()) {
+      throw new Error("中央既有交易來源不符，停止重試");
+    }
+    return "exists";
+  }
   const payer = expense.payerFarm || expense.farm;
   const isAdvance = payer !== expense.farm && expense.txType === "支出";
   const row = [txId, dateText, expense.farm, payer, expense.txType || "支出",
@@ -711,68 +730,56 @@ async function syncCentralCreate({ txId, dateText, expense, userName, sourceShee
     requestBody: { values: [row] }
   });
   return "created";
+  });
 }
 
 // V2.9.2: 手動刪列專用，中央刪除前核對來源帳本與月份。
-// 缺失 ID 不是刪除證據；必須由上一輪完整快照及列位移共同確認。
+// 缺失 ID 不是刪除證據；必須核對已保存的列級身分消失。
 async function syncCentralDeletedVerified(txId, sourceSheetId, monthSheet) {
+  rowIdentity.assertMonth(monthSheet);
   const sheets = await centralSheets();
-  if (!sheets) throw new Error("中央同步未啟用");
-  const values = await centralRows(sheets);
-  const matches = values.slice(1).map((row, i) => ({row, n:i+2}))
-    .filter(x => String(x.row[0] || "").trim() === txId);
-  if (matches.length !== 1) {
-    if (!matches.length) return "missing";
-    throw new Error(`中央交易 ID 重複：${txId}`);
-  }
-  const row = matches[0].row;
-  if (String(row[17] || "").trim() !== String(sourceSheetId).trim() ||
-      String(row[18] || "").trim() !== String(monthSheet).trim()) {
-    throw new Error("中央來源帳本或月份不符，禁止刪除");
-  }
-  if (String(row[20] || "").trim() !== "有效") {
-    throw new Error("中央交易狀態不是有效，禁止刪除");
-  }
-  // 在刪除前再讀一次中央，防止來源核對與刪除之間列號已改變。
-  const fresh = await centralRows(sheets);
-  if (String(fresh[matches[0].n - 1]?.[0] || "").trim() !== txId ||
-      String(fresh[matches[0].n - 1]?.[17] || "").trim() !== String(sourceSheetId).trim() ||
-      String(fresh[matches[0].n - 1]?.[18] || "").trim() !== String(monthSheet).trim()) {
-    throw new Error("中央列號在核對期間改變，禁止刪除");
-  }
-  const meta = await sheets.spreadsheets.get({spreadsheetId:CENTRAL_SHEET_ID,
-    fields:"sheets.properties(sheetId,title)"});
-  const tab = (meta.data.sheets || []).find(x => x.properties.title === CENTRAL_TAB);
-  if (!tab) throw new Error("找不到中央流水帳分頁");
-  await sheets.spreadsheets.batchUpdate({spreadsheetId:CENTRAL_SHEET_ID,
-    requestBody:{requests:[{deleteDimension:{range:{sheetId:tab.properties.sheetId,
-      dimension:"ROWS",startIndex:matches[0].n-1,endIndex:matches[0].n}}}]}});
-  return "deleted";
+  if (!sheets) throw Error("中央同步未啟用");
+  await rowIdentity.secureSystem(sheets,CENTRAL_SHEET_ID,CENTRAL_TAB,process.env.GOOGLE_CLIENT_EMAIL);
+  return rowIdentity.protect(sheets,CENTRAL_SHEET_ID,CENTRAL_TAB,process.env.GOOGLE_CLIENT_EMAIL,async tab => {
+    const values=await centralRows(sheets);
+    const hits=values.slice(1).map((row,i)=>({row,n:i+2})).filter(x=>String(x.row[0]||"").trim()===txId);
+    if(hits.length>1)throw Error("中央交易 ID 重複");
+    if(!hits.length)return "missing";
+    const {row,n}=hits[0];
+    if(String(row[17]||"").trim()!==sourceSheetId || String(row[18]||"").trim()!==monthSheet)throw Error("中央來源帳本或月份不符");
+    if(!["有效","已刪除"].includes(row[20]))throw Error("中央交易狀態不合法");
+    const id=await rowIdentity.bind(sheets,CENTRAL_SHEET_ID,tab,txId,sourceSheetId,monthSheet,n);
+    const fresh=await centralRows(sheets);
+    const position=rowIdentity.rowForIdentity(await rowIdentity.metadata(sheets,CENTRAL_SHEET_ID),
+      rowIdentity.identityValue(txId,sourceSheetId,monthSheet),tab,id);
+    if(position!==n || JSON.stringify(fresh[position-1])!==JSON.stringify(row))throw Error("中央列身分在核對期間改變");
+    await sheets.spreadsheets.batchUpdate({spreadsheetId:CENTRAL_SHEET_ID,requestBody:{requests:[{
+      deleteDimension:{range:{sheetId:tab.sheetId,dimension:"ROWS",startIndex:position-1,endIndex:position}}
+    }]}});
+    return "deleted";
+  });
 }
 
-async function syncCentralDeleted(txId) {
+async function syncCentralAmount({txId,sourceSheetId,monthSheet,amount}) {
+  if (monthSheet < "202610月" || !Number.isFinite(amount)) throw Error("金額或月份不合法");
   const sheets = await centralSheets();
-  if (!sheets) return "disabled";
-  const values = await centralRows(sheets);
-  const matches = [];
-  for (let i = 1; i < values.length; i++) {
-    if (String(values[i][0] || "") === txId) matches.push(i + 1);
-  }
-  if (matches.length > 1) throw new Error(`中央交易 ID 重複：${txId}`);
-  if (!matches.length) return "missing";
-  const meta = await sheets.spreadsheets.get({
-    spreadsheetId: CENTRAL_SHEET_ID, fields: "sheets.properties(sheetId,title)"
+  await rowIdentity.secureSystem(sheets,CENTRAL_SHEET_ID,CENTRAL_TAB,process.env.GOOGLE_CLIENT_EMAIL);
+  return rowIdentity.protect(sheets,CENTRAL_SHEET_ID,CENTRAL_TAB,process.env.GOOGLE_CLIENT_EMAIL,async tab => {
+  const rows = await centralRows(sheets);
+  const matches = rows.map((row,i)=>({row,n:i+1})).filter(x=>String(x.row[0]||"").trim()===txId);
+  if (matches.length !== 1) throw Error("中央更新找不到唯一交易");
+  const {row,n}=matches[0];
+  if (row[17] !== sourceSheetId || row[18] !== monthSheet || row[20] !== "有效") throw Error("中央更新來源或狀態不符");
+  if (Number(String(row[13]).replace(/,/g,"")) === Math.abs(amount)) return "updated";
+  const identity=await rowIdentity.bind(sheets,CENTRAL_SHEET_ID,tab,txId,sourceSheetId,monthSheet,n);
+  const position=rowIdentity.rowForIdentity(await rowIdentity.metadata(sheets,CENTRAL_SHEET_ID),rowIdentity.identityValue(txId,sourceSheetId,monthSheet),tab,identity);
+  if(position!==n)throw Error("中央列身分改變");
+  const fresh = await centralRows(sheets);
+  if (JSON.stringify(fresh[n-1]) !== JSON.stringify(row)) throw Error("中央更新期間資料改變");
+  await sheets.spreadsheets.values.update({spreadsheetId:CENTRAL_SHEET_ID,
+    range:`'${CENTRAL_TAB}'!N${n}`,valueInputOption:"RAW",requestBody:{values:[[Math.abs(amount)]]}});
+  return "updated";
   });
-  const tab = (meta.data.sheets || []).find(x => x.properties.title === CENTRAL_TAB);
-  if (!tab) throw new Error("找不到中央流水帳分頁");
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: CENTRAL_SHEET_ID,
-    requestBody: { requests: [{ deleteDimension: { range: {
-      sheetId: tab.properties.sheetId, dimension: "ROWS",
-      startIndex: matches[0] - 1, endIndex: matches[0]
-    } } }] }
-  });
-  return "deleted";
 }
 
 // 代付：付款場別幫帳務歸屬場別支付，費用仍只算歸屬場別一次。
@@ -888,9 +895,192 @@ async function ensureTransactionColumn(sheets, sheetId, monthSheet) {
   ]}});
 }
 
-async function writeExpense(sheetId, monthSheet, expense, dateText, userName, userId) {
+// Persistent outbox lives in a separate system tab, never in historical month tabs.
+const OUTBOX_TAB = "系統中央同步待辦";
+const OUTBOX_HEADERS = ["工作JSON", "狀態"];
+async function outboxAppendRequest(sheetId, payloads) {
+  await ensureSheet(sheetId, OUTBOX_TAB, OUTBOX_HEADERS);
+  const sheets = await getSheets();
+  const meta = await sheets.spreadsheets.get({spreadsheetId:sheetId, fields:"sheets.properties(sheetId,title)"});
+  const tab = meta.data.sheets.find(t => t.properties.title === OUTBOX_TAB);
+  return {appendCells:{sheetId:tab.properties.sheetId,
+    rows:payloads.map(p => ({values:[sheetCell(JSON.stringify(p)),sheetCell("待處理")]})),
+    fields:"userEnteredValue"}};
+}
+const drainCentralOutbox = require("./central-sync-outbox").createOutboxRunner({
+  read: async sheetId => {
+    const sheets = await getSheets();
+    const meta = await sheets.spreadsheets.get({spreadsheetId:sheetId,fields:"sheets.properties(title)"});
+    if (!meta.data.sheets.some(t => t.properties.title === OUTBOX_TAB)) return [];
+    await rowIdentity.secureSystem(sheets,sheetId,OUTBOX_TAB,process.env.GOOGLE_CLIENT_EMAIL);
+    const result = await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${OUTBOX_TAB}'!A2:B`});
+    return (result.data.values || []).map((r,i) => ({row:i+2,done:r[1]==="完成",payload:JSON.parse(r[0])}));
+  },
+  around: async (sheetId,job,work) => {
+    if(job.payload.sourceSheetId!==sheetId)throw Error("待辦來源帳本不符");
+    const sheets=await getSheets();
+    return rowIdentity.protect(sheets,sheetId,job.payload.monthSheet,process.env.GOOGLE_CLIENT_EMAIL,async tab=>{
+      if(job.payload.action==="delete")await verifyPendingDeletion(sheets,sheetId,tab,job.payload);
+      return work();
+    });
+  },
+  execute: async p => {
+    const result = p.action === "create" ? await syncCurrentCreate(p) :
+      p.action === "delete" ? await syncCentralDeletedVerified(p.txId,p.sourceSheetId,p.monthSheet) :
+      p.action === "amount" ? await syncCurrentAmount(p) : null;
+    if (!["created","exists","deleted","missing","updated","obsolete"].includes(result)) throw Error("中央同步未完成");
+  },
+  finish: async (sheetId,job) => {
+    const sheets = await getSheets();
+    const p = job.payload;
+    if(p.action==="create"){
+      const response=await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${p.monthSheet}'!S2:S`});
+      const hits=(response.data.values||[]).map((r,i)=>({id:String(r[0]||"").trim(),n:i+2})).filter(x=>x.id===p.txId);
+      if(hits.length>1)throw Error("個人交易 ID 重複");
+      if(hits.length===1){
+        const data=await rowIdentity.sheetInfo(sheets,sheetId),tab=data.sheets.find(t=>t.properties.title===p.monthSheet).properties;
+        await formatPersonalDate(sheets,sheetId,tab,hits[0].n);
+        const metadataId=await rowIdentity.bind(sheets,sheetId,tab,p.txId,sheetId,p.monthSheet,hits[0].n);
+        await rememberSourceIdentity(sheets,sheetId,p.monthSheet,p.txId,hits[0].n,tab.sheetId,metadataId);
+      }
+    }
+    if(p.action==="create" || p.action==="amount")await repairAccountingJournal(sheetId,p);
+    // Resolve the log by permanent ID on every attempt; never persist a mutable row number.
+    if (p.action === "delete") {
+      const logs = (await readAccountingLog(sheetId)).filter(e => e.id === p.txId && e.month === p.monthSheet);
+      if (logs.length > 1) throw Error("刪除日誌 ID 重複");
+      if (logs.length) await sheets.spreadsheets.values.update({spreadsheetId:sheetId,
+        range:`'${RECENT_LOG_TAB}'!K${logs[0].logRow}:L${logs[0].logRow}`,valueInputOption:"RAW",
+        requestBody:{values:[["已刪除",new Date().toISOString()]]}});
+    }
+    await sheets.spreadsheets.values.update({spreadsheetId:sheetId,range:`'${OUTBOX_TAB}'!B${job.row}`,
+      valueInputOption:"RAW",requestBody:{values:[["完成"]]}});
+  }
+});
+
+async function verifyPendingDeletion(sheets,sheetId,tab,p) {
+  const sourceInfo=await rowIdentity.sheetInfo(sheets,sheetId);
+  for(const sheet of sourceInfo.sheets||[]){
+    const month=sheet.properties.title;
+    if(!/^\d{6}月$/.test(month))continue;
+    if(sheet.properties.gridProperties?.columnCount!=null && sheet.properties.gridProperties.columnCount<19)continue;
+    const result=await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${month}'!S2:S`});
+    if((result.data.values||[]).some(r=>String(r[0]||"").trim()===p.txId))throw Error("來源交易已復原或移往其他月份，停止刪除並待核對");
+  }
+  const proof=p.evidence;
+  if(!proof || proof.sheetId!==tab.sheetId || !Number.isInteger(proof.metadataId))throw Error("刪除待辦缺少可信列級身分，停止刪除");
+  const meta=await rowIdentity.metadata(sheets,sheetId);
+  if((meta.developerMetadata||[]).some(m=>m.metadataId===proof.metadataId))throw Error("交易列身分仍存在，不能推定刪除");
+}
+async function repairAccountingJournal(sheetId,p) {
+  const sheets=await getSheets();
+  const result=await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${p.monthSheet}'!A1:S`,valueRenderOption:"UNFORMATTED_VALUE"});
+  const rows=result.data.values||[];
+  if(rows[0]?.[18]!==PERSONAL_TX_HEADER)throw Error("缺少交易 ID 欄，停止日誌修復");
+  const hits=rows.slice(1).map((row,i)=>({row,n:i+2})).filter(x=>String(x.row[18]||"").trim()===p.txId);
+  if(!hits.length){
+    if(p.action!=="create" || !p.userId || !p.createdAt)return;
+    const snapshots=await readSyncSnapshots(sheetId,sheets),snapshot=snapshots.get(p.monthSheet);
+    const info=await rowIdentity.sheetInfo(sheets,sheetId),tab=info.sheets.find(t=>t.properties.title===p.monthSheet)?.properties;
+    if(!tab || !rowIdentity.deletionProven(await rowIdentity.metadata(sheets,sheetId),tab,snapshot?.identities,p.txId,new Set()))return;
+    const priorRow=snapshot.positions?.[p.txId];
+    if(!Number.isInteger(priorRow)||priorRow<2)return;
+    await ensureSheet(sheetId,RECENT_LOG_TAB,RECENT_LOG_HEADERS);
+    await rowIdentity.protect(sheets,sheetId,RECENT_LOG_TAB,process.env.GOOGLE_CLIENT_EMAIL,async()=>{
+      if((await readAccountingLog(sheetId)).some(e=>e.id===p.txId))return;
+      await appendAccountingLog(sheetId,{id:p.txId,userId:p.userId,v2Marker:"V2-ID",timestamp:p.createdAt,
+        monthSheet:p.monthSheet,rowNumber:priorRow,farm:p.expense.farm,txType:p.expense.txType||"支出",
+        item:p.expense.accountItem,amount:p.expense.amount,recorder:p.userName});
+    });
+    return;
+  }
+  if(hits.length!==1)throw Error("個人交易 ID 重複，不能修復日誌");
+  const {row,n}=hits[0];
+  if(typeof row[12]!=="number" || !Number.isFinite(row[12]))throw Error("金額不合法，不能修復日誌");
+  await ensureSheet(sheetId,RECENT_LOG_TAB,RECENT_LOG_HEADERS);
+  await rowIdentity.protect(sheets,sheetId,RECENT_LOG_TAB,process.env.GOOGLE_CLIENT_EMAIL,async()=>{
+    const entries=(await readAccountingLog(sheetId)).filter(e=>e.id===p.txId);
+    if(entries.length>1)throw Error("記帳日誌 ID 重複");
+    if(entries.length){
+      const e=entries[0];
+      if(e.month!==p.monthSheet || e.status==="已刪除")throw Error("日誌狀態衝突，停止自動修復");
+      // Only mutable projection fields change; keep original user/transaction ownership.
+      await sheets.spreadsheets.values.batchUpdate({spreadsheetId:sheetId,requestBody:{valueInputOption:"RAW",data:[
+        {range:`'${RECENT_LOG_TAB}'!C${e.logRow}`,values:[[n]]},
+        {range:`'${RECENT_LOG_TAB}'!G${e.logRow}`,values:[[Math.abs(row[12])]]}
+      ]}});
+    }else{
+      if(p.action!=="create" || !p.userId || !p.createdAt)throw Error("缺少原始建立憑證，不能重建日誌");
+      await appendAccountingLog(sheetId,{id:p.txId,userId:p.userId,v2Marker:"V2-ID",timestamp:p.createdAt,
+        monthSheet:p.monthSheet,rowNumber:n,farm:row[0],txType:row[2],item:row[7],amount:Math.abs(row[12]),recorder:row[15]});
+    }
+  });
+}
+
+async function syncCurrentCreate(p) {
+  const sheets=await getSheets();
+  const response=await sheets.spreadsheets.values.get({spreadsheetId:p.sourceSheetId,range:`'${p.monthSheet}'!A1:S`,valueRenderOption:"UNFORMATTED_VALUE"});
+  const rows=response.data.values||[];
+  if(rows[0]?.[18]!==PERSONAL_TX_HEADER)throw Error("缺少交易 ID 欄，停止新增同步");
+  const hits=rows.slice(1).filter(r=>String(r[18]||"").trim()===p.txId);
+  if(!hits.length)return "obsolete";
+  if(hits.length!==1)throw Error("來源交易 ID 重複，停止新增同步");
+  if(typeof hits[0][12]!=="number"||!Number.isFinite(hits[0][12]))throw Error("來源金額不合法");
+  return syncCentralCreate({...p,expense:{...p.expense,amount:Math.abs(hits[0][12])}});
+}
+
+async function syncCurrentAmount(p) {
+  const sheets = await getSheets();
+  const response = await sheets.spreadsheets.values.get({spreadsheetId:p.sourceSheetId,
+    range:`'${p.monthSheet}'!A1:S`,valueRenderOption:"UNFORMATTED_VALUE"});
+  const rows=response.data.values || [];
+  if (rows[0]?.[18] !== PERSONAL_TX_HEADER) throw Error("缺少交易 ID 欄");
+  const hits=rows.slice(1).filter(r=>String(r[18]||"").trim()===p.txId);
+  if (!hits.length) return "obsolete"; // Never turn a disappeared ID into a create or delete.
+  if (hits.length !== 1) throw Error("個人交易 ID 重複");
+  const amount=hits[0][12];
+  if (typeof amount !== "number" || !Number.isFinite(amount)) throw Error("個人金額無效");
+  return syncCentralAmount({...p,amount});
+}
+
+function sheetDateSerial(dateText) {
+  const match = String(dateText).match(/^(\d{4})\/(\d{2})\/(\d{2})$/);
+  if (!match) throw Error("記帳日期格式不正確");
+  return (Date.UTC(Number(match[1]),Number(match[2])-1,Number(match[3]))-Date.UTC(1899,11,30))/86400000;
+}
+async function formatPersonalDate(sheets,sheetId,tab,row) {
+  await sheets.spreadsheets.batchUpdate({spreadsheetId:sheetId,requestBody:{requests:[{repeatCell:{
+    range:{sheetId:tab.sheetId,startRowIndex:row-1,endRowIndex:row,startColumnIndex:6,endColumnIndex:7},
+    cell:{userEnteredFormat:{numberFormat:{type:"DATE",pattern:"yyyy/mm/dd"}}},fields:"userEnteredFormat.numberFormat"
+  }}]}});
+}
+async function rememberSourceIdentity(sheets,sheetId,month,txId,row,tabId,metadataId) {
+  const snapshots=await readSyncSnapshots(sheetId,sheets);
+  const old=snapshots.get(month);
+  const ids=new Set(old?.ids||[]);ids.add(txId);
+  const positions=new Map(Object.entries(old?.positions||{}));positions.set(txId,row);
+  // Older snapshots may lack positions; no deletion is inferred from these fallback positions.
+  for(const id of ids)if(!positions.has(id))positions.set(id,2);
+  const identities={...(old?.identities||{}),[txId]:{metadataId,sheetId:tabId}};
+  await saveSyncSnapshot(sheetId,sheets,snapshots,month,Math.max(old?.gridRows||0,row),ids,positions,identities);
+}
+
+async function writeExpense(sheetId, monthSheet, expense, dateText, userName, userId, eventId = "") {
   const sheets = await getSheets();
   const isHistorical = monthSheet < "202610月";
+  return rowIdentity.protect(sheets,sheetId,monthSheet,process.env.GOOGLE_CLIENT_EMAIL,async sourceTab=>{
+  let requestTxId = null;
+  if (!isHistorical && eventId) {
+    const hash = createHash("sha256").update(JSON.stringify([sheetId,eventId])).digest("hex").slice(0,32);
+    requestTxId = `TX-${hash.slice(0,8)}-${hash.slice(8,12)}-${hash.slice(12,16)}-${hash.slice(16,20)}-${hash.slice(20)}`;
+    const info = await sheets.spreadsheets.get({spreadsheetId:sheetId,fields:"sheets.properties(title)"});
+    if (info.data.sheets.some(t=>t.properties.title===OUTBOX_TAB)) {
+      const pending = await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${OUTBOX_TAB}'!A2:B`});
+      const prior = (pending.data.values||[]).map(r=>JSON.parse(r[0])).filter(p=>p.action==="create"&&p.txId===requestTxId);
+      if (prior.length>1 || prior.some(p=>p.userId!==(userId||"")||p.sourceSheetId!==sheetId)) throw Error("事件交易身分不一致，停止記帳");
+      if (prior.length) { const failures=await drainCentralOutbox(sheetId);return {duplicate:true,txId:requestTxId,centralWarning:failures.length>0}; }
+    }
+  }
   let layout = null;
   if (isHistorical) layout = await getAppendLayout(sheetId, monthSheet);
   else await ensurePersonalFarmColumns(sheetId, monthSheet);
@@ -915,12 +1105,15 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName, us
     });
   }
 
-  const txId = `TX-${randomUUID()}`;
+  const txId = requestTxId || `TX-${randomUUID()}`;
   if (!isHistorical) {
     await ensureTransactionColumn(sheets, sheetId, monthSheet);
     appendValues = [...appendValues, "", "", txId]; // Q/R 不動；S 保存永久 ID
   }
-  const appendResult = await sheets.spreadsheets.values.append({
+  const createPayload = {action:"create",txId,dateText,expense,userName,userId:userId||"",createdAt:new Date().toISOString(),sourceSheetId:sheetId,monthSheet};
+  let appendResult;
+  if (isHistorical) {
+    appendResult = await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
     range: `'${monthSheet}'!A:${columnLetter(appendValues.length)}`,
     valueInputOption: "USER_ENTERED",
@@ -928,6 +1121,24 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName, us
     requestBody: { values: [appendValues] },
 
   });
+
+  } else {
+    const queueRequest = await outboxAppendRequest(sheetId,[createPayload]);
+    const meta = await sheets.spreadsheets.get({spreadsheetId:sheetId,fields:"sheets.properties(sheetId,title)"});
+    const tab = meta.data.sheets.find(t => t.properties.title === monthSheet);
+    // Atomic within the personal spreadsheet: a transaction cannot exist without its retry job.
+    await sheets.spreadsheets.batchUpdate({spreadsheetId:sheetId,requestBody:{requests:[
+      {appendCells:{sheetId:tab.properties.sheetId,rows:[{values:appendValues.map((value,index) => index === 6 ? {userEnteredValue:{numberValue:sheetDateSerial(dateText)}} : sheetCell(value))}],fields:"userEnteredValue"}},
+      queueRequest
+    ]}});
+    const ids = await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${monthSheet}'!S2:S`});
+    const hits = (ids.data.values || []).map((r,i)=>r[0]===txId?i+2:null).filter(Boolean);
+    if (hits.length !== 1) throw Error("新增交易定位失敗；待辦已保留，請勿重複記帳");
+    await formatPersonalDate(sheets,sheetId,sourceTab,hits[0]);
+    const metadataId=await rowIdentity.bind(sheets,sheetId,sourceTab,txId,sheetId,monthSheet,hits[0]);
+    await rememberSourceIdentity(sheets,sheetId,monthSheet,txId,hits[0],sourceTab.sheetId,metadataId);
+    appendResult = {data:{updates:{updatedRange:`'${monthSheet}'!A${hits[0]}:S${hits[0]}`}}};
+  }
 
   // 記錄實際寫入時間，跨月份查詢依此排序；記帳成功後才寫日誌。
   // 日誌失敗不應讓使用者重複記帳。
@@ -1007,17 +1218,22 @@ async function writeExpense(sheetId, monthSheet, expense, dateText, userName, us
     console.warn("套用列顏色失敗，不影響記帳：", formatErr.message);
   }
   let centralWarning = !CENTRAL_SYNC_ENABLED;
-  if (!auditWarning && CENTRAL_SYNC_ENABLED) {
+  if (!isHistorical && CENTRAL_SYNC_ENABLED) {
     try {
-      await syncCentralCreate({ txId, dateText, expense, userName, sourceSheetId: sheetId, monthSheet });
+      const failures = await drainCentralOutbox(sheetId);
+      if (failures.length) throw failures[0].error;
+      if(auditWarning)auditWarning=!(await readAccountingLog(sheetId)).some(e=>e.id===txId);
     } catch (err) {
       centralWarning = true;
       console.error("個人帳本已寫入，但中央同步失敗（請勿重複記帳）：", txId, err.message);
     }
+  } else if (CENTRAL_SYNC_ENABLED && isHistorical && !auditWarning) {
+    try { await syncCentralCreate(createPayload); } catch (err) { centralWarning = true; }
   } else if (CENTRAL_SYNC_ENABLED) {
     centralWarning = true;
   }
   return { auditWarning, centralWarning, txId };
+  });
 }
 
 function headerIndex(headers, names) {
@@ -1372,6 +1588,7 @@ async function readAccountingLog(sheetId) {
     spreadsheetId: sheetId, fields: "sheets.properties(title)"
   });
   if (!(meta.data.sheets || []).some(s => s.properties.title === RECENT_LOG_TAB)) return [];
+  await rowIdentity.secureSystem(sheets,sheetId,RECENT_LOG_TAB,process.env.GOOGLE_CLIENT_EMAIL);
   const result = await sheets.spreadsheets.values.get({
     spreadsheetId: sheetId, range: `'${RECENT_LOG_TAB}'!A2:M`,
     valueRenderOption: "FORMATTED_VALUE"
@@ -1399,7 +1616,7 @@ async function lastOwnEntry(sheetId, userId) {
   const entries = await readAccountingLog(sheetId);
   return entries.filter(e => e.id && e.userId === userId && e.status !== "已刪除" &&
     /^\d{6}月$/.test(e.month) && e.row >= 2 && !Number.isNaN(Date.parse(e.timestamp)))
-    .sort((a, b) => b.timestamp.localeCompare(a.timestamp))[0] || null;
+    .sort((a, b) => b.timestamp.localeCompare(a.timestamp) || b.logRow-a.logRow)[0] || null;
 }
 
 function formatDeletionEntry(e) {
@@ -1409,22 +1626,32 @@ function formatDeletionEntry(e) {
     `填表人：${e.recorder}`, `記帳ID：${e.id}`].join("\n");
 }
 
+async function latestDeletionEntry(sheetId,entry) {
+  if(entry.month<"202610月")return entry;
+  const sheets=await getSheets();
+  return rowIdentity.protect(sheets,sheetId,entry.month,process.env.GOOGLE_CLIENT_EMAIL,async()=>{
+    await repairAccountingJournal(sheetId,{action:"amount",txId:entry.id,sourceSheetId:sheetId,monthSheet:entry.month});
+    return (await readAccountingLog(sheetId)).find(e=>e.id===entry.id&&e.userId===entry.userId&&e.status!=="已刪除")||entry;
+  });
+}
 async function requestDeleteLast(sheetId, userId) {
-  const entry = await lastOwnEntry(sheetId, userId);
+  let entry = await lastOwnEntry(sheetId, userId);
   if (!entry) return "目前沒有可刪除的本人記帳。舊資料沒有 LINE User ID，為安全起見不能透過此指令刪除。";
-  pendingDeletions.set(`${sheetId}:${userId}`, { id: entry.id, mode: "own-last", expiresAt: Date.now() + DELETE_CONFIRM_MS });
+  entry=await latestDeletionEntry(sheetId,entry);
+  pendingDeletions.set(`${sheetId}:${userId}`, { id: entry.id, amount:entry.amount, mode: "own-last", expiresAt: Date.now() + DELETE_CONFIRM_MS });
   return `⚠️ 即將永久刪除你最後寫入的記帳\n\n${formatDeletionEntry(entry)}\n\n請於5分鐘內輸入「確認刪除」，或輸入「取消」。\n此操作會真正移除月份分頁中的整列。`;
 }
 
 async function requestSelectedDelete(sheetId, userId, id) {
   if (!userId || !TX_ID_PATTERN.test(id)) return "❌ 記帳ID格式不正確。";
   const entries = await readAccountingLog(sheetId);
-  const entry = entries.find(e => e.id.toLowerCase() === id.toLowerCase() &&
+  let entry = entries.find(e => e.id.toLowerCase() === id.toLowerCase() &&
     e.userId === userId && e.status !== "已刪除" &&
     /^\d{6}月$/.test(e.month) && e.row >= 2);
   if (!entry) return "❌ 找不到本人可刪除的有效記帳；舊資料或其他人的帳不能刪除。";
+  entry=await latestDeletionEntry(sheetId,entry);
   pendingDeletions.set(`${sheetId}:${userId}`, {
-    id: entry.id, mode: "selected", expiresAt: Date.now() + DELETE_CONFIRM_MS
+    id: entry.id, amount:entry.amount, mode: "selected", expiresAt: Date.now() + DELETE_CONFIRM_MS
   });
   return `⚠️ 即將永久刪除指定記帳\n\n${formatDeletionEntry(entry)}\n\n請於5分鐘內輸入「確認刪除」，或輸入「取消」。\n此操作會真正移除月份分頁中的整列。`;
 }
@@ -1471,7 +1698,19 @@ async function resolveDeletionRow(sheets, sheetId, entry, entries, headers) {
   return candidateRows[0].rowNumber;
 }
 
-async function confirmDeleteLast(sheetId, userId) {
+async function confirmDeleteLast(sheetId, userId, eventId = "") {
+  // Persist confirmation identity in the atomic deletion job. A redelivery after
+  // restart must never consume a newer confirmation for a different transaction.
+  if (eventId) {
+    const sheets = await getSheets();
+    const info = await sheets.spreadsheets.get({spreadsheetId:sheetId,fields:"sheets.properties(title)"});
+    if (info.data.sheets.some(t=>t.properties.title===OUTBOX_TAB)) {
+      const result = await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${OUTBOX_TAB}'!A2:B`});
+      const prior=(result.data.values||[]).map(r=>JSON.parse(r[0])).filter(p=>p.action==="delete"&&p.confirmEventId===eventId);
+      if(prior.some(p=>p.sourceSheetId!==sheetId||p.confirmUserId!==userId))throw Error("刪除事件身分不符");
+      if(prior.length)return "✅ 此刪除確認已接收，本次不重複刪除。中央同步以待辦處理狀態為準。";
+    }
+  }
   const key = `${sheetId}:${userId}`;
   const pending = pendingDeletions.get(key);
   pendingDeletions.delete(key); // 一次性確認，避免重送
@@ -1479,14 +1718,20 @@ async function confirmDeleteLast(sheetId, userId) {
 
   const sheets = await getSheets();
   const entries = await readAccountingLog(sheetId);
-  const entry = entries.find(e => e.id === pending.id && e.userId === userId && e.status !== "已刪除");
+  let entry = entries.find(e => e.id === pending.id && e.userId === userId && e.status !== "已刪除");
   if (!entry) return "❌ 找不到本人待刪除的有效記帳，已取消。";
+  if (entry.month < "202610月") return "❌ 歷史月份為唯讀，未執行刪除。";
   if (!/^\d{6}月$/.test(entry.month)) return "❌ 月份分頁格式不正確，已停止刪除。";
   if (pending.mode === "own-last") {
     const newest = await lastOwnEntry(sheetId, userId);
     if (!newest || newest.id !== entry.id) return "⚠️ 期間又有新記帳，請重新輸入「刪除上一筆」。";
   }
 
+  return rowIdentity.protect(sheets,sheetId,entry.month,process.env.GOOGLE_CLIENT_EMAIL,async sourceTab=>{
+  await repairAccountingJournal(sheetId,{action:"amount",txId:entry.id,sourceSheetId:sheetId,monthSheet:entry.month});
+  entry=(await readAccountingLog(sheetId)).find(e=>e.id===entry.id && e.userId===userId && e.status!=="已刪除");
+  if(!entry)return "❌ 記帳日誌已改變，停止刪除。";
+  if(pending.amount!==entry.amount)return "⚠️ 金額在確認期間改變，請重新下刪除指令確認最新內容。";
   const meta = await sheets.spreadsheets.get({
     spreadsheetId: sheetId, fields: "sheets.properties(sheetId,title)"
   });
@@ -1522,30 +1767,21 @@ async function confirmDeleteLast(sheetId, userId) {
       return "❌ 原列已有其他交易ID，且找不到本筆交易，已停止刪除。";
     }
   }
-  // V2-ID 交易必須用 S 欄永久 ID 定位；絕不可退回指紋比對刪除。
-  if (entry.v2Marker === "V2-ID") {
-    if (!hasTxColumn) return "❌ 找不到系統交易ID欄，已停止刪除；請通知管理者。";
-    const confirmedId = await sheets.spreadsheets.values.get({spreadsheetId:sheetId,
-      range:`'${entry.month}'!S${actualRow}`,valueRenderOption:"FORMATTED_VALUE"});
-    if (String(confirmedId.data.values?.[0]?.[0] || "").trim() !== entry.id)
-      return "❌ 無法以永久交易ID唯一確認資料列，已停止刪除；請通知管理者。";
-  }
-  if (entry.v2Marker !== "V2-ID" && (!hasTxColumn || !(await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${entry.month}'!S${actualRow}`,valueRenderOption:"FORMATTED_VALUE"})).data.values?.[0]?.[0])) {
-    if (!sameDeletionFingerprint(row, headers, entry)) {
-    actualRow = await resolveDeletionRow(sheets, sheetId, entry, entries, headers);
-    if (!actualRow) {
-      return "❌ 月份資料與記帳日誌不一致，且無法唯一辨識交易。已停止刪除，請人工檢查。";
-    }
-    console.warn(`[列號安全恢復] ${entry.id} ${entry.month}: ${entry.row} -> ${actualRow}`);
-    }
-  }
+  // All deletions require the permanent S-column ID, including older journal entries.
+  // Never fall back to row numbers, amounts or a content fingerprint.
+  if (!hasTxColumn) return "❌ 找不到系統交易ID欄，已停止刪除；請通知管理者。";
+  const confirmedId = await sheets.spreadsheets.values.get({spreadsheetId:sheetId,
+    range:`'${entry.month}'!S${actualRow}`,valueRenderOption:"FORMATTED_VALUE"});
+  if (String(confirmedId.data.values?.[0]?.[0] || "").trim() !== entry.id)
+    return "❌ 無法以永久交易ID唯一確認資料列，已停止刪除；請通知管理者。";
 
   // 一個 batchUpdate 同時刪除月份列、標記日誌刪除、調整後續列號。
   // 記帳ID不變；列號僅作定位，不能當作中央同步主鍵。
+  const metadataId=await rowIdentity.bind(sheets,sheetId,sourceTab,entry.id,sheetId,entry.month,actualRow);
   const requests = [{ deleteDimension: {
     range: { sheetId: monthTab.sheetId, dimension: "ROWS", startIndex: actualRow - 1, endIndex: actualRow }
   }}];
-  for (const e of entries) {
+  for (const e of await readAccountingLog(sheetId)) {
     if (e.id === entry.id) {
       requests.push({ updateCells: {
         range: { sheetId: logTab.sheetId, startRowIndex: e.logRow - 1,
@@ -1561,16 +1797,22 @@ async function confirmDeleteLast(sheetId, userId) {
       }});
     }
   }
+  if (entry.month >= "202610月") requests.push(await outboxAppendRequest(sheetId,[{
+    action:"delete",txId:entry.id,sourceSheetId:sheetId,monthSheet:entry.month,confirmEventId:eventId,confirmUserId:userId,evidence:{metadataId,sheetId:sourceTab.sheetId}
+  }]));
   await sheets.spreadsheets.batchUpdate({ spreadsheetId: sheetId, requestBody: { requests } });
   let centralDeleteWarning = false;
   try {
-    const result = await syncCentralDeleted(entry.id);
+    const failures = await drainCentralOutbox(sheetId);
+    if (failures?.length) throw failures[0].error;
+    const result = "deleted";
     if (result === "missing") centralDeleteWarning = true;
   } catch (err) {
     centralDeleteWarning = true;
     console.error("本地刪除成功，但中央刪除同步失敗：", entry.id, err.message);
   }
   return `✅ 已永久刪除本人記帳\n\n${formatDeletionEntry(entry)}\n\n月份分頁已移除該列，系統日誌保留刪除狀態供日後中央同步。${centralDeleteWarning ? "\n⚠️ 中央同步未完成，請通知管理者，勿重複刪除。" : ""}`;
+  });
 }
 
 async function recentTenText(sheetId, userId) {
@@ -1589,7 +1831,8 @@ async function recentTenText(sheetId, userId) {
       range: `'${RECENT_LOG_TAB}'!A2:L`,
       valueRenderOption: "FORMATTED_VALUE",
     });
-    logRows = (logResult.data.values || []).map(r => ({
+    logRows = (logResult.data.values || []).map((r,i) => ({
+      logRow:i+2,
       timestamp: String(r[0] || ""), month: String(r[1] || ""),
       row: Number(r[2]), status: String(r[10] || "有效"),
       id: String(r[8] || ""), userId: String(r[9] || ""),
@@ -1597,12 +1840,12 @@ async function recentTenText(sheetId, userId) {
   }
 
   // 先依實際寫入時間排序；舊資料沒有時間紀錄時只能用月份及列號近似。
-  const ordered = logRows.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  const ordered = logRows.sort((a, b) => b.timestamp.localeCompare(a.timestamp) || b.logRow-a.logRow);
   const byMonth = new Map();
   async function monthRows(month) {
     if (byMonth.has(month)) return byMonth.get(month);
     const result = await sheets.spreadsheets.values.get({
-      spreadsheetId: sheetId, range: `'${month}'!A1:R`,
+      spreadsheetId: sheetId, range: `'${month}'!A1:S`,
       valueRenderOption: "FORMATTED_VALUE",
     });
     const values = result.data.values || [];
@@ -1611,13 +1854,13 @@ async function recentTenText(sheetId, userId) {
     const indices = {
       farm: idx(["場別", "帳務歸屬"]), date: idx(["日期"]),
       txType: idx(["收支類型"]), item: idx(["品項"]),
-      amount: idx(["金額"]), recorder: idx(["填表人"]),
+      amount: idx(["金額"]), recorder: idx(["填表人"]), txId: idx(["系統交易ID"]),
     };
     const rows = values.slice(1).map((r, i) => {
       const get = key => indices[key] < 0 ? "" : String(r[indices[key]] || "").trim();
       return { month, row: i + 2, farm: get("farm"), date: get("date"),
         txType: get("txType"), item: get("item"), amount: get("amount"),
-        recorder: get("recorder") };
+        recorder: get("recorder"), txId: get("txId") };
     }).filter(r => r.date || r.item || r.amount);
     byMonth.set(month, rows);
     return rows;
@@ -1628,11 +1871,13 @@ async function recentTenText(sheetId, userId) {
   for (const log of ordered) {
     if (recent.length >= 10) break;
     if (!months.includes(log.month)) continue;
-    const key = `${log.month}:${log.row}`;
-    if (used.has(key)) continue;
-    const row = (await monthRows(log.month)).find(r => r.row === log.row);
+    const actualRows = await monthRows(log.month);
+    const matches = actualRows.filter(r => r.txId === log.id);
+    const row = TX_ID_PATTERN.test(log.id) && matches.length === 1 ? matches[0] : null;
     if (!row) continue;
-    used.add(key);
+    const actualKey = `${log.month}:${row.row}`;
+    if (used.has(actualKey)) continue;
+    used.add(actualKey);
     recent.push({ ...row, approximate: false, id: log.id, ownerId: log.userId });
   }
 
@@ -1934,7 +2179,7 @@ async function expenseMenuHandler(text, event, sheetId = null) {
   }
   if (text === "取消記帳") { expenseSessions.delete(key); helpSessions.delete(key); return "已取消本次新增記帳（沒有寫入資料）。"; }
   if (text === "記帳說明") return menuHome();
-  if (text === "代付說明" || text === "跨場代付") return "跨場代付目前尚未開放，請勿用一般支出代替跨場代付，以免帳務歸屬錯誤。";
+  if (text === "代付說明" || text === "跨場代付") return "跨場代付可輸入：草湖幫東平 5600 電費 / 台電。也支援日期前綴，例如 2026/10/24 草湖幫東平 5600 電費 / 台電。只寫付款同事帳本，費用歸屬東平場，中央只計一筆。目前僅支援雞場帳戶；零用金代付尚未支援。LINE 本月查詢仍以本人帳本為範圍，不代表全部同事的中央彙總。";
   if (text === "應收應付") return "應收應付專用查詢尚未開放；目前可使用「本月」查看收支，請勿將收支合計當作未結清應收應付。";
   if (text === "區間查詢") return "目前支援：本月、今年、9月、2026/10、草湖 本月。自訂起訖日查詢尚未開放。";
   if (["使用說明", "操作說明"].includes(text)) {
@@ -2172,7 +2417,7 @@ async function handleTextMessage(event) {
   if (numberDelete) return await requestDeleteByNumber(targetSheetId, userId, Number(numberDelete[1]));
   const idDelete = text.match(/^刪除\s+(TX-[0-9a-f-]+)$/i);
   if (idDelete) return await requestSelectedDelete(targetSheetId, userId, idDelete[1]);
-  if (text === "確認刪除") return await confirmDeleteLast(targetSheetId, userId);
+  if (text === "確認刪除") return await confirmDeleteLast(targetSheetId, userId, event.webhookEventId || event.message?.id || "");
   if (text === "取消") {
     pendingDeletions.delete(`${targetSheetId}:${userId}`);
     return "已取消刪除。";
@@ -2219,8 +2464,10 @@ async function handleTextMessage(event) {
       expense,
       dated.dateInfo.dateText,
       userName,
-      event.source?.userId || ""
+      event.source?.userId || "",
+      event.webhookEventId || event.message?.id || ""
     );
+    if (writeResult?.duplicate) return `✅ 此事件的記錄完成流程先前已執行，本次不會重複新增。請以最近10筆確認目前狀態。${writeResult.centralWarning ? "中央同步仍待重試。" : ""}`;
     await recordPersonalFarm(event.source?.userId || "", expense.payerFarm || expense.farm);
     await recordPersonalVendor(event.source?.userId || "", expense.vendor);
 
@@ -2306,11 +2553,11 @@ const RECONCILE_BOOK_GAP_MS = 1500;
 // V2.5.2：個人帳本同步快照。只用於 2026/10 起有 S 欄永久交易 ID 的月份。
 // Google Sheets 定時輪詢無法單憑「ID 消失」判定刪除；必須另有分頁總列數減少的證據。
 const SYNC_SNAPSHOT_TAB = "系統同步快照";
-const SYNC_SNAPSHOT_HEADERS = ["月份", "上次分頁總列數", "上次交易ID清單JSON", "快照時間UTC", "交易ID列號快照JSON"];
+const SYNC_SNAPSHOT_HEADERS = ["月份", "上次分頁總列數", "上次交易ID清單JSON", "快照時間UTC", "交易ID列號快照JSON", "列級身分快照JSON"];
 async function readSyncSnapshots(sheetId, sheets) {
   await ensureSheet(sheetId, SYNC_SNAPSHOT_TAB, SYNC_SNAPSHOT_HEADERS);
   const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: sheetId, range: `'${SYNC_SNAPSHOT_TAB}'!A2:E`, valueRenderOption: "FORMATTED_VALUE"
+    spreadsheetId: sheetId, range: `'${SYNC_SNAPSHOT_TAB}'!A2:F`, valueRenderOption: "FORMATTED_VALUE"
   });
   const out = new Map();
   (result.data.values || []).forEach((r, i) => {
@@ -2329,61 +2576,40 @@ async function readSyncSnapshots(sheetId, sheets) {
           throw Error("invalid row positions");
         }
       }
-      out.set(String(r[0]), { sheetRow: i + 2, gridRows, ids, positions });
+      const identities=JSON.parse(String(r[5]||"{}"));
+      if(!identities || typeof identities!=="object" || Array.isArray(identities) ||
+          Object.entries(identities).some(([id,p])=>!ids.includes(id)||!p||!Number.isInteger(p.metadataId)||p.metadataId<1||!Number.isInteger(p.sheetId)||p.sheetId<0))throw Error("invalid identities");
+      out.set(String(r[0]), { sheetRow: i + 2, gridRows, ids, positions, identities });
     } catch (err) { throw new Error(`同步快照 ${r[0]} 損壞，已停止該帳本對帳：${err.message}`); }
   });
+  for(const [month,record] of await snapshotStore.read(sheets,sheetId))out.set(month,record);
   return out;
 }
-async function saveSyncSnapshot(sheetId, sheets, snapshots, month, gridRows, ids, positions) {
+async function saveSyncSnapshot(sheetId, sheets, snapshots, month, gridRows, ids, positions, identities = {}) {
   const json = JSON.stringify([...ids].sort());
-  if (json.length > 45000) throw new Error(`月份 ${month} 快照過大，請人工處理`);
+
   const positionsJson = JSON.stringify(Object.fromEntries([...ids].sort().map(id => [id, positions.get(id)])));
-  if (positionsJson.length > 45000) throw new Error(`月份 ${month} 列號快照過大，請人工處理`);
-  const values = [[month, gridRows, json, new Date().toISOString(), positionsJson]];
+
+  const identityJson=JSON.stringify(identities);
+  if(json.length>45000||positionsJson.length>45000||identityJson.length>45000||snapshots.get(month)?.storage==='v2'){
+    const record=await snapshotStore.save({sheets,book:sheetId,month,gridRows,ids,positions,identities,ensure:ensureSheet});
+    snapshots.set(month,record);return;
+  }
+  const values = [[month, gridRows, json, new Date().toISOString(), positionsJson, identityJson]];
   const old = snapshots.get(month);
   if (old) {
     await sheets.spreadsheets.values.update({ spreadsheetId: sheetId,
-      range: `'${SYNC_SNAPSHOT_TAB}'!A${old.sheetRow}:E${old.sheetRow}`,
+      range: `'${SYNC_SNAPSHOT_TAB}'!A${old.sheetRow}:F${old.sheetRow}`,
       valueInputOption: "RAW", requestBody: { values } });
   } else {
     await sheets.spreadsheets.values.append({ spreadsheetId: sheetId,
-      range: `'${SYNC_SNAPSHOT_TAB}'!A:E`, valueInputOption: "RAW",
+      range: `'${SYNC_SNAPSHOT_TAB}'!A:F`, valueInputOption: "RAW",
       insertDataOption: "INSERT_ROWS", requestBody: { values } });
   }
-  snapshots.set(month, {sheetRow: old?.sheetRow || 0, gridRows, ids: [...ids], positions: Object.fromEntries(positions)});
+  snapshots.set(month, {sheetRow: old?.sheetRow || 0, gridRows, ids: [...ids], positions: Object.fromEntries(positions),identities});
 }
 
-// V2.9 離線候選：比對上輪 ID + 列號快照，支援跨輪逐筆及同輪多筆整列刪除。
-// 無上一輪列號快照、末尾刪除、清空 ID、搬動列、同時插入列或不一致時，一律保留中央。
-function v29HasRowDeletionProof({newlyMissing, snapshot, byId, currentIds}) {
-  if (!snapshot?.positions || !newlyMissing.length) return false;
-  const before = snapshot.positions;
-  const oldIds = new Set(snapshot.ids);
-  const gone = new Set(newlyMissing.map(e => e.id));
-  if (gone.size !== newlyMissing.length || [...gone].some(id => !oldIds.has(id))) return false;
-  const beforeRows = snapshot.ids.map(id => before[id]);
-  if (new Set(beforeRows).size !== beforeRows.length) return false;
-  // 新增交易在本輪也可能發生；若新增 ID 插在舊資料中間，無法證明刪列。
-  const lastOldRow = Math.max(...beforeRows);
-  for (const id of currentIds) {
-    if (!oldIds.has(id)) {
-      const hits = byId.get(id) || [];
-      if (hits.length !== 1 || hits[0] <= lastOldRow - gone.size) return false;
-    }
-  }
-  let shifted = 0;
-  for (const id of snapshot.ids) {
-    if (gone.has(id)) continue;
-    const hits = byId.get(id) || [];
-    if (hits.length !== 1) return false;
-    const expected = before[id] - [...gone].filter(g => before[g] < before[id]).length;
-    if (hits[0] !== expected) return false;
-    if (hits[0] < before[id]) shifted++;
-  }
-  // 必須看見後續原有交易向上移動；不能僅憑 ID 消失刪除中央。
-  return shifted > 0;
-}
-
+// 刪除證據改為已保存的 row-scoped developerMetadata 消失；不再依列位移推測。
 // 中央安全對帳：只校正唯一匹配交易的列號；不依內容差異自動刪中央。
 // 絕不依舊列號單獨判定刪除；有重複內容、欄位缺漏或資料異常時略過。
 let reconciliationRunning = false;
@@ -2392,7 +2618,25 @@ function reconcileFingerprint(farm, type, item, amount, recorder) {
     Math.abs(Number(String(amount).replace(/,/g, ""))), String(recorder).trim()].join("\u001f");
 }
 async function reconcileOneBook(sheetId) {
+  const currentMonth = taipeiNow().monthSheet;
+  await rowIdentity.recoverTemporaryProtections(await getSheets(),sheetId,process.env.GOOGLE_CLIENT_EMAIL);
+  const pendingFailures = await drainCentralOutbox(sheetId);
+  if (pendingFailures.length) throw pendingFailures[0].error;
   const sheets = await getSheets();
+  // Completed jobs retain original ownership evidence; use it if the projection log was lost.
+  const retryJobs=await sheets.spreadsheets.get({spreadsheetId:sheetId,fields:"sheets.properties(title)"});
+  if(retryJobs.data.sheets.some(t=>t.properties.title===OUTBOX_TAB)){
+    const response=await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`'${OUTBOX_TAB}'!A2:B`});
+    const seen=new Set((await readAccountingLog(sheetId)).map(e=>e.id));
+    for(const r of response.data.values||[]){
+      const p=JSON.parse(r[0]);
+      if(p.action!=="create"||seen.has(p.txId)||p.monthSheet<currentMonth)continue;
+      rowIdentity.assertMonth(p.monthSheet);
+      if(p.sourceSheetId!==sheetId)throw Error("待辦來源帳本不符");
+      await rowIdentity.protect(sheets,sheetId,p.monthSheet,process.env.GOOGLE_CLIENT_EMAIL,()=>repairAccountingJournal(sheetId,p));
+      seen.add(p.txId);
+    }
+  }
   const entries = await readAccountingLog(sheetId);
   const snapshots = await readSyncSnapshots(sheetId, sheets);
   const groups = new Map();
@@ -2407,7 +2651,13 @@ async function reconcileOneBook(sheetId) {
   const logTab = tabs.get(RECENT_LOG_TAB);
   if (!logTab) return;
   for (const [month, logs] of groups) {
+    if (month < "202610月") continue;
+    const historical = month < currentMonth;
+    // Past months get no bulk baseline, amount changes or row-number repair.
+    // Only previously established identity evidence may authorize a targeted deletion.
+    if (historical && !Object.keys(snapshots.get(month)?.identities||{}).length) continue;
     if (!tabs.has(month)) continue; // 分頁被移除不等於可安全確認每筆交易
+    await rowIdentity.protect(sheets,sheetId,month,process.env.GOOGLE_CLIENT_EMAIL,async sourceTab=>{
     const response = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId,
       range: `'${month}'!A1:AZ`, valueRenderOption: "FORMATTED_VALUE" });
     const rows = response.data.values || [];
@@ -2437,28 +2687,24 @@ async function reconcileOneBook(sheetId) {
             rows:[{values:[sheetCell(hits[0])]}],fields:"userEnteredValue"}});
         } else missing.push(e);
       }
-      // 必須有快照包含該 ID，且同輪觀察到唯一的整列上移證據。
+      // 快照必須包含該 ID，且該筆已保存的列級身分必須消失。
       // 配置總列數僅用於診斷，不再作為實際刪除的證據。
       const removedRows = snapshot && gridRows > 0 ? snapshot.gridRows - gridRows : 0;
       const previouslyKnown = new Set(snapshot?.ids || []);
       // 升級前就已缺失的交易不在快照中，僅列警告；不阻止新交易日後的刪除辨識。
       const newlyMissing = missing.filter(e => previouslyKnown.has(e.id));
       const oldMissing = missing.filter(e => !previouslyKnown.has(e.id));
-      // 快照中的消失 ID 必須全部能在本輪日誌的「新缺失」找到；
-      // 否則可能是 LINE 刪除、人工修改 S 欄或其他異常，禁止自動刪除。
-      const snapshotGone = snapshot ? snapshot.ids.filter(id => !currentIds.has(id)) : [];
-      const snapshotMissingMatches = snapshotGone.length === newlyMissing.length &&
-        snapshotGone.every(id => newlyMissing.some(e => e.id === id));
-      const safelyMissing = snapshotMissingMatches && v29HasRowDeletionProof({
-        newlyMissing, snapshot, byId, currentIds
-      });
+      const identityMeta=await rowIdentity.metadata(sheets,sheetId);
+      const verifiedMissing = newlyMissing.filter(e=>
+        rowIdentity.deletionProven(identityMeta,sourceTab,snapshot?.identities,e.id,currentIds));
+      const safelyMissing = newlyMissing.length>0 && verifiedMissing.length===newlyMissing.length;
       // V2.8 階段二：唯讀診斷，不放寬刪除條件，不輸出交易ID。
       // gridProperties.rowCount 是配置列數，不等於實際記帳筆數。
       if (missing.length || snapshot) {
         console.info(`[V2.9 刪除診斷] 月份=${month} 快照=${snapshot ? "有" : "無"}` +
           ` 快照ID數=${snapshot?.ids.length ?? 0} 現有ID數=${currentIds.size}` +
           ` 舊缺失=${oldMissing.length} 新缺失=${newlyMissing.length}` +
-          ` 配置列差=${removedRows} 整列位移證據=${safelyMissing} 允許自動刪除=${Boolean(safelyMissing && !unsafe)}`);
+          ` 配置列差=${removedRows} 列級身分刪除證據=${safelyMissing} 允許自動刪除=${Boolean(safelyMissing && !unsafe)}`);
       }
 
       // 避免新交易 ID 重複、未知交易 ID 或整個分頁異常造成誤刪。
@@ -2471,36 +2717,58 @@ async function reconcileOneBook(sheetId) {
       if (newlyMissing.length && (!safelyMissing || unsafe)) {
         console.warn(`[V2.8 手動刪除待核對] 帳本=${String(sheetId).slice(0,6)} 月份=${month} 新缺少=${newlyMissing.length}筆，總列數減少=${removedRows}，異常=${unsafe}；中央保留。缺少ID不能單獨證明刪除整列。`);
       }
-      if (changes.length) await sheets.spreadsheets.batchUpdate({
-        spreadsheetId:sheetId,requestBody:{requests:changes}});
-      if (safelyMissing && !unsafe) {
-        // 先刪中央，成功後才將個人日誌標記為已刪除；下次對帳可安全重試。
-        for (const e of newlyMissing) {
-          try {
-            const result = await syncCentralDeletedVerified(e.id, sheetId, month);
-            if (result !== "deleted" && result !== "missing") throw Error(`中央刪除回傳 ${result}`);
-            await sheets.spreadsheets.values.update({spreadsheetId:sheetId,
-              range:`'${RECENT_LOG_TAB}'!K${e.logRow}:L${e.logRow}`,
-              valueInputOption:"RAW",requestBody:{values:[["已刪除",new Date().toISOString()]]}});
-            console.info(`[V2.5.2 手動刪除已同步] ${month} ${e.id}`);
-          } catch(err) {
-            unsafe = true;
-            console.error(`[V2.5.2 中央刪除失敗，保留快照待重試] ${e.id}`,err.message);
-            break;
+      if (!unsafe && !historical) {
+        const central = await centralRows(await centralSheets());
+        const amountJobs=[];
+        for (const e of logs.filter(e=>e.status!=="已刪除" && e.v2Marker==="V2-ID")) {
+          const hits=byId.get(e.id)||[];
+          if (hits.length!==1) continue;
+          const raw=rows[hits[0]-1]?.[12];
+          if (raw === "" || raw == null) continue;
+          const amount=Number(String(raw).replace(/,/g,""));
+          if (!Number.isFinite(amount)) continue;
+          const target=central.filter(r=>r[0]===e.id);
+          if (target.length===1 && target[0][17]===sheetId && target[0][18]===month && target[0][20]==="有效" &&
+              (Number(String(target[0][13]).replace(/,/g,""))!==Math.abs(amount) || Math.abs(e.amount)!==Math.abs(amount))) {
+            amountJobs.push({action:"amount",txId:e.id,sourceSheetId:sheetId,monthSheet:month});
           }
         }
+        if (amountJobs.length) {
+          const request=await outboxAppendRequest(sheetId,amountJobs);
+          await sheets.spreadsheets.batchUpdate({spreadsheetId:sheetId,requestBody:{requests:[request]}});
+          const failures=await drainCentralOutbox(sheetId);
+          if (failures.length) throw failures[0].error;
+        }
+      }
+      if (!historical) for(let start=0;start<changes.length;start+=500)await sheets.spreadsheets.batchUpdate({
+        spreadsheetId:sheetId,requestBody:{requests:changes.slice(start,start+500)}});
+      if (verifiedMissing.length && !unsafe) {
+        // Persist the entire proven batch before processing any member.
+        const request = await outboxAppendRequest(sheetId,verifiedMissing.map(e => ({
+          action:"delete",txId:e.id,sourceSheetId:sheetId,monthSheet:month,evidence:snapshot.identities[e.id]
+        })));
+        await sheets.spreadsheets.batchUpdate({spreadsheetId:sheetId,requestBody:{requests:[request]}});
+        const failures = await drainCentralOutbox(sheetId);
+        if (failures.length) throw failures[0].error;
+
       }
       // 有不確定的缺失時保留原快照，不讓不明原因的缺 ID 被默默視為正常。
-      if (!unsafe && (newlyMissing.length === 0 || safelyMissing)) {
+      if (!historical && !unsafe && (newlyMissing.length === 0 || safelyMissing)) {
         const positions = new Map([...byId.entries()].map(([id, hits]) => [id, hits[0]]));
-        await saveSyncSnapshot(sheetId, sheets, snapshots, month, gridRows, currentIds, positions);
+        const identities={};
+        for(const id of currentIds){
+          const metadataId=await rowIdentity.bind(sheets,sheetId,sourceTab,id,sheetId,month,positions.get(id),identityMeta);
+          identities[id]={metadataId,sheetId:sourceTab.sheetId};
+        }
+        await saveSyncSnapshot(sheetId, sheets, snapshots, month, gridRows, currentIds, positions,identities);
       }
-      continue;
+      return;
     }
+    if (historical) return; // No legacy row-number repair in historical months.
     const col = names => headerIndex(headers, names);
     const ix = [col(["帳務歸屬", "場別"]), col(["收支類型"]), col(["品項"]),
       col(["金額"]), col(["填表人"])];
-    if (ix.some(x => x < 0)) continue;
+    if (ix.some(x => x < 0)) return;
     const actual = new Map();
     rows.slice(1).forEach((r, i) => {
       if (!r.length) return;
@@ -2541,6 +2809,7 @@ async function reconcileOneBook(sheetId) {
     if (requests.length) await sheets.spreadsheets.batchUpdate({
       spreadsheetId:sheetId,requestBody:{requests}});
 
+    });
   }
   // 不再對所有「已刪除」日誌無條件重試中央刪除：
   // 舊版對帳可能將人工修改誤標為已刪除，重試會持續誤刪。
@@ -2567,7 +2836,7 @@ async function reconcileAllBooks() {
     for (const id of ids) {
       // 各帳本間錯開請求，避免 8 本帳本在同一分鐘集中讀取。
       await reconcileSleep(RECONCILE_BOOK_GAP_MS);
-      try { await reconcileOneBook(id); }
+      try { await writeQueue.exclusive(() => reconcileOneBook(id)); }
       catch (err) {
         if (isSheetsReadQuotaError(err)) {
           reconciliationRetryAfter = Date.now() + RECONCILE_QUOTA_COOLDOWN_MS;
@@ -2587,13 +2856,22 @@ async function reconcileAllBooks() {
   finally { reconciliationRunning = false; }
 }
 // 每10分鐘背景檢查一次；中央失敗不阻止 LINE 記帳。
-setInterval(() => { reconcileAllBooks().catch(err => console.error(err)); }, 10 * 60 * 1000);
+const backgroundTimer = setInterval(() => {
+  if (!lifecycle.closing) lifecycle.track(() => reconcileAllBooks()).catch(() => console.error("背景對帳未完成，請檢查同步待辦"));
+}, 10 * 60 * 1000);
 
+const completedEventReplies = new Map();
 async function handleEvent(event) {
   if (event.type !== "message" || event.message.type !== "text") return null;
 
   try {
-    const replyText = await handleTextMessage(event);
+    const eventId = event.webhookEventId || event.message?.id;
+    const replyText = await writeQueue.exclusive(async () => {
+      if (eventId && completedEventReplies.has(eventId)) return completedEventReplies.get(eventId);
+      const reply = await handleTextMessage(event);
+      if (eventId) { completedEventReplies.set(eventId,reply);if(completedEventReplies.size>2000)completedEventReplies.delete(completedEventReplies.keys().next().value); }
+      return reply;
+    });
 
     const msg = { type: "text", text: replyText };
     const quickReply = expenseQuickReply(replyText, event);
@@ -2605,7 +2883,7 @@ async function handleEvent(event) {
 
     return "OK";
   } catch (err) {
-    console.error("處理訊息錯誤：", err);
+    console.error("處理訊息錯誤：", {name:["Error","TypeError","GaxiosError"].includes(err?.name)?err.name:"Error",httpStatus:Number(err?.response?.status)||null});
 
     try {
       await client.replyMessage({
@@ -2636,6 +2914,7 @@ async function processWebhookEvents(events) {
     const id = event.webhookEventId || event.message?.id;
     if (id && processedWebhookEvents.has(id)) continue;
     const result = await handleEvent(event);
+    if (result === "ERROR") throw Error("LINE 事件處理或回覆失敗");
     if (id && result === "OK") {
       processedWebhookEvents.set(id, Date.now());
       if (processedWebhookEvents.size > 2000) {
@@ -2645,20 +2924,54 @@ async function processWebhookEvents(events) {
     }
   }
 }
-app.post("/webhook", line.middleware(config), async (req, res) => {
-  const task = webhookSerialQueue.then(() => processWebhookEvents(req.body.events));
-  webhookSerialQueue = task.catch(err => console.error("Webhook queue error:", err));
+app.post("/webhook", httpGuard.body, line.middleware(config), httpGuard.admit, async (req, res) => {
+  const previous = webhookSerialQueue;
+  const task = lifecycle.track(() => previous.then(() => processWebhookEvents(req.body.events)));
+  webhookSerialQueue = task.catch(err => console.error("Webhook queue error: processing failed"));
   try {
     await task;
-    res.status(200).end();
+    if (!res.writableEnded && !res.destroyed) res.status(200).end();
   } catch (err) {
-    console.error("Webhook Error:", err);
-    res.status(500).end();
+    console.error("Webhook Error: processing failed");
+    if (!res.writableEnded && !res.destroyed) res.status(500).end();
+  } finally {
+    req.releaseHttpJob();
   }
 });
 
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
+app.use(httpGuard.errors);
+
+const httpServer = app.listen(PORT, () => {
   console.log(`Chicken Farm Accounting Bot - Simplified Income Expense + Keyword Master Version running on port ${PORT}`);
 });
+
+httpSecurity.configureServer(httpServer);
+
+// Stop admission/background scheduling first. Never treat an HTTP deadline as
+// cancellation of accepted work. A platform SIGKILL still needs durable replay.
+app.locals.drainAccounting = async () => {
+  lifecycle.stop();
+  clearInterval(backgroundTimer);
+  await lifecycle.idle();
+  await writeQueue.idle();
+};
+if (typeof process.once === "function") {
+  let stopping = false;
+  const shutdown = () => {
+    if (stopping) return;
+    stopping = true;
+    lifecycle.stop();
+    clearInterval(backgroundTimer);
+    httpServer.close();
+    const deadline = setTimeout(() => process.exit(1), 45000);
+    deadline.unref();
+    app.locals.drainAccounting().then(() => {
+      clearTimeout(deadline);
+      process.exit(0);
+    }, () => process.exit(1));
+  };
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
+}

@@ -4,7 +4,8 @@ const express = require("express");
 const line = require("@line/bot-sdk");
 const { google } = require("googleapis");
 const { randomUUID, createHash } = require("node:crypto");
-const rowIdentity = require("./sheet-identity").withDeclaredOwners(JSON.parse(process.env.SHEET_DECLARED_OWNERS_JSON || "{}"),process.env.GOOGLE_CLIENT_EMAIL);
+let masterAuthorizedBooks = new Set();
+const rowIdentity = require("./sheet-identity").withDeclaredOwners({},process.env.GOOGLE_CLIENT_EMAIL,{resolveOwner:resolveGoogleBookOwner});
 
 const snapshotStore = require("./snapshot-store");
 
@@ -180,6 +181,32 @@ function getGoogleAuth() {
     key: privateKey,
     scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
+}
+
+let ownerDriveClient;
+async function resolveGoogleBookOwner(book) {
+  if (book !== MASTER_SHEET_ID && book !== CENTRAL_SHEET_ID && !masterAuthorizedBooks.has(book)) {
+    throw new Error("帳本未列入授權主檔，停止驗證及寫入");
+  }
+  try {
+    if (!ownerDriveClient) ownerDriveClient = google.drive({version:"v3",
+      auth:getGoogleAuth().createScoped(["https://www.googleapis.com/auth/drive.metadata.readonly"])});
+    const response = await ownerDriveClient.files.get({fileId:book,supportsAllDrives:true,
+      fields:"id,mimeType,trashed,driveId,owners(emailAddress),capabilities(canEdit)"},{timeout:10000,retry:false});
+    const file = response.data;
+    if (file?.id !== book || file.mimeType !== "application/vnd.google-apps.spreadsheet" ||
+        file.trashed !== false || file.driveId || file.capabilities?.canEdit !== true ||
+        !Array.isArray(file.owners) || file.owners.length !== 1 ||
+        typeof file.owners[0]?.emailAddress !== "string" || !/^\S+@\S+\.\S+$/.test(file.owners[0].emailAddress.trim())) {
+      throw new Error("OWNER_METADATA_INVALID");
+    }
+    return file.owners[0].emailAddress.trim().toLowerCase();
+  } catch (err) {
+    const safe = new Error("無法確認Google帳本擁有者或編輯權限，停止該操作");
+    const status = Number(err?.response?.status);
+    if (Number.isInteger(status) && status >= 400 && status <= 599) safe.response = {status};
+    throw safe;
+  }
 }
 
 async function getSheets() {
@@ -423,6 +450,11 @@ async function getMasterSheetTitle() {
   return tabs[0]?.title || null;
 }
 
+function refreshOwnerBookScope(rows) {
+  masterAuthorizedBooks = new Set(rows.filter(r => ["Y","YES","TRUE","1","啟用"].includes(String(r[4]||"").trim().toUpperCase()))
+    .map(r => String(r[3]||"").trim()).filter(Boolean));
+}
+
 async function resolveUserSheet(event) {
   const userId = event.source?.userId || "";
 
@@ -448,6 +480,7 @@ async function resolveUserSheet(event) {
   });
 
   const rows = result.data.values || [];
+  refreshOwnerBookScope(rows);
 
   const matched = rows.find(r =>
     String(r[2] || "").trim() === userId
@@ -483,6 +516,7 @@ async function resolveUserSheet(event) {
 }
 
 async function ensureSheet(sheetId, sheetName, headers) {
+  await rowIdentity.verifyOwner(sheetId);
   const sheets = await getSheets();
 
   const meta = await sheets.spreadsheets.get({
@@ -2827,6 +2861,7 @@ async function reconcileAllBooks() {
     if (!title) return;
     const response = await sheets.spreadsheets.values.get({spreadsheetId:MASTER_SHEET_ID,
       range:`'${title}'!A2:F`,valueRenderOption:"FORMATTED_VALUE"});
+    refreshOwnerBookScope(response.data.values || []);
     const ids = [...new Set((response.data.values || [])
       .filter(r => ["Y","YES","TRUE","1","啟用"].includes(String(r[4]||"").trim().toUpperCase()))
       .map(r => String(r[3]||"").trim()).filter(Boolean))];
@@ -2834,7 +2869,7 @@ async function reconcileAllBooks() {
     for (const id of ids) {
       // 各帳本間錯開請求，避免 8 本帳本在同一分鐘集中讀取。
       await reconcileSleep(RECONCILE_BOOK_GAP_MS);
-      try { await writeQueue.exclusive(() => reconcileOneBook(id)); }
+      try { await writeQueue.exclusive(() => rowIdentity.ownerScope(() => reconcileOneBook(id))); }
       catch (err) {
         if (isSheetsReadQuotaError(err)) {
           reconciliationRetryAfter = Date.now() + RECONCILE_QUOTA_COOLDOWN_MS;
@@ -2862,12 +2897,12 @@ async function handleEvent(event) {
 
   try {
     const eventId = event.webhookEventId || event.message?.id;
-    const replyText = await writeQueue.exclusive(async () => {
+    const replyText = await writeQueue.exclusive(() => rowIdentity.ownerScope(async () => {
       if (eventId && completedEventReplies.has(eventId)) return completedEventReplies.get(eventId);
       const reply = await handleTextMessage(event);
       if (eventId) { completedEventReplies.set(eventId,reply);if(completedEventReplies.size>2000)completedEventReplies.delete(completedEventReplies.keys().next().value); }
       return reply;
-    });
+    }));
 
     const msg = { type: "text", text: replyText };
     const quickReply = expenseQuickReply(replyText, event);

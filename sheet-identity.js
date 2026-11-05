@@ -144,15 +144,33 @@ function deletionProven(data,tab,previous,txId,currentIds) {
 module.exports={COMPACT_KEY,COMPACT_VALUE,registryStore,recoverTemporaryProtections,KEY,assertMonth,identityValue,sheetInfo,metadata,matches,protect,secureSystem,bind,rowForIdentity,deletionProven};
 // Explicit operator declaration, scoped per spreadsheet. This does not discover
 // or certify ownership using Drive, and never trusts an arbitrary second editor.
-function withDeclaredOwners(declarations={},declaredActor=process.env.GOOGLE_CLIENT_EMAIL){
+function withDeclaredOwners(declarations={},declaredActor=process.env.GOOGLE_CLIENT_EMAIL,options={}){
  if(!declarations||typeof declarations!=='object'||Array.isArray(declarations))throw Error('帳本擁有者設定無效');
  const owners=new Map();
  for(const [book,email] of Object.entries(declarations)){
   if(!book||typeof email!=='string'||!/^\S+@\S+\.\S+$/.test(email.trim()))throw Error('帳本擁有者設定無效');
   owners.set(book,email.trim().toLowerCase());
  }
- return {...module.exports,bind:(sheets,book,tab,txId,sourceBook,month,row,cached)=>bind(sheets,book,tab,txId,sourceBook,month,row,cached,owners,declaredActor),protect:(sheets,book,title,actor,work)=>protect(sheets,book,title,actor,work,owners),
-  secureSystem:(sheets,book,title,actor)=>secureSystem(sheets,book,title,actor,owners),
-  recoverTemporaryProtections:(sheets,book,actor)=>recoverTemporaryProtections(sheets,book,actor,owners)};
+ const resolveOwner=options.resolveOwner;
+ if(resolveOwner!==undefined&&typeof resolveOwner!=='function')throw Error('帳本擁有者驗證器無效');
+ const ownerContext=new AsyncLocalStorage();
+ const ownerScope=work=>ownerContext.getStore()?work():ownerContext.run(new Map(),work);
+ const policyFor=book=>{
+  const context=ownerContext.getStore();
+  if(context.has(book))return context.get(book);
+  const pending=Promise.resolve().then(async()=>{
+   const owner=resolveOwner?await resolveOwner(book):owners.get(book);
+   if(resolveOwner&&(typeof owner!=='string'||!/^\S+@\S+\.\S+$/.test(owner.trim())))throw Error('無法驗證帳本擁有者，停止寫入');
+   return owner?new Map([[book,owner.trim().toLowerCase()]]):new Map();
+  });
+  context.set(book,pending);return pending;
+ };
+ const usingOwner=(book,work)=>ownerScope(async()=>work(await policyFor(book)));
+ return {...module.exports,ownerScope,
+  verifyOwner:book=>usingOwner(book,policy=>policy.get(book)),
+  bind:(sheets,book,tab,txId,sourceBook,month,row,cached)=>usingOwner(book,policy=>bind(sheets,book,tab,txId,sourceBook,month,row,cached,policy,declaredActor)),
+  protect:(sheets,book,title,actor,work)=>usingOwner(book,policy=>protect(sheets,book,title,actor,work,policy)),
+  secureSystem:(sheets,book,title,actor)=>usingOwner(book,policy=>secureSystem(sheets,book,title,actor,policy)),
+  recoverTemporaryProtections:(sheets,book,actor)=>usingOwner(book,policy=>recoverTemporaryProtections(sheets,book,actor,policy))};
 }
 module.exports.withDeclaredOwners=withDeclaredOwners;

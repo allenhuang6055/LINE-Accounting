@@ -1,0 +1,11 @@
+'use strict';
+const test=require('node:test');
+const assert=require('node:assert/strict');
+const {allMissingProven}=require('../manual-delete-proof');
+const a={id:'a'},b={id:'b'};
+test('single verified deletion',()=>assert.equal(allMissingProven([a],[a]),true));
+test('multiple verified deletions',()=>assert.equal(allMissingProven([a,b],[b,a]),true));
+test('mixed proven and unproven deletions must block entire batch',()=>assert.equal(allMissingProven([a,b],[a]),false));
+test('same number but wrong identity cannot authorize deletion',()=>assert.equal(allMissingProven([a,b],[a,{id:'c'}]),false));
+test('duplicate proof cannot authorize deletion',()=>assert.equal(allMissingProven([a,b],[a,a]),false));
+test('no missing rows must not authorize deletion',()=>assert.equal(allMissingProven([],[]),false));

@@ -139,6 +139,8 @@ function deletionProven(data,tab,previous,txId,currentIds) {
  if(!proof || proof.sheetId!==tab.sheetId || !Number.isInteger(proof.metadataId)||currentIds.has(txId))return false;
  // A cleared ID leaves row metadata intact. Only disappearance of the known metadata
  // with the matching ID's absence is accepted. Never infer deletion from grid size.
+ // The marker must be absent from the entire spreadsheet, not merely moved
+ // to another row or tab. A moved marker is not proof of a deleted row.
  return !(data.developerMetadata||[]).some(m=>m.metadataId===proof.metadataId);
 }
 module.exports={COMPACT_KEY,COMPACT_VALUE,registryStore,recoverTemporaryProtections,KEY,assertMonth,identityValue,sheetInfo,metadata,matches,protect,secureSystem,bind,rowForIdentity,deletionProven};

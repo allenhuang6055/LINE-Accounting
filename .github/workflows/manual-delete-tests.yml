@@ -1,0 +1,23 @@
+name: Manual deletion regression
+on:
+  push:
+    branches:
+      - fix/manual-delete-sync-owner-compat-20261106
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Syntax check
+        run: |
+          node --check server.js
+          node --check sheet-identity.js
+          node --check central-sync-outbox.js
+      - name: Manual deletion identity regression
+        run: node --test test/manual-delete-identity.test.js

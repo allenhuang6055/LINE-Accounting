@@ -2310,7 +2310,7 @@ const SYNC_SNAPSHOT_HEADERS = ["月份", "上次分頁總列數", "上次交易I
 async function readSyncSnapshots(sheetId, sheets) {
   await ensureSheet(sheetId, SYNC_SNAPSHOT_TAB, SYNC_SNAPSHOT_HEADERS);
   const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: sheetId, range: `'${SYNC_SNAPSHOT_TAB}'!A2:E`, valueRenderOption: "FORMATTED_VALUE"
+    spreadsheetId: sheetId, range: `'${SYNC_SNAPSHOT_TAB}'!A2:F`, valueRenderOption: "FORMATTED_VALUE"
   });
   const out = new Map();
   (result.data.values || []).forEach((r, i) => {
@@ -2329,28 +2329,78 @@ async function readSyncSnapshots(sheetId, sheets) {
           throw Error("invalid row positions");
         }
       }
-      out.set(String(r[0]), { sheetRow: i + 2, gridRows, ids, positions });
+      let markers = null;
+      if (String(r[5] || "").trim()) {
+        markers = JSON.parse(String(r[5]));
+        if (!markers || typeof markers !== "object" || Array.isArray(markers) ||
+            Object.values(markers).some(v => !Number.isSafeInteger(v) || v <= 0)) throw Error("invalid metadata markers");
+      }
+      out.set(String(r[0]), { sheetRow: i + 2, gridRows, ids, positions, markers });
     } catch (err) { throw new Error(`同步快照 ${r[0]} 損壞，已停止該帳本對帳：${err.message}`); }
   });
   return out;
 }
-async function saveSyncSnapshot(sheetId, sheets, snapshots, month, gridRows, ids, positions) {
+async function saveSyncSnapshot(sheetId, sheets, snapshots, month, gridRows, ids, positions, markers = null) {
   const json = JSON.stringify([...ids].sort());
   if (json.length > 45000) throw new Error(`月份 ${month} 快照過大，請人工處理`);
   const positionsJson = JSON.stringify(Object.fromEntries([...ids].sort().map(id => [id, positions.get(id)])));
   if (positionsJson.length > 45000) throw new Error(`月份 ${month} 列號快照過大，請人工處理`);
-  const values = [[month, gridRows, json, new Date().toISOString(), positionsJson]];
+  const markerJson = markers ? JSON.stringify(markers) : "";
+  if (markerJson.length > 45000) throw new Error("列身分快照過大，停止同步");
+  const values = [[month, gridRows, json, new Date().toISOString(), positionsJson, markerJson]];
   const old = snapshots.get(month);
   if (old) {
     await sheets.spreadsheets.values.update({ spreadsheetId: sheetId,
-      range: `'${SYNC_SNAPSHOT_TAB}'!A${old.sheetRow}:E${old.sheetRow}`,
+      range: `'${SYNC_SNAPSHOT_TAB}'!A${old.sheetRow}:F${old.sheetRow}`,
       valueInputOption: "RAW", requestBody: { values } });
   } else {
     await sheets.spreadsheets.values.append({ spreadsheetId: sheetId,
-      range: `'${SYNC_SNAPSHOT_TAB}'!A:E`, valueInputOption: "RAW",
+      range: `'${SYNC_SNAPSHOT_TAB}'!A:F`, valueInputOption: "RAW",
       insertDataOption: "INSERT_ROWS", requestBody: { values } });
   }
-  snapshots.set(month, {sheetRow: old?.sheetRow || 0, gridRows, ids: [...ids], positions: Object.fromEntries(positions)});
+  snapshots.set(month, {sheetRow: old?.sheetRow || 0, gridRows, ids: [...ids], positions: Object.fromEntries(positions), markers});
+}
+
+
+// Manual deletion only: row-scoped Google metadata survives clearing cells but is
+// removed by deleting its row. One search + one batched create per month, not per ID.
+const MANUAL_DELETE_METADATA_KEY = "line-accounting.manual-delete.v1";
+async function manualDeleteMarkers(sheets, book, tabId, byId, snapshot) {
+  const response = await sheets.spreadsheets.developerMetadata.search({
+    spreadsheetId: book, requestBody: {dataFilters:[{
+      developerMetadataLookup:{metadataKey:MANUAL_DELETE_METADATA_KEY,visibility:"DOCUMENT"}
+    }]}
+  });
+  const all = (response.data.matchedDeveloperMetadata || []).map(x=>x.developerMetadata).filter(Boolean);
+  const byMarkerId = new Map(all.map(m=>[m.metadataId,m]));
+  const previous = snapshot?.markers || {};
+  const missing = Object.entries(previous).filter(([id,markerId])=>!byId.has(id) && !byMarkerId.has(markerId));
+  const markers = {};
+  const requests = [], requestedIds=[];
+  for (const [id, hits] of byId) {
+    if (hits.length !== 1) throw Error("交易ID重複，停止建立列身分");
+    const matches = all.filter(m=>m.metadataKey===MANUAL_DELETE_METADATA_KEY &&
+      m.metadataValue===id && m.location?.dimensionRange?.sheetId===tabId &&
+      m.location.dimensionRange.dimension==="ROWS" &&
+      m.location.dimensionRange.startIndex===hits[0]-1);
+    if (matches.length>1) throw Error("列身分重複，停止同步");
+    if (matches.length===1) {markers[id]=matches[0].metadataId;continue;}
+    if (previous[id]) throw Error("既有交易列身分不符，停止同步");
+    requests.push({createDeveloperMetadata:{developerMetadata:{
+      metadataKey:MANUAL_DELETE_METADATA_KEY,metadataValue:id,visibility:"DOCUMENT",
+      location:{dimensionRange:{sheetId:tabId,dimension:"ROWS",startIndex:hits[0]-1,endIndex:hits[0]}}
+    }}});
+    requestedIds.push(id);
+  }
+  if (requests.length) {
+    const created = await sheets.spreadsheets.batchUpdate({spreadsheetId:book,requestBody:{requests}});
+    requestedIds.forEach((id,i)=>{
+      const markerId=created.data.replies?.[i]?.createDeveloperMetadata?.developerMetadata?.metadataId;
+      if (!Number.isSafeInteger(markerId)) throw Error("無法確認列身分建立，停止同步");
+      markers[id]=markerId;
+    });
+  }
+  return {markers, missing:new Set(missing.map(([id])=>id))};
 }
 
 // V2.9 離線候選：比對上輪 ID + 列號快照，支援跨輪逐筆及同輪多筆整列刪除。
@@ -2455,9 +2505,18 @@ async function reconcileOneBook(sheetId) {
       const snapshotGone = snapshot ? snapshot.ids.filter(id => !currentIds.has(id)) : [];
       const snapshotMissingMatches = snapshotGone.length === newlyMissing.length &&
         snapshotGone.every(id => newlyMissing.some(e => e.id === id));
-      const safelyMissing = snapshotMissingMatches && v29HasRowDeletionProof({
-        newlyMissing, snapshot, byId, currentIds, gridRows
-      });
+      // Metadata must have been recorded on a PREVIOUS successful pass.
+      // Never use newly created markers as evidence for an earlier deletion.
+      let markerState = null;
+      if (!unsafe && ![...byId.values()].some(hits=>hits.length!==1) &&
+          [...currentIds].every(id=>TX_ID_PATTERN.test(id))) {
+        markerState = await manualDeleteMarkers(sheets,sheetId,tabs.get(month).sheetId,byId,snapshot);
+      }
+      const metadataProven = Boolean(snapshot?.markers && newlyMissing.length &&
+        newlyMissing.every(e=>Number.isSafeInteger(snapshot.markers[e.id]) &&
+          markerState?.missing.has(e.id)));
+      const safelyMissing = snapshotMissingMatches && (metadataProven ||
+        v29HasRowDeletionProof({newlyMissing, snapshot, byId, currentIds, gridRows}));
       // V2.8 階段二：唯讀診斷，不放寬刪除條件，不輸出交易ID。
       // gridProperties.rowCount 是配置列數，不等於實際記帳筆數。
       if (missing.length || snapshot) {
@@ -2499,7 +2558,7 @@ async function reconcileOneBook(sheetId) {
       // 有不確定的缺失時保留原快照，不讓不明原因的缺 ID 被默默視為正常。
       if (!unsafe && (newlyMissing.length === 0 || safelyMissing)) {
         const positions = new Map([...byId.entries()].map(([id, hits]) => [id, hits[0]]));
-        await saveSyncSnapshot(sheetId, sheets, snapshots, month, gridRows, currentIds, positions);
+        await saveSyncSnapshot(sheetId, sheets, snapshots, month, gridRows, currentIds, positions, markerState?.markers || null);
       }
       continue;
     }

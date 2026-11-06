@@ -60,7 +60,7 @@ async function protect(sheets,book,title,actor,work,owners=new Map()) {
  const data=await sheetInfo(sheets,book),sheet=data.sheets?.find(t=>t.properties.title===title),tab=sheet?.properties;
  if(!tab)throw Error('找不到待保護分頁');
  const full=(sheet.protectedRanges||[]).filter(p=>fullSheetProtection(p,tab.sheetId)),key=JSON.stringify([book,tab.sheetId]);
- if(full.some(p=>!validProtection(p,tab.sheetId,actor,owners.get(book))))throw Error('既有整頁保護無法確認，停止寫入');
+ if(full.some(p=>!validProtection(p,tab.sheetId,actor,owners.get(book))))throw Error('既有整頁保護無法確認；若帳本由同事擁有，不能將其他編輯者當作擁有者自動放行，停止寫入');
  if(activeLocks.has(key)){
   if(!lockContext.getStore()?.has(key))throw Error('分頁由其他工作使用');
   return work(tab);
@@ -147,6 +147,9 @@ module.exports={COMPACT_KEY,COMPACT_VALUE,registryStore,recoverTemporaryProtecti
 function withDeclaredOwners(declarations={},declaredActor=process.env.GOOGLE_CLIENT_EMAIL){
  if(!declarations||typeof declarations!=='object'||Array.isArray(declarations))throw Error('帳本擁有者設定無效');
  const owners=new Map();
+ // Owner declarations are optional. User-owned books must remain usable when
+ // the service account is the sole explicitly authorized protection editor.
+ // Never infer an unknown owner from an arbitrary editor or relax protection checks.
  for(const [book,email] of Object.entries(declarations)){
   if(!book||typeof email!=='string'||!/^\S+@\S+\.\S+$/.test(email.trim()))throw Error('帳本擁有者設定無效');
   owners.set(book,email.trim().toLowerCase());

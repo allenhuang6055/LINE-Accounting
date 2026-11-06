@@ -2515,8 +2515,11 @@ async function reconcileOneBook(sheetId) {
       const metadataProven = Boolean(snapshot?.markers && newlyMissing.length &&
         newlyMissing.every(e=>Number.isSafeInteger(snapshot.markers[e.id]) &&
           markerState?.missing.has(e.id)));
-      const safelyMissing = snapshotMissingMatches && (metadataProven ||
-        v29HasRowDeletionProof({newlyMissing, snapshot, byId, currentIds, gridRows}));
+      // Once row markers are established, never fall back to position-only proof:
+      // a cleared S cell plus an unrelated row shift must not delete central data.
+      const safelyMissing = snapshotMissingMatches && (snapshot?.markers
+        ? metadataProven
+        : v29HasRowDeletionProof({newlyMissing, snapshot, byId, currentIds, gridRows}));
       // V2.8 階段二：唯讀診斷，不放寬刪除條件，不輸出交易ID。
       // gridProperties.rowCount 是配置列數，不等於實際記帳筆數。
       if (missing.length || snapshot) {

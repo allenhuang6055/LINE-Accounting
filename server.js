@@ -2302,6 +2302,9 @@ function isSheetsReadQuotaError(err) {
 let reconciliationRetryAfter = 0;
 const RECONCILE_QUOTA_COOLDOWN_MS = 3 * 60 * 1000;
 const RECONCILE_BOOK_GAP_MS = 1500;
+// V2.9.1: rotate across books; a quota failure resumes at the SAME book.
+const RECONCILE_BOOKS_PER_ROUND = 2;
+let reconciliationNextBookId = null;
 
 // V2.5.2：個人帳本同步快照。只用於 2026/10 起有 S 欄永久交易 ID 的月份。
 // Google Sheets 定時輪詢無法單憑「ID 消失」判定刪除；必須另有分頁總列數減少的證據。
@@ -2365,13 +2368,18 @@ async function saveSyncSnapshot(sheetId, sheets, snapshots, month, gridRows, ids
 // Manual deletion only: row-scoped Google metadata survives clearing cells but is
 // removed by deleting its row. One search + one batched create per month, not per ID.
 const MANUAL_DELETE_METADATA_KEY = "line-accounting.manual-delete.v1";
-async function manualDeleteMarkers(sheets, book, tabId, byId, snapshot) {
-  const response = await sheets.spreadsheets.developerMetadata.search({
-    spreadsheetId: book, requestBody: {dataFilters:[{
-      developerMetadataLookup:{metadataKey:MANUAL_DELETE_METADATA_KEY,visibility:"DOCUMENT"}
-    }]}
-  });
-  const all = (response.data.matchedDeveloperMetadata || []).map(x=>x.developerMetadata).filter(Boolean);
+async function manualDeleteMarkers(sheets, book, tabId, byId, snapshot, cache = null) {
+  // Search once per BOOK, then reuse the result across its months.
+  let all = cache?.all;
+  if (!all) {
+    const response = await sheets.spreadsheets.developerMetadata.search({
+      spreadsheetId: book, requestBody: {dataFilters:[{
+        developerMetadataLookup:{metadataKey:MANUAL_DELETE_METADATA_KEY,visibility:"DOCUMENT"}
+      }]}
+    });
+    all = (response.data.matchedDeveloperMetadata || []).map(x=>x.developerMetadata).filter(Boolean);
+    if (cache) cache.all = all;
+  }
   const byMarkerId = new Map(all.map(m=>[m.metadataId,m]));
   const previous = snapshot?.markers || {};
   const missing = Object.entries(previous).filter(([id,markerId])=>!byId.has(id) && !byMarkerId.has(markerId));
@@ -2398,8 +2406,14 @@ async function manualDeleteMarkers(sheets, book, tabId, byId, snapshot) {
       const markerId=created.data.replies?.[i]?.createDeveloperMetadata?.developerMetadata?.metadataId;
       if (!Number.isSafeInteger(markerId)) throw Error("無法確認列身分建立，停止同步");
       markers[id]=markerId;
+      // Keep the in-memory metadata cache accurate after creating markers.
+      all.push({metadataId:markerId,metadataKey:MANUAL_DELETE_METADATA_KEY,
+        metadataValue:id,visibility:"DOCUMENT",
+        location:{dimensionRange:{sheetId:tabId,dimension:"ROWS",
+          startIndex:byId.get(id)[0]-1,endIndex:byId.get(id)[0]}}});
     });
   }
+  console.info(`[V2.9.1 列身分] 分頁ID=${tabId} 已追蹤=${Object.keys(markers).length} 本輪新增=${requestedIds.length} 既有快照標記=${Object.keys(previous).length} 標記消失=${missing.length}`);
   return {markers, missing:new Set(missing.map(([id])=>id))};
 }
 
@@ -2451,6 +2465,7 @@ async function reconcileOneBook(sheetId) {
   const sheets = await getSheets();
   const entries = await readAccountingLog(sheetId);
   const snapshots = await readSyncSnapshots(sheetId, sheets);
+  const markerCache = {};
   const groups = new Map();
   for (const e of entries) {
     if (!TX_ID_PATTERN.test(e.id) || !/^\d{6}月$/.test(e.month)) continue;
@@ -2510,8 +2525,9 @@ async function reconcileOneBook(sheetId) {
       let markerState = null;
       if (!unsafe && ![...byId.values()].some(hits=>hits.length!==1) &&
           [...currentIds].every(id=>TX_ID_PATTERN.test(id))) {
-        markerState = await manualDeleteMarkers(sheets,sheetId,tabs.get(month).sheetId,byId,snapshot);
+        markerState = await manualDeleteMarkers(sheets,sheetId,tabs.get(month).sheetId,byId,snapshot,markerCache);
       }
+      if (newlyMissing.length) console.info(`[V2.9.1 刪除證據] 月份=${month} 新缺少=${newlyMissing.length} 快照列標記=${Object.keys(snapshot?.markers || {}).length} 標記確認消失=${markerState?.missing.size ?? "未讀取"}`);
       const metadataProven = Boolean(snapshot?.markers && newlyMissing.length &&
         newlyMissing.every(e=>Number.isSafeInteger(snapshot.markers[e.id]) &&
           markerState?.missing.has(e.id)));
@@ -2631,20 +2647,34 @@ async function reconcileAllBooks() {
     const ids = [...new Set((response.data.values || [])
       .filter(r => ["Y","YES","TRUE","1","啟用"].includes(String(r[4]||"").trim().toUpperCase()))
       .map(r => String(r[3]||"").trim()).filter(Boolean))];
-    console.info(`[V2 對帳] 開始檢查，帳本數=${ids.length}`);
-    for (const id of ids) {
-      // 各帳本間錯開請求，避免 8 本帳本在同一分鐘集中讀取。
+    // A stable book ID cursor avoids starvation when Sheets quota interrupts a round.
+    const start = Math.max(0, ids.indexOf(reconciliationNextBookId));
+    const count = Math.min(RECONCILE_BOOKS_PER_ROUND, ids.length);
+    console.info(`[V2.9.1 分批對帳] 總帳本=${ids.length} 本輪預計=${count} 起點=${start+1}`);
+    let completed = 0, quotaLimited = false;
+    for (let n=0;n<count;n++) {
+      const index = (start+n)%ids.length;
+      const id = ids[index];
       await reconcileSleep(RECONCILE_BOOK_GAP_MS);
-      try { await reconcileOneBook(id); }
-      catch (err) {
+      try {
+        await reconcileOneBook(id);
+        completed++;
+        reconciliationNextBookId = ids[(index+1)%ids.length] || null;
+        console.info(`[V2.9.1 對帳進度] 完成=${completed}/${count} 下一帳本序號=${(index+1)%ids.length+1}`);
+      } catch (err) {
         if (isSheetsReadQuotaError(err)) {
           reconciliationRetryAfter = Date.now() + RECONCILE_QUOTA_COOLDOWN_MS;
-          console.warn(`[V2.8 配額保護] Google Sheets 讀取限流，停止本輪背景對帳；下輪安全重試。帳本=${id.slice(0,6)}；中央不做推定刪除`);
+          reconciliationNextBookId = id; // Retry THIS book, not the first book.
+          quotaLimited = true;
+          console.warn(`[V2.9.1 配額保護] Google Sheets 限流，保留進度，下輪從本帳本重試；帳本=${id.slice(0,6)}；中央不做推定刪除`);
           break;
         }
+        // A non-quota failure should not starve all later books.
+        reconciliationNextBookId = ids[(index+1)%ids.length] || null;
         console.error("單一帳本對帳失敗", id.slice(0,6), err.message);
       }
     }
+    console.info(`[V2.9.1 分批結果] 完成=${completed}/${count} 限流=${quotaLimited} 下一帳本=${reconciliationNextBookId?.slice(0,6)||"無"}`);
     console.info("[V2 對帳] 本輪完成");
   } catch (err) {
     if (isSheetsReadQuotaError(err)) {

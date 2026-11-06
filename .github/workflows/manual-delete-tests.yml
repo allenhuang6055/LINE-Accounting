@@ -19,5 +19,6 @@ jobs:
           node --check server.js
           node --check sheet-identity.js
           node --check central-sync-outbox.js
+          node --check manual-delete-proof.js
       - name: Manual deletion identity regression
-        run: node --test test/manual-delete-identity.test.js
+        run: node --test test/manual-delete-identity.test.js test/manual-delete-batch.test.js

@@ -2697,7 +2697,7 @@ async function reconcileOneBook(sheetId) {
       const identityMeta=await rowIdentity.metadata(sheets,sheetId);
       const verifiedMissing = newlyMissing.filter(e=>
         rowIdentity.deletionProven(identityMeta,sourceTab,snapshot?.identities,e.id,currentIds));
-      const safelyMissing = newlyMissing.length>0 && verifiedMissing.length===newlyMissing.length;
+      const safelyMissing = require('./manual-delete-proof').allMissingProven(newlyMissing,verifiedMissing);
       // V2.8 階段二：唯讀診斷，不放寬刪除條件，不輸出交易ID。
       // gridProperties.rowCount 是配置列數，不等於實際記帳筆數。
       if (missing.length || snapshot) {

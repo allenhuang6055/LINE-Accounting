@@ -2355,7 +2355,7 @@ async function saveSyncSnapshot(sheetId, sheets, snapshots, month, gridRows, ids
 
 // V2.9 離線候選：比對上輪 ID + 列號快照，支援跨輪逐筆及同輪多筆整列刪除。
 // 無上一輪列號快照、末尾刪除、清空 ID、搬動列、同時插入列或不一致時，一律保留中央。
-function v29HasRowDeletionProof({newlyMissing, snapshot, byId, currentIds}) {
+function v29HasRowDeletionProof({newlyMissing, snapshot, byId, currentIds, gridRows}) {
   if (!snapshot?.positions || !newlyMissing.length) return false;
   const before = snapshot.positions;
   const oldIds = new Set(snapshot.ids);
@@ -2381,7 +2381,13 @@ function v29HasRowDeletionProof({newlyMissing, snapshot, byId, currentIds}) {
     if (hits[0] < before[id]) shifted++;
   }
   // 必須看見後續原有交易向上移動；不能僅憑 ID 消失刪除中央。
-  return shifted > 0;
+  // 同輪多筆缺失須全數通過位置驗證，避免部分刪除造成中央資料不一致。
+  // 刪除最後一列沒有後續列上移：只有實際工作表總列數恰好減少相同筆數，
+  // 且所有舊交易列號均一致時，才視為整列刪除。單純清空 S 欄不會減少總列數。
+  const gridShrink = Number.isSafeInteger(gridRows) && Number.isSafeInteger(snapshot.gridRows) &&
+    snapshot.gridRows - gridRows === gone.size;
+  return (shifted > 0 || gridShrink) &&
+    [...gone].every(id => Number.isSafeInteger(before[id]) && before[id] >= 2);
 }
 
 // 中央安全對帳：只校正唯一匹配交易的列號；不依內容差異自動刪中央。
@@ -2450,7 +2456,7 @@ async function reconcileOneBook(sheetId) {
       const snapshotMissingMatches = snapshotGone.length === newlyMissing.length &&
         snapshotGone.every(id => newlyMissing.some(e => e.id === id));
       const safelyMissing = snapshotMissingMatches && v29HasRowDeletionProof({
-        newlyMissing, snapshot, byId, currentIds
+        newlyMissing, snapshot, byId, currentIds, gridRows
       });
       // V2.8 階段二：唯讀診斷，不放寬刪除條件，不輸出交易ID。
       // gridProperties.rowCount 是配置列數，不等於實際記帳筆數。

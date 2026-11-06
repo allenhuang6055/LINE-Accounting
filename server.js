@@ -2742,7 +2742,9 @@ async function reconcileOneBook(sheetId) {
       }
       if (!historical) for(let start=0;start<changes.length;start+=500)await sheets.spreadsheets.batchUpdate({
         spreadsheetId:sheetId,requestBody:{requests:changes.slice(start,start+500)}});
-      if (verifiedMissing.length && !unsafe) {
+      if (safelyMissing && !unsafe) {
+        // Only delete when every newly missing ID has independently verified
+        // row-metadata deletion evidence. Never partially delete a mixed batch.
         // Persist the entire proven batch before processing any member.
         const request = await outboxAppendRequest(sheetId,verifiedMissing.map(e => ({
           action:"delete",txId:e.id,sourceSheetId:sheetId,monthSheet:month,evidence:snapshot.identities[e.id]

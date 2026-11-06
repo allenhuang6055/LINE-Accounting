@@ -15,4 +15,4 @@ jobs:
         with:
           node-version: '24'
       - run: node --check server.js
-      - run: node --test test/current-manual-delete-limitations.test.js
+      - run: node --test test/current-manual-delete-limitations.test.js test/manual-delete-metadata.test.js

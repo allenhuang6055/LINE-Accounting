@@ -2381,7 +2381,8 @@ function v29HasRowDeletionProof({newlyMissing, snapshot, byId, currentIds}) {
     if (hits[0] < before[id]) shifted++;
   }
   // 必須看見後續原有交易向上移動；不能僅憑 ID 消失刪除中央。
-  return shifted > 0;
+  // 同輪多筆缺失須全數通過位置驗證，避免部分刪除造成中央資料不一致。
+  return shifted > 0 && [...gone].every(id => Number.isSafeInteger(before[id]) && before[id] >= 2);
 }
 
 // 中央安全對帳：只校正唯一匹配交易的列號；不依內容差異自動刪中央。

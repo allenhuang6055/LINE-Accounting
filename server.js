@@ -2392,7 +2392,7 @@ async function manualDeleteMarkers(sheets, book, tabId, byId, snapshot, cache = 
       m.location.dimensionRange.dimension==="ROWS" &&
       m.location.dimensionRange.startIndex===hits[0]-1);
     if (matches.length>1) throw Error("列身分重複，停止同步");
-    if (matches.length===1) {markers[id]=matches[0].metadataId;continue;}
+    if (matches.length===1) { if (previous[id] && previous[id] !== matches[0].metadataId) throw Error("既有列身分已變更"); markers[id]=matches[0].metadataId;continue;}
     if (previous[id]) throw Error("既有交易列身分不符，停止同步");
     requests.push({createDeveloperMetadata:{developerMetadata:{
       metadataKey:MANUAL_DELETE_METADATA_KEY,metadataValue:id,visibility:"DOCUMENT",
@@ -2508,76 +2508,41 @@ async function reconcileOneBook(sheetId) {
             rows:[{values:[sheetCell(hits[0])]}],fields:"userEnteredValue"}});
         } else missing.push(e);
       }
-      // 必須有快照包含該 ID，且同輪觀察到唯一的整列上移證據。
-      // 配置總列數僅用於診斷，不再作為實際刪除的證據。
-      const removedRows = snapshot && gridRows > 0 ? snapshot.gridRows - gridRows : 0;
-      const previouslyKnown = new Set(snapshot?.ids || []);
-      // 升級前就已缺失的交易不在快照中，僅列警告；不阻止新交易日後的刪除辨識。
-      const newlyMissing = missing.filter(e => previouslyKnown.has(e.id));
-      const oldMissing = missing.filter(e => !previouslyKnown.has(e.id));
-      // 快照中的消失 ID 必須全部能在本輪日誌的「新缺失」找到；
-      // 否則可能是 LINE 刪除、人工修改 S 欄或其他異常，禁止自動刪除。
-      const snapshotGone = snapshot ? snapshot.ids.filter(id => !currentIds.has(id)) : [];
-      const snapshotMissingMatches = snapshotGone.length === newlyMissing.length &&
-        snapshotGone.every(id => newlyMissing.some(e => e.id === id));
-      // Metadata must have been recorded on a PREVIOUS successful pass.
-      // Never use newly created markers as evidence for an earlier deletion.
-      let markerState = null;
-      if (!unsafe && ![...byId.values()].some(hits=>hits.length!==1) &&
-          [...currentIds].every(id=>TX_ID_PATTERN.test(id))) {
-        markerState = await manualDeleteMarkers(sheets,sheetId,tabs.get(month).sheetId,byId,snapshot,markerCache);
-      }
-      if (newlyMissing.length) console.info(`[V2.9.1 刪除證據] 月份=${month} 新缺少=${newlyMissing.length} 快照列標記=${Object.keys(snapshot?.markers || {}).length} 標記確認消失=${markerState?.missing.size ?? "未讀取"}`);
-      const metadataProven = Boolean(snapshot?.markers && newlyMissing.length &&
-        newlyMissing.every(e=>Number.isSafeInteger(snapshot.markers[e.id]) &&
-          markerState?.missing.has(e.id)));
-      // Once row markers are established, never fall back to position-only proof:
-      // a cleared S cell plus an unrelated row shift must not delete central data.
-      const safelyMissing = snapshotMissingMatches && (snapshot?.markers
-        ? metadataProven
-        : v29HasRowDeletionProof({newlyMissing, snapshot, byId, currentIds, gridRows}));
-      // V2.8 階段二：唯讀診斷，不放寬刪除條件，不輸出交易ID。
-      // gridProperties.rowCount 是配置列數，不等於實際記帳筆數。
-      if (missing.length || snapshot) {
-        console.info(`[V2.9 刪除診斷] 月份=${month} 快照=${snapshot ? "有" : "無"}` +
-          ` 快照ID數=${snapshot?.ids.length ?? 0} 現有ID數=${currentIds.size}` +
-          ` 舊缺失=${oldMissing.length} 新缺失=${newlyMissing.length}` +
-          ` 配置列差=${removedRows} 整列位移證據=${safelyMissing} 允許自動刪除=${Boolean(safelyMissing && !unsafe)}`);
-      }
-
-      // 避免新交易 ID 重複、未知交易 ID 或整個分頁異常造成誤刪。
+      // V2.9.2: retain unresolved evidence independently of the current row baseline.
       if ([...byId.values()].some(hits => hits.length !== 1)) unsafe = true;
       if ([...currentIds].some(id => !TX_ID_PATTERN.test(id))) unsafe = true;
       if (!gridRows || rows.length > gridRows) unsafe = true;
       const activeLogIds = new Set(logs.filter(e => e.status !== "已刪除" && e.v2Marker === "V2-ID").map(e => e.id));
       if ([...currentIds].some(id => !activeLogIds.has(id))) unsafe = true;
-      if (oldMissing.length) console.warn(`[V2.5.2 升級前待核對] ${month} ${oldMissing.length}筆；中央保留`);
-      if (newlyMissing.length && (!safelyMissing || unsafe)) {
-        console.warn(`[V2.8 手動刪除待核對] 帳本=${String(sheetId).slice(0,6)} 月份=${month} 新缺少=${newlyMissing.length}筆，總列數減少=${removedRows}，異常=${unsafe}；中央保留。缺少ID不能單獨證明刪除整列。`);
+      if (unsafe) {
+        console.warn(`[V2.9.2 安全略過] 月份=${month} 資料不一致`);
+        continue;
       }
+      const markerState = await manualDeleteMarkers(sheets,sheetId,tabs.get(month).sheetId,byId,snapshot,markerCache);
+      const pending = {...markerState.markers};
+      // Preserve prior marker IDs even if the source row is absent or a retry fails.
+      for (const e of missing) {
+        if (Number.isSafeInteger(snapshot?.markers?.[e.id])) pending[e.id] = snapshot.markers[e.id];
+      }
+      const proven = missing.filter(e => Number.isSafeInteger(snapshot?.markers?.[e.id]) && markerState.missing.has(e.id));
+      console.info(`[V2.9.2 刪除診斷] 月份=${month} 缺失=${missing.length} 已確認=${proven.length} 待人工核對=${missing.length-proven.length}`);
       if (changes.length) await sheets.spreadsheets.batchUpdate({
         spreadsheetId:sheetId,requestBody:{requests:changes}});
-      if (safelyMissing && !unsafe) {
-        // 先刪中央，成功後才將個人日誌標記為已刪除；下次對帳可安全重試。
-        for (const e of newlyMissing) {
-          try {
-            const result = await syncCentralDeletedVerified(e.id, sheetId, month);
-            if (result !== "deleted" && result !== "missing") throw Error(`中央刪除回傳 ${result}`);
-            await sheets.spreadsheets.values.update({spreadsheetId:sheetId,
-              range:`'${RECENT_LOG_TAB}'!K${e.logRow}:L${e.logRow}`,
-              valueInputOption:"RAW",requestBody:{values:[["已刪除",new Date().toISOString()]]}});
-            console.info(`[V2.5.2 手動刪除已同步] ${month} ${e.id}`);
-          } catch(err) {
-            unsafe = true;
-            console.error(`[V2.5.2 中央刪除失敗，保留快照待重試] ${e.id}`,err.message);
-            break;
-          }
+      // Persist evidence before any central mutation. A failed write must not delete.
+      const positions = new Map([...byId.entries()].map(([id,hits])=>[id,hits[0]]));
+      await saveSyncSnapshot(sheetId,sheets,snapshots,month,gridRows,currentIds,positions,pending);
+      for (const e of proven) {
+        try {
+          const result = await syncCentralDeletedVerified(e.id,sheetId,month);
+          if (result !== "deleted" && result !== "missing") throw Error(`中央刪除回傳 ${result}`);
+          await sheets.spreadsheets.values.update({spreadsheetId:sheetId,
+            range:`'${RECENT_LOG_TAB}'!K${e.logRow}:L${e.logRow}`,
+            valueInputOption:"RAW",requestBody:{values:[["已刪除",new Date().toISOString()]]}});
+          console.info(`[V2.9.2 手動刪除已同步] ${month} ${e.id}`);
+        } catch(err) {
+          console.error("[V2.9.2 中央刪除失敗，保留證據]",err.message);
+          throw err;
         }
-      }
-      // 有不確定的缺失時保留原快照，不讓不明原因的缺 ID 被默默視為正常。
-      if (!unsafe && (newlyMissing.length === 0 || safelyMissing)) {
-        const positions = new Map([...byId.entries()].map(([id, hits]) => [id, hits[0]]));
-        await saveSyncSnapshot(sheetId, sheets, snapshots, month, gridRows, currentIds, positions, markerState?.markers || null);
       }
       continue;
     }
